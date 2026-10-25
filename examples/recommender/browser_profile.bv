@@ -1,0 +1,105 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_events.bv";
+
+obj BrowserOperation {
+    operation_id: String;
+    item_id: Int;
+    rating: Int;
+    revision: String;
+    status: String;
+    retryable: Bool;
+    message: String;
+};
+
+defn browser_profile_upsert(ratings: List<ProfileRating>, change: ProfileRating) -> List<ProfileRating> {
+    let updated: List<ProfileRating> = [];
+    let inserted: Bool = false;
+    foreach idx in 0..ratings .^Length {
+        let current: ProfileRating = ratings[idx];
+        when current.item_id == change.item_id {
+            updated <- change;
+            inserted = true;
+        };
+        when current.item_id != change.item_id {
+            when !inserted && current.item_id > change.item_id {
+                updated <- change;
+                inserted = true;
+            };
+            updated <- current;
+        };
+    };
+    when !inserted { updated <- change; };
+    term updated;
+};
+
+defn browser_profile_overlay(ratings: List<ProfileRating>, operations: List<BrowserOperation>) -> List<ProfileRating> {
+    let visible: List<ProfileRating> = ratings;
+    foreach idx in 0..operations .^Length {
+        let operation: BrowserOperation = operations[idx];
+        when operation.status == "local" || operation.status == "sending" ||
+            operation.status == "unsent" || operation.status == "uncertain" || operation.status == "unknown" {
+            visible = browser_profile_upsert(visible,ProfileRating { item_id: operation.item_id, rating: operation.rating });
+        };
+    };
+    term visible;
+};
+
+defn browser_profile_render(ratings: List<ProfileRating>, operations: List<BrowserOperation>) -> String {
+    let visible: List<ProfileRating> = browser_profile_overlay(ratings,operations);
+    let output: String = "";
+    foreach idx in 0..visible .^Length {
+        let row: ProfileRating = visible[idx];
+        output += "Movie "+((row.item_id+1) as String)+": "+(row.rating as String)+" / 5";
+        when browser_operation_item_pending(operations,row.item_id) { output += " (pending save)"; };
+        output += ". ";
+    };
+    term output;
+};
+
+defn browser_operation_index(operations: List<BrowserOperation>, operation_id: String) -> Int {
+    foreach idx in 0..operations .^Length {
+        when operations[idx].operation_id == operation_id { term idx; };
+    };
+    term -1;
+};
+
+defn browser_operation_upsert(operations: List<BrowserOperation>, change: BrowserOperation) -> List<BrowserOperation> {
+    let updated: List<BrowserOperation> = [];
+    let found: Bool = false;
+    foreach idx in 0..operations .^Length {
+        when operations[idx].operation_id == change.operation_id {
+            updated <- change;
+            found = true;
+        };
+        when operations[idx].operation_id != change.operation_id { updated <- operations[idx]; };
+    };
+    when !found { updated <- change; };
+    term updated;
+};
+
+defn browser_operation_advance(operations: List<BrowserOperation>, change: BrowserOperation) -> List<BrowserOperation> {
+    let index: Int = browser_operation_index(operations,change.operation_id);
+    when index < 0 { term browser_operation_upsert(operations,change); };
+    let current: BrowserOperation = operations[index];
+    when (current.status == "saved" || current.status == "discarded") &&
+        change.status != current.status { term operations; };
+    term browser_operation_upsert(operations,change);
+};
+
+defn browser_operation_item_pending(operations: List<BrowserOperation>, item_id: Int) -> Bool {
+    foreach idx in 0..operations .^Length {
+        let operation: BrowserOperation = operations[idx];
+        when operation.item_id == item_id && operation.status != "saved" && operation.status != "discarded" { term true; };
+    };
+    term false;
+};
+
+defn browser_operation_unresolved(operations: List<BrowserOperation>) -> Int {
+    let count: Int = 0;
+    foreach idx in 0..operations .^Length {
+        when operations[idx].status != "saved" && operations[idx].status != "discarded" { count = count+1; };
+    };
+    term count;
+};

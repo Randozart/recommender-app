@@ -1,0 +1,181 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./worker_messages.bv";
+import "std/posix/syscall.bv";
+
+const WORKER_MODEL_SLOTS: Int = 4;
+const WORKER_WAIT_NOHANG: Int = 1;
+const WORKER_SIGTERM: Int = 15;
+const WORKER_SIGKILL: Int = 9;
+const WORKER_PR_SET_PDEATHSIG: Int = 1;
+obj ModelDescriptor { generation: String; path: String; identity: String; bytes: Int; };
+obj ModelSlot { descriptor: ModelDescriptor; readers: Int; occupied: Bool; };
+obj ModelRegistry { slots: List<ModelSlot>; current_generation: String; };
+obj ModelLease { descriptor: ModelDescriptor; held: Bool; };
+obj ModelInstall { registry: ModelRegistry; installed: Bool; error: String; };
+obj ModelAcquisition { registry: ModelRegistry; lease: ModelLease; };
+obj WorkerChild { pid: Int; channel_fd: Int; deadline_ms: Int; attempt: Int; restart_limit: Int; };
+obj WorkerExit { child: WorkerChild; status: Int; signal: Int; signaled: Bool; reaped: Bool; restart: Bool; timed_out: Bool; };
+obj WorkerPoolLimits { persistence_workers: Int; prediction_workers: Int; };
+
+defn model_registry_new() -> ModelRegistry {
+    let slots: List<ModelSlot> = [];
+    foreach idx in 0..WORKER_MODEL_SLOTS {
+        slots <- ModelSlot { descriptor: ModelDescriptor { generation: "0", path: "", identity: "", bytes: 0 }, readers: 0, occupied: false };
+    };
+    term ModelRegistry { slots: slots, current_generation: "0" };
+};
+
+defn model_descriptor_valid(model: ModelDescriptor) -> Bool {
+    term protocol_positive(model.generation) && worker_path_valid(model.path) &&
+        model.identity .^Length > 0 && model.identity .^Length <= 4096 &&
+        model.bytes > 0 && model.bytes <= 536870912;
+};
+
+defn model_find(registry: ModelRegistry, generation: String) -> Int {
+    foreach idx in 0..registry.slots .^Length {
+        when registry.slots[idx].occupied && registry.slots[idx].descriptor.generation == generation { term idx; };
+    };
+    term -1;
+};
+
+// Install only a complete validated descriptor. A slot is reclaimed only
+// after all issued readers release their leases; a fifth live generation is
+// refused instead of freeing memory still visible to a worker.
+defn model_install(registry: ModelRegistry, model: ModelDescriptor) -> ModelInstall {
+    when !model_descriptor_valid(model) || model_find(registry,model.generation) >= 0 {
+        term ModelInstall { registry: registry, installed: false, error: "invalid-or-duplicate-model-generation" };
+    };
+    let slot: Int = model_reclaimable_slot(registry,0);
+    when slot < 0 { term ModelInstall { registry: registry, installed: false, error: "model-reader-capacity" }; };
+    let replacement: ModelSlot = ModelSlot { descriptor: model, readers: 0, occupied: true };
+    let next: List<ModelSlot> = model_replace_slot(registry.slots,slot,replacement);
+    term ModelInstall { registry: ModelRegistry { slots: next, current_generation: model.generation }, installed: true, error: "" };
+};
+
+defn model_reclaimable_slot(registry: ModelRegistry, idx: Int) -> Int {
+    when idx >= registry.slots .^Length { term -1; };
+    let slot: ModelSlot = registry.slots[idx];
+    when !slot.occupied || (slot.readers == 0 && slot.descriptor.generation != registry.current_generation) { term idx; };
+    term model_reclaimable_slot(registry,idx+1);
+};
+
+defn model_acquire(registry: ModelRegistry, generation: String) -> Result<ModelAcquisition,String> {
+    let idx: Int = model_find(registry,generation);
+    when idx < 0 { term Err("Requested model generation is not installed."); };
+    let slot: ModelSlot = registry.slots[idx];
+    let replacement: ModelSlot = ModelSlot { descriptor: slot.descriptor, readers: slot.readers+1, occupied: true };
+    let slots: List<ModelSlot> = model_replace_slot(registry.slots,idx,replacement);
+    let updated: ModelRegistry = ModelRegistry { slots: slots, current_generation: registry.current_generation };
+    term Ok(ModelAcquisition { registry: updated, lease: ModelLease { descriptor: slot.descriptor, held: true } });
+};
+
+defn model_release(registry: ModelRegistry, lease: ModelLease) -> Result<ModelRegistry,String> {
+    when !lease.held { term Err("Model reader lease was already released."); };
+    let idx: Int = model_find(registry,lease.descriptor.generation);
+    when idx < 0 { term Err("Leased model generation was reclaimed while in use."); };
+    let slot: ModelSlot = registry.slots[idx];
+    when slot.readers < 1 { term Err("Model reader count is inconsistent."); };
+    let replacement: ModelSlot = ModelSlot { descriptor: slot.descriptor, readers: slot.readers-1, occupied: true };
+    let slots: List<ModelSlot> = model_replace_slot(registry.slots,idx,replacement);
+    term Ok(ModelRegistry { slots: slots, current_generation: registry.current_generation });
+};
+
+defn model_replace_slot(slots: List<ModelSlot>, target: Int, replacement: ModelSlot) -> List<ModelSlot> {
+    let result: List<ModelSlot> = [];
+    foreach idx in 0..slots .^Length {
+        when idx == target { result <- replacement; };
+        when idx != target { result <- slots[idx]; };
+    };
+    term result;
+};
+
+defn model_reader_count(registry: ModelRegistry, generation: String) -> Int {
+    let idx: Int = model_find(registry,generation);
+    when idx < 0 { term -1; };
+    term registry.slots[idx].readers;
+};
+
+// Poll and reap without blocking the reactor. A timed-out child is killed and
+// synchronously reaped before the slot may be reused, so it cannot become a
+// zombie or keep an IPC endpoint alive. Restart remains a caller decision and
+// is allowed only within the explicitly bounded attempt budget.
+defn worker_child_poll(child: WorkerChild, now_ms: Int) -> WorkerExit {
+    when child.pid <= 0 || child.channel_fd < 0 || child.attempt < 1 || child.restart_limit < 0 || child.attempt > child.restart_limit+1 {
+        term WorkerExit { child: child, status: -1, signal: 0, signaled: false, reaped: false, restart: false, timed_out: false };
+    };
+    let status_ptr: Int = Malloc#(8) as Int;
+    Store#(status_ptr,0,8);
+    let result: Int = syscall(SYS_WAIT4,child.pid,status_ptr,WORKER_WAIT_NOHANG,0);
+    when result == -4 { Free#(status_ptr as Ptr); term worker_child_poll(child,now_ms); };
+    when result == 0 {
+        when now_ms < child.deadline_ms { term WorkerExit { child: child, status: 0, signal: 0, signaled: false, reaped: false, restart: false, timed_out: false }; };
+        syscall(SYS_KILL,child.pid,WORKER_SIGKILL);
+        Store#(status_ptr,0,8);
+        let reaped: Int = worker_wait_reap(child.pid,status_ptr);
+        let raw_status: Int = Load#(status_ptr,4);
+        let signal: Int = raw_status & 127;
+        let code: Int = raw_status >> 8;
+        Free#(status_ptr as Ptr); syscall(SYS_CLOSE,child.channel_fd);
+        term WorkerExit { child: WorkerChild { pid: 0, channel_fd: -1, deadline_ms: child.deadline_ms,
+            attempt: child.attempt, restart_limit: child.restart_limit }, status: code, signal: signal, signaled: signal != 0,
+            reaped: reaped == child.pid, restart: reaped == child.pid && child.attempt <= child.restart_limit,
+            timed_out: true };
+    };
+    when result < 0 { term worker_child_reap_error(child,status_ptr); };
+    let raw_status: Int = Load#(status_ptr,4);
+    let signal: Int = raw_status & 127;
+    let code: Int = raw_status >> 8;
+    Free#(status_ptr as Ptr); syscall(SYS_CLOSE,child.channel_fd);
+    term WorkerExit { child: WorkerChild { pid: 0, channel_fd: -1, deadline_ms: child.deadline_ms,
+        attempt: child.attempt, restart_limit: child.restart_limit }, status: code, signal: signal, signaled: signal != 0,
+        reaped: result == child.pid, restart: result == child.pid && (code != 0 || signal != 0) && child.attempt <= child.restart_limit,
+        timed_out: false };
+};
+
+defn worker_child_reap_error(child: WorkerChild, status_ptr: Int) -> WorkerExit {
+    syscall(SYS_KILL,child.pid,WORKER_SIGKILL);
+    let reaped: Int = worker_wait_reap(child.pid,status_ptr);
+    let raw_status: Int = Load#(status_ptr,4);
+    let signal: Int = raw_status & 127;
+    let code: Int = raw_status >> 8;
+    Free#(status_ptr as Ptr); syscall(SYS_CLOSE,child.channel_fd);
+    let gone: Bool = reaped == child.pid || reaped == -10;
+    term WorkerExit { child: WorkerChild { pid: 0, channel_fd: -1, deadline_ms: child.deadline_ms,
+        attempt: child.attempt, restart_limit: child.restart_limit }, status: code, signal: signal, signaled: signal != 0,
+        reaped: gone, restart: gone && (code != 0 || signal != 0) && child.attempt <= child.restart_limit, timed_out: false };
+};
+
+defn worker_pool_limits(persistence_workers: Int, prediction_workers: Int) -> Result<WorkerPoolLimits,String> {
+    when persistence_workers < 1 || persistence_workers > 16 || prediction_workers < 1 || prediction_workers > 16 {
+        term Err("Persistence and prediction worker counts must each be in the range 1..16.");
+    };
+    term Ok(WorkerPoolLimits { persistence_workers: persistence_workers, prediction_workers: prediction_workers });
+};
+
+// Call immediately in every forked child before database or reactor work.
+// Linux does not inherit PDEATHSIG across fork, and the parent can die between
+// prctl and this check, so both operations are required.
+defn worker_child_parent_guard(parent_pid: Int) -> Bool {
+    when parent_pid <= 1 { term false; };
+    let configured: Int = syscall(SYS_PRCTL,WORKER_PR_SET_PDEATHSIG,WORKER_SIGTERM);
+    term configured == 0 && syscall(SYS_GETPPID) == parent_pid;
+};
+
+// Close only descriptors explicitly transferred as inherited parent-owned
+// resources. The child's IPC endpoint is omitted by the launcher; never call a
+// protocol-aware close (for example pg_close) on a fork-shared DB descriptor.
+defn worker_child_close_inherited(fds: List<Int>) -> Bool {
+    foreach idx in 0..fds .^Length {
+        when fds[idx] >= 0 && syscall(SYS_CLOSE,fds[idx]) < 0 { term false; };
+    };
+    term true;
+};
+
+defn worker_wait_reap(pid: Int, status_ptr: Int) -> Int {
+    Store#(status_ptr,0,8);
+    let result: Int = syscall(SYS_WAIT4,pid,status_ptr,0,0);
+    when result == -4 { term worker_wait_reap(pid,status_ptr); };
+    term result;
+};

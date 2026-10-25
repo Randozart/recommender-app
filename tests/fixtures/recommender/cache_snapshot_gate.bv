@@ -1,0 +1,98 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_test_support.bv";
+import { lookup_user_item, sim_user, sim_item } from "../../../examples/recommender/cf_engine.bv";
+
+defn snapshot_wait(state: ServerState) -> ServerState {
+    let updated: ServerState = state;
+    foreach step in 0..1000 {
+        updated = server_step(updated,10);
+        when updated.worker.pid == 0 && !updated.refresh && updated.worker.owners .^Length == 0 { term updated; };
+    };
+    term updated;
+};
+
+defn snapshot_matches(model: ServerModel) -> Bool {
+    let ok: Bool = true;
+    foreach a in 0..model.population.nusers {
+        foreach b in 0..model.population.nusers {
+            when !(Fabs#(mat_get(model.cache.user_sim,a,b)-sim_user(model.population,model.means,a,b)) <= 0.000001) { ok = false; };
+        };
+    };
+    foreach a in 0..model.population.nitems {
+        foreach b in 0..model.population.nitems {
+            when !(Fabs#(mat_get(model.cache.item_sim,a,b)-sim_item(model.population,model.means,a,b)) <= 0.000001) { ok = false; };
+        };
+    };
+    term ok;
+};
+
+defn snapshot_revision_edges(conn: PgConn) -> Bool {
+    let before: String = unwrap(model_revision(conn));
+    let rolled: PgResult = pg_simple_query(conn,"BEGIN; UPDATE baseline_ratings SET rating=1; ROLLBACK");
+    let rollback: Bool = rolled.ok && unwrap(model_revision(conn)) == before;
+    let deleted: PgResult = pg_simple_query(conn,"DELETE FROM baseline_ratings WHERE user_idx=0 AND item_id=0");
+    let after_delete: String = unwrap(model_revision(conn));
+    let truncated: PgResult = pg_simple_query(conn,"TRUNCATE baseline_ratings");
+    let after_truncate: String = unwrap(model_revision(conn));
+    let account: PgResult = pg_simple_query(conn,"INSERT INTO accounts(username,password) VALUES('revision-gate','hash'); DELETE FROM accounts WHERE username='revision-gate'");
+    let after_account: String = unwrap(model_revision(conn));
+    let recreated: PgResult = pg_simple_query(conn,"TRUNCATE model_revision; INSERT INTO model_revision(id) VALUES(TRUE)");
+    term rollback && deleted.ok && truncated.ok && account.ok && recreated.ok && after_delete != before && after_truncate != after_delete && after_account != after_truncate && unwrap(model_revision(conn)) != after_account;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let state: ServerState = test_server();
+    let path: String = "/tmp/briev-snapshot-gate-"+syscall(39) as String;
+    let saved: Bool = model_save(state.model,path);
+    let restored: Result<ServerModel,PgResult> = model_restore(path,state.model.revision,3,8);
+    let roundtrip: Bool = false;
+    when is_ok(restored) { let decoded: ServerModel = unwrap(restored); println!("roundtrip sample original={} decoded={} oracle={} mean={} nnz={}",mat_get(state.model.cache.user_sim,0,1),mat_get(decoded.cache.user_sim,0,1),sim_user(decoded.population,decoded.means,0,1),vec_get(decoded.means.user_mean,0),decoded.population.nnz); roundtrip = snapshot_matches(decoded); model_free(decoded); };
+    let renamed: PgResult = pg_simple_query(state.conn,"ALTER TABLE baseline_ratings RENAME TO cache_gate_hidden");
+    let hit: Result<ServerModel,PgResult> = model_load_path(state.conn,3,8,path);
+    let renamed_back: PgResult = pg_simple_query(state.conn,"ALTER TABLE cache_gate_hidden RENAME TO baseline_ratings");
+    let reused: Bool = renamed.ok && renamed_back.ok && is_ok(hit);
+    when is_ok(hit) { model_free(unwrap(hit)); };
+    let edited: PgResult = pg_simple_query(state.conn,"UPDATE baseline_ratings SET rating=5 WHERE user_idx=0 AND item_id=0");
+    let changed: Result<ServerModel,PgResult> = model_load_path(state.conn,3,8,path);
+    let invalidated: Bool = false;
+    when is_ok(changed) {
+        let newer: ServerModel = unwrap(changed);
+        invalidated = edited.ok && newer.revision != state.model.revision && newer.population.nnz == state.model.population.nnz && lookup_user_item(newer.population,0,0) == 5.0;
+        model_free(newer);
+    };
+    let image: String = model_image(state.model);
+    let data: Int = ((image as Data) as Int)+8;
+    let offset: Int = MODEL_HEADER+state.model.revision .^Length;
+    Store#(data+offset,Load#(data+offset,1) ^ 1,1);
+    let corruption: Bool = !model_image_valid(image,state.model.revision,3,8);
+    let truncation: Bool = !model_image_valid(image[0:79],state.model.revision,3,8);
+    Free#(((image as Data) as Int) as Ptr);
+    let failed_write: Bool = !model_save(state.model,path+"/unwritable.snapshot");
+    let lock: PgResult = pg_simple_query(state.conn,"BEGIN; LOCK TABLE model_revision IN ACCESS EXCLUSIVE MODE");
+    state = server_refresh(state);
+    let started: Bool = lock.ok && state.worker.pid > 0;
+    let response: TestExchange = test_http(state,"GET","/movies","");
+    state = response.server;
+    let responsive: Bool = started && state.worker.pid > 0 && str_find(response.response," 200 ") >= 0;
+    let queued: TestExchange = test_http(state,"POST","/admin/refresh","");
+    state = queued.server;
+    let pending: Bool = state.refresh;
+    let released: PgResult = pg_simple_query(state.conn,"COMMIT");
+    state = snapshot_wait(state);
+    let installed: Bool = released.ok && state.worker.pid == 0 && !state.refresh && state.model.revision == unwrap(model_revision(state.conn));
+    let before: String = state.model.revision;
+    let blocked: PgResult = pg_simple_query(state.conn,"BEGIN; LOCK TABLE model_revision IN ACCESS EXCLUSIVE MODE");
+    state = server_refresh(state);
+    let killed: Int = syscall(62,state.worker.pid,9);
+    let unlocked: PgResult = pg_simple_query(state.conn,"COMMIT");
+    state = snapshot_wait(state);
+    let retained: Bool = blocked.ok && unlocked.ok && killed == 0 && state.worker.pid == 0 && state.model.revision == before;
+    let revision_edges: Bool = snapshot_revision_edges(state.conn);
+    println!("snapshot_saved={} roundtrip={} reused_without_build={} same_count_edit_invalidates={} corruption={} truncation={} failed_write={} responsive_during_refresh={} queued={} installed={} failed_worker_retains={} rollback_delete_truncate_account_epoch={}",saved,roundtrip,reused,invalidated,corruption,truncation,failed_write,responsive,pending,installed,retained,revision_edges);
+    remove_file(path); model_free(state.model); reactor_close(state.reactor); pg_close(state.conn);
+    when !saved || !roundtrip || !reused || !invalidated || !corruption || !truncation || !failed_write || !responsive || !pending || !installed || !retained || !revision_edges { endprogram 1; };
+    tick = 1; endprogram;
+};

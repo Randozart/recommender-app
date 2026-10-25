@@ -1,0 +1,314 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./store.bv";
+import "./worker_messages.bv";
+
+// 2026-10-22: I07 puts each rating and its idempotency receipt in one
+// account-locked transaction. This targets reconnect/retry after a lost reply;
+// retire only if a replacement preserves account-lifetime receipts and FIFO.
+obj DurableOperationReceipt {
+    account_id: Int; operation_id: String; profile: ProfileVersion;
+    item_id: Int; rating: Int; timestamp: String; status: String;
+};
+enum OperationWriteOutcome {
+    OperationApplied(DurableOperationReceipt),
+    OperationReplayed(DurableOperationReceipt),
+    OperationAlreadyDiscarded(DurableOperationReceipt),
+    OperationConflict(String),
+    OperationFailed(PgResult),
+    OperationUncertain(String),
+};
+obj OperationWriteResult { outcome: OperationWriteOutcome; };
+obj OperationReceiptBatch { ok: Bool; receipts: List<DurableOperationReceipt>; error: String; message: String; uncertain: Bool; };
+
+defn operation_store_table_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS rating_operation_receipts (" +
+        "account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, " +
+        "operation_id TEXT NOT NULL CHECK (operation_id ~ '^[0-9a-f]{64}$'), " +
+        "server_epoch TEXT NOT NULL CHECK (server_epoch ~ '^[0-9a-f]{32}$'), " +
+        "revision BIGINT NOT NULL CHECK (revision > 0), " +
+        "item_id INTEGER NOT NULL CHECK (item_id BETWEEN 0 AND 1681), " +
+        "rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5), " +
+        "ts BIGINT NOT NULL CHECK (ts >= 0), " +
+        "status TEXT NOT NULL CHECK (status IN ('saved','discarded')), " +
+        "PRIMARY KEY (account_id, operation_id), " +
+        "UNIQUE (server_epoch, revision), " +
+        "CHECK (substring(operation_id from 1 for 32) = server_epoch))";
+};
+
+// Call with an idle connection after store_create_schema. This migration is
+// additive and never truncates account data or expires receipts.
+defn operation_store_create_schema(conn: PgConn) -> PgResult {
+    let started: PgResult = pg_simple_query(conn,"BEGIN");
+    when !started.ok { term started; };
+    let created: PgResult = pg_simple_query(conn,operation_store_table_ddl());
+    when !created.ok { term operation_store_rollback(conn,created); };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok { term committed; };
+    term committed;
+};
+
+defn operation_store_database_identity(conn: PgConn, epoch: String) -> Result<String,String> {
+    when !protocol_hex(epoch,32) { term Err("Use the current 32-character lowercase server epoch."); };
+    let identity: PgResult = pg_simple_query(conn,"SELECT current_database(),current_schema()");
+    when !identity.ok || identity.nrows != 1 || identity.ncols != 2 { term Err("Cannot verify the persistence worker database and schema."); };
+    term Ok(pg_row_text(identity,0,0)+"/"+pg_row_text(identity,0,1)+"/"+epoch);
+};
+
+defn operation_store_save(conn: PgConn, command: RatingCommand, profile: ProfileVersion, timestamp: String) -> OperationWriteResult {
+    when !protocol_command_valid(command) || !protocol_operation_version_valid(profile,command.operation_id) ||
+        command.server_epoch != profile.server_epoch || !protocol_counter(timestamp) {
+        term operation_write_conflict("Operation identity, payload, revision or timestamp is invalid.");
+    };
+    let begun: PgResult = pg_simple_query(conn,"BEGIN");
+    when !begun.ok { term operation_write_from_query_error(begun,"Could not begin the rating transaction."); };
+    let owner: PgResult = operation_store_lock_account(conn,profile.account_id);
+    when !owner.ok { term operation_store_rollback_result(conn,owner,"Could not lock the rating account."); };
+    when owner.nrows != 1 || owner.ncols != 1 {
+        term operation_store_rollback_result(conn,store_error("The rating account does not exist."),"The rating account does not exist.");
+    };
+    term operation_store_save_locked(conn,command,profile,timestamp);
+};
+
+defn operation_store_save_locked(conn: PgConn, command: RatingCommand, profile: ProfileVersion, timestamp: String) -> OperationWriteResult {
+    let existing: PgResult = operation_store_find_receipt(conn,profile.account_id,command.operation_id);
+    when !existing.ok { term operation_store_rollback_result(conn,existing,"Could not read the durable operation receipt."); };
+    when existing.nrows > 0 { term operation_store_save_replay(conn,existing,command,profile,timestamp); };
+    let written: PgResult = store_rating_upsert(conn,profile.account_id,command.item_id,command.rating,to_int(timestamp));
+    when !written.ok { term operation_store_rollback_result(conn,written,"The rating upsert failed and was rolled back."); };
+    let receipt: PgResult = operation_store_insert_receipt(conn,command,profile,timestamp,"saved");
+    when !receipt.ok { term operation_store_rollback_result(conn,receipt,"The receipt insert failed and the rating was rolled back."); };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok { term operation_write_uncertain("The rating commit reply was not confirmed; reconcile its receipt before retrying."); };
+    term operation_write_applied(operation_store_receipt_value(profile.account_id,command.operation_id,
+        command.server_epoch,profile.revision,command.item_id,command.rating,timestamp,"saved"));
+};
+
+defn operation_store_discard(conn: PgConn, original: RatingSaved, item: Int, rating: Int, timestamp: String) -> OperationWriteResult {
+    when !protocol_saved_valid(original) || item < 0 || item >= 1682 || rating < 1 || rating > 5 || !protocol_counter(timestamp) {
+        term operation_write_conflict("Supply the original failed operation identity, valid rating and timestamp.");
+    };
+    let begun: PgResult = pg_simple_query(conn,"BEGIN");
+    when !begun.ok { term operation_write_from_query_error(begun,"Could not begin the discard transaction."); };
+    let owner: PgResult = operation_store_lock_account(conn,original.profile.account_id);
+    when !owner.ok { term operation_store_rollback_result(conn,owner,"Could not lock the discard account."); };
+    when owner.nrows != 1 || owner.ncols != 1 {
+        term operation_store_rollback_result(conn,store_error("The discard account does not exist."),"The discard account does not exist.");
+    };
+    term operation_store_discard_locked(conn,original,item,rating,timestamp);
+};
+
+defn operation_store_discard_locked(conn: PgConn, original: RatingSaved, item: Int, rating: Int, timestamp: String) -> OperationWriteResult {
+    let existing: PgResult = operation_store_find_receipt(conn,original.profile.account_id,original.operation_id);
+    when !existing.ok { term operation_store_rollback_result(conn,existing,"Could not read the discard receipt."); };
+    when existing.nrows > 0 { term operation_store_discard_replay(conn,existing,original,item,rating,timestamp); };
+    let command: RatingCommand = RatingCommand { server_epoch: original.profile.server_epoch,
+        operation_id: original.operation_id, item_id: item, rating: rating };
+    let inserted: PgResult = operation_store_insert_receipt(conn,command,original.profile,timestamp,"discarded");
+    when !inserted.ok { term operation_store_rollback_result(conn,inserted,"The discard tombstone insert failed."); };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok { term operation_write_uncertain("The discard commit reply was not confirmed; reconcile its receipt before retrying."); };
+    term operation_write_applied(operation_store_receipt_value(original.profile.account_id,original.operation_id,
+        original.profile.server_epoch,original.profile.revision,item,rating,timestamp,"discarded"));
+};
+
+// The account row lock waits for any transaction whose COMMIT reply was lost.
+// Only after that lock is held is an absent receipt authoritative as unknown.
+defn operation_store_receipts(conn: PgConn, owner: Int, epoch: String, operations: List<String>) -> OperationReceiptBatch {
+    when owner < 1 || owner > 2147483647 || !protocol_hex(epoch,32) || operations .^Length < 1 || operations .^Length > 64 {
+        term operation_receipt_batch_error("invalid-request","Receipt lookup requires an account and 1..64 operation IDs.",false);
+    };
+    let begun: PgResult = pg_simple_query(conn,"BEGIN");
+    when !begun.ok { term operation_receipt_batch_from_query(begun,"Could not begin receipt reconciliation."); };
+    let locked: PgResult = operation_store_lock_account(conn,owner);
+    when !locked.ok { term operation_receipt_batch_rollback(conn,locked,"Could not lock the receipt account."); };
+    when locked.nrows != 1 || locked.ncols != 1 {
+        term operation_receipt_batch_rollback(conn,store_error("The receipt account does not exist."),"The receipt account does not exist.");
+    };
+    let empty: List<DurableOperationReceipt> = [];
+    let collected: Result<List<DurableOperationReceipt>,String> = operation_store_collect_receipts(conn,owner,epoch,operations,0,empty);
+    when is_err(collected) {
+        term operation_receipt_batch_rollback(conn,store_error(unwrap_err(collected)),"Receipt lookup failed.");
+    };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok {
+        term operation_receipt_batch_error("receipt-uncertain","Receipt reconciliation commit was not confirmed; reconnect and retry.",true);
+    };
+    term OperationReceiptBatch { ok: true, receipts: unwrap(collected), error: "", message: "", uncertain: false };
+};
+
+defn operation_store_collect_receipts(conn: PgConn, owner: Int, epoch: String, operations: List<String>, idx: Int)
+    -> Result<List<DurableOperationReceipt>,String>
+{
+    when idx >= operations .^Length {
+        let empty: List<DurableOperationReceipt> = [];
+        term Ok(empty);
+    };
+    when !protocol_hex(operations[idx],64) || !operation_store_id_new(operations,idx) {
+        term Err("Receipt lookup IDs must be unique 64-character lowercase hexadecimal values.");
+    };
+    let rows: PgResult = operation_store_find_receipt(conn,owner,operations[idx]);
+    when !rows.ok { term Err("Could not read a durable operation receipt."); };
+    let value: Result<DurableOperationReceipt,String> = operation_store_receipt_or_unknown(rows,owner,epoch,operations[idx]);
+    when is_err(value) { term Err(unwrap_err(value)); };
+    let tail: Result<List<DurableOperationReceipt>,String> = operation_store_collect_receipts(conn,owner,epoch,operations,idx+1);
+    when is_err(tail) { term Err(unwrap_err(tail)); };
+    let head: List<DurableOperationReceipt> = [unwrap(value)];
+    term Ok(head+unwrap(tail));
+};
+
+defn operation_store_id_new(operations: List<String>, idx: Int) -> Bool {
+    foreach previous in 0..idx { when operations[previous] == operations[idx] { term false; }; };
+    term true;
+};
+
+defn operation_store_receipt_or_unknown(rows: PgResult, owner: Int, epoch: String, operation: String)
+    -> Result<DurableOperationReceipt,String>
+{
+    when rows.nrows == 0 {
+        term Ok(DurableOperationReceipt { account_id: owner, operation_id: operation,
+            profile: ProfileVersion { server_epoch: epoch, account_id: owner, revision: "0" },
+            item_id: -1, rating: 0, timestamp: "0", status: "unknown" });
+    };
+    when rows.nrows != 1 { term Err("A durable operation key returned more than one receipt."); };
+    term operation_store_decode_receipt(rows);
+};
+
+defn operation_store_lock_account(conn: PgConn, owner: Int) -> PgResult {
+    let params: List<String> = [owner as String];
+    term pg_exec(conn,"SELECT id FROM accounts WHERE id=$1::integer FOR UPDATE",params);
+};
+
+defn operation_store_find_receipt(conn: PgConn, owner: Int, operation: String) -> PgResult {
+    let params: List<String> = [owner as String,operation];
+    term pg_exec(conn,"SELECT account_id,operation_id,server_epoch,revision,item_id,rating,ts,status " +
+        "FROM rating_operation_receipts WHERE account_id=$1::integer AND operation_id=$2",params);
+};
+
+defn operation_store_insert_receipt(conn: PgConn, command: RatingCommand, profile: ProfileVersion, timestamp: String, status: String) -> PgResult {
+    let params: List<String> = [profile.account_id as String,command.operation_id,profile.server_epoch,profile.revision,
+        command.item_id as String,command.rating as String,timestamp,status];
+    term pg_exec(conn,"INSERT INTO rating_operation_receipts " +
+        "(account_id,operation_id,server_epoch,revision,item_id,rating,ts,status) " +
+        "VALUES ($1::integer,$2,$3,$4::bigint,$5::integer,$6::smallint,$7::bigint,$8)",params);
+};
+
+defn operation_store_save_replay(conn: PgConn, rows: PgResult, command: RatingCommand, profile: ProfileVersion, timestamp: String) -> OperationWriteResult {
+    let receipt: Result<DurableOperationReceipt,String> = operation_store_decode_receipt(rows);
+    when is_err(receipt) { term operation_store_rollback_result(conn,store_error(unwrap_err(receipt)),"The durable operation receipt is invalid."); };
+    let value: DurableOperationReceipt = unwrap(receipt);
+    when !operation_receipt_matches(value,command,profile,timestamp) {
+        term operation_store_rollback_conflict(conn,"This operation ID already has a different payload or revision.");
+    };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok { term operation_write_uncertain("Receipt replay could not be confirmed; reconcile on a fresh connection."); };
+    when value.status == "discarded" { term OperationWriteResult { outcome: OperationAlreadyDiscarded(value) }; };
+    term OperationWriteResult { outcome: OperationReplayed(value) };
+};
+
+defn operation_store_discard_replay(conn: PgConn, rows: PgResult, original: RatingSaved, item: Int, rating: Int, timestamp: String) -> OperationWriteResult {
+    let receipt: Result<DurableOperationReceipt,String> = operation_store_decode_receipt(rows);
+    when is_err(receipt) { term operation_store_rollback_result(conn,store_error(unwrap_err(receipt)),"The durable operation receipt is invalid."); };
+    let value: DurableOperationReceipt = unwrap(receipt);
+    when !operation_receipt_matches(value,RatingCommand { server_epoch: original.profile.server_epoch,
+        operation_id: original.operation_id, item_id: item, rating: rating },original.profile,timestamp) {
+        term operation_store_rollback_conflict(conn,"The discard payload does not match its original operation receipt.");
+    };
+    when value.status == "saved" {
+        term operation_store_rollback_conflict(conn,"A committed rating cannot be discarded; submit a compensating edit.");
+    };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok { term operation_write_uncertain("Discard receipt replay could not be confirmed; reconcile on a fresh connection."); };
+    term OperationWriteResult { outcome: OperationReplayed(value) };
+};
+
+defn operation_store_decode_receipt(rows: PgResult) -> Result<DurableOperationReceipt,String> {
+    when rows.nrows != 1 || rows.ncols != 8 { term Err("Expected exactly one durable operation receipt."); };
+    let owner: Int = pg_row_int(rows,0,0);
+    let operation: String = pg_row_text(rows,0,1);
+    let epoch: String = pg_row_text(rows,0,2);
+    let revision: String = pg_row_text(rows,0,3);
+    let item: Int = pg_row_int(rows,0,4);
+    let rating: Int = pg_row_int(rows,0,5);
+    let timestamp: String = pg_row_text(rows,0,6);
+    let status: String = pg_row_text(rows,0,7);
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: owner, revision: revision };
+    when owner < 1 || !protocol_operation_version_valid(profile,operation) || item < 0 || item >= 1682 || rating < 1 || rating > 5 ||
+        !protocol_counter(timestamp) || (status != "saved" && status != "discarded") {
+        term Err("The durable operation receipt violates its versioned bounds.");
+    };
+    term Ok(DurableOperationReceipt { account_id: owner, operation_id: operation, profile: profile,
+        item_id: item, rating: rating, timestamp: timestamp, status: status });
+};
+
+defn operation_receipt_matches(receipt: DurableOperationReceipt, command: RatingCommand, profile: ProfileVersion, timestamp: String) -> Bool {
+    term receipt.account_id == profile.account_id && receipt.operation_id == command.operation_id &&
+        protocol_same_profile(receipt.profile,profile) && receipt.profile.server_epoch == command.server_epoch &&
+        receipt.item_id == command.item_id && receipt.rating == command.rating && receipt.timestamp == timestamp;
+};
+
+defn operation_store_receipt_value(owner: Int, operation: String, epoch: String, revision: String,
+    item: Int, rating: Int, timestamp: String, status: String) -> DurableOperationReceipt {
+    term DurableOperationReceipt { account_id: owner, operation_id: operation,
+        profile: ProfileVersion { server_epoch: epoch, account_id: owner, revision: revision },
+        item_id: item, rating: rating, timestamp: timestamp, status: status };
+};
+
+defn operation_write_applied(receipt: DurableOperationReceipt) -> OperationWriteResult {
+    term OperationWriteResult { outcome: OperationApplied(receipt) };
+};
+
+defn operation_write_conflict(message: String) -> OperationWriteResult {
+    term OperationWriteResult { outcome: OperationConflict(message) };
+};
+
+defn operation_write_uncertain(message: String) -> OperationWriteResult {
+    term OperationWriteResult { outcome: OperationUncertain(message) };
+};
+
+defn operation_write_from_query_error(result: PgResult, context: String) -> OperationWriteResult {
+    when result.err_code == "" { term operation_write_uncertain(context+" The connection outcome is unknown; reconcile receipts."); };
+    term OperationWriteResult { outcome: OperationFailed(result) };
+};
+
+defn operation_store_rollback_result(conn: PgConn, failure: PgResult, context: String) -> OperationWriteResult {
+    when failure.err_code == "" { term operation_write_uncertain(context+" The connection outcome is unknown; reconcile receipts."); };
+    let rolled_back: PgResult = pg_simple_query(conn,"ROLLBACK");
+    when !rolled_back.ok {
+        term operation_write_uncertain(context+" Rollback was not confirmed; reconcile receipts on a fresh connection.");
+    };
+    term OperationWriteResult { outcome: OperationFailed(failure) };
+};
+
+defn operation_store_rollback_conflict(conn: PgConn, message: String) -> OperationWriteResult {
+    let rolled_back: PgResult = pg_simple_query(conn,"ROLLBACK");
+    when !rolled_back.ok { term operation_write_uncertain(message+" Rollback was not confirmed; reconcile receipts."); };
+    term operation_write_conflict(message);
+};
+
+defn operation_store_rollback(conn: PgConn, failure: PgResult) -> PgResult {
+    let rolled_back: PgResult = pg_simple_query(conn,"ROLLBACK");
+    when !rolled_back.ok { term PgResult { ok: false, ncols: 0, nrows: 0,
+        fields: failure.fields, err_code: "", err_msg: "Rollback outcome is unknown; discard this connection." }; };
+    term failure;
+};
+
+defn operation_receipt_batch_error(code: String, message: String, uncertain: Bool) -> OperationReceiptBatch {
+    let receipts: List<DurableOperationReceipt> = [];
+    term OperationReceiptBatch { ok: false, receipts: receipts, error: code, message: message, uncertain: uncertain };
+};
+
+defn operation_receipt_batch_from_query(result: PgResult, context: String) -> OperationReceiptBatch {
+    when result.err_code == "" { term operation_receipt_batch_error("receipt-uncertain",context+" Reconnect and retry receipt lookup.",true); };
+    term operation_receipt_batch_error("database",context+" Check the database connection and schema.",false);
+};
+
+defn operation_receipt_batch_rollback(conn: PgConn, failure: PgResult, context: String) -> OperationReceiptBatch {
+    when failure.err_code == "" { term operation_receipt_batch_from_query(failure,context); };
+    let rolled_back: PgResult = pg_simple_query(conn,"ROLLBACK");
+    when !rolled_back.ok {
+        term operation_receipt_batch_error("receipt-uncertain",context+" Rollback was not confirmed; reconnect.",true);
+    };
+    term operation_receipt_batch_error("database",context+" Check the database constraint or account state.",false);
+};

@@ -1,0 +1,21 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_test_support.bv";
+import { sim_user, sim_item } from "../../../examples/recommender/cf_engine.bv";
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let model: Result<ServerModel,PgResult> = model_restore(model_cache_path(),"",943,1682);
+    when is_err(model) { println!("full snapshot rejected"); endprogram 1; };
+    let loaded: ServerModel = unwrap(model);
+    let ok: Bool = true;
+    foreach idx in 0..6 {
+        let a: Int = idx*31; let b: Int = idx*47+1;
+        let u: Float = sim_user(loaded.population,loaded.means,a,b);
+        let i: Float = sim_item(loaded.population,loaded.means,a,b);
+        when !(Fabs#(u-mat_get(loaded.cache.user_sim,a,b)) <= 0.000001) || !(Fabs#(i-mat_get(loaded.cache.item_sim,a,b)) <= 0.000001) { ok = false; };
+    };
+    println!("full_shape_reference_samples={}",ok);
+    model_free(loaded); when !ok { endprogram 1; };
+    tick = 1; endprogram;
+};

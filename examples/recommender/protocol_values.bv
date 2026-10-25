@@ -1,0 +1,112 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_types.bv";
+
+const RECOMMENDER_PROTOCOL: Int = 1;
+const PROTOCOL_JSON_LIMIT: Int = 65536;
+const PROTOCOL_ITEMS: Int = 1682;
+const PROTOCOL_TOP: Int = 5;
+
+defn protocol_member(value: JsonValue, key: String) -> JsonValue {
+    match value { Object(pairs) => protocol_pairs(pairs,key), _ => Null(), }
+};
+defn protocol_pairs(pairs: List<(String,JsonValue)>, key: String) -> JsonValue {
+    foreach idx in 0..pairs .^Length { when pairs[idx].0 == key { term pairs[idx].1; }; };
+    term Null();
+};
+
+defn protocol_text(value: JsonValue) -> String { match value { StrVal(text) => text, _ => "", } };
+defn protocol_is_text(value: JsonValue) -> Bool { match value { StrVal(text) => true, _ => false, } };
+defn protocol_integer(value: JsonValue) -> Int { match value { IntVal(number) => number, _ => -1, } };
+defn protocol_boolean(value: JsonValue) -> Bool { match value { BoolVal(flag) => flag, _ => false, } };
+defn protocol_is_boolean(value: JsonValue) -> Bool { match value { BoolVal(flag) => true, _ => false, } };
+defn protocol_array(value: JsonValue) -> List<JsonValue> { match value { Array(values) => values, _ => [], } };
+defn protocol_is_array(value: JsonValue) -> Bool { match value { Array(values) => true, _ => false, } };
+defn protocol_float(value: JsonValue) -> Float {
+    match value { FloatVal(number) => number, IntVal(number) => number as Float, _ => -1.0, }
+};
+
+defn protocol_unique(pairs: List<(String,JsonValue)>) -> Bool {
+    foreach idx in 0..pairs .^Length { when !protocol_unique_after(pairs,idx) { term false; }; };
+    term true;
+};
+defn protocol_unique_after(pairs: List<(String,JsonValue)>, idx: Int) -> Bool {
+    foreach other in (idx+1)..pairs .^Length { when pairs[idx].0 == pairs[other].0 { term false; }; };
+    term true;
+};
+
+defn protocol_object(value: JsonValue) -> Bool {
+    match value { Object(pairs) => protocol_unique(pairs), _ => false, }
+};
+
+defn protocol_hex(text: String, length: Int) -> Bool {
+    when text .^Length != length { term false; };
+    foreach idx in 0..length {
+        let byte: Int = byte_at(text,idx);
+        when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { term false; };
+    };
+    term true;
+};
+
+defn protocol_counter(text: String) -> Bool {
+    let length: Int = text .^Length;
+    when length < 1 || length > 19 { term false; };
+    when length > 1 && byte_at(text,0) == 48 { term false; };
+    foreach idx in 0..length { when byte_at(text,idx) < 48 || byte_at(text,idx) > 57 { term false; }; };
+    when length < 19 { term true; };
+    let limit: String = "9223372036854775807";
+    foreach idx in 0..19 {
+        when byte_at(text,idx) < byte_at(limit,idx) { term true; };
+        when byte_at(text,idx) > byte_at(limit,idx) { term false; };
+    };
+    term true;
+};
+
+defn protocol_positive(text: String) -> Bool { term protocol_counter(text) && text != "0"; };
+defn protocol_counter_next(text: String) -> Result<String,String> {
+    when !protocol_counter(text) { term Err("Supply a canonical decimal counter string."); };
+    when text == "9223372036854775807" { term Err("Revision capacity is exhausted; drain pending writes and restart with a new server epoch."); };
+    let suffix: String = "";
+    foreach offset in 0..text .^Length {
+        let idx: Int = text .^Length-1-offset;
+        let digit: Int = byte_at(text,idx)-48;
+        when digit < 9 { term Ok(text[0:idx]+((digit+1) as String)+suffix); };
+        suffix = "0"+suffix;
+    };
+    term Ok("1"+suffix);
+};
+defn protocol_operation_id(epoch: String, nonce: String) -> Result<String,String> {
+    when !protocol_hex(epoch,32) || !protocol_hex(nonce,32) { term Err("Use a 32-character lowercase hexadecimal epoch and nonce."); };
+    term Ok(epoch+nonce);
+};
+defn protocol_operation_matches(epoch: String, operation: String) -> Bool {
+    when !protocol_hex(epoch,32) || !protocol_hex(operation,64) { term false; };
+    term operation[0:32] == epoch;
+};
+defn protocol_version_valid(version: ProfileVersion) -> Bool {
+    term protocol_hex(version.server_epoch,32) && version.account_id > 0 &&
+        version.account_id <= 2147483647 && protocol_counter(version.revision);
+};
+defn protocol_rating_valid(rating: ProfileRating) -> Bool {
+    term rating.item_id >= 0 && rating.item_id < PROTOCOL_ITEMS && rating.rating >= 1 && rating.rating <= 5;
+};
+defn protocol_command_valid(command: RatingCommand) -> Bool {
+    term protocol_operation_matches(command.server_epoch,command.operation_id) &&
+        protocol_rating_valid(ProfileRating { item_id: command.item_id, rating: command.rating });
+};
+defn protocol_document(text: String) -> Result<JsonValue,String> {
+    when text .^Length > PROTOCOL_JSON_LIMIT { term Err("Request exceeds 65536 UTF-8 bytes; send a smaller request."); };
+    let parsed: Result<JsonValue,String> = json_parse(text);
+    when is_err(parsed) { term Err("Supply a complete valid JSON object."); };
+    let value: JsonValue = unwrap(parsed);
+    when !protocol_object(value) { term Err("Supply a JSON object with no duplicate fields."); };
+    when protocol_integer(protocol_member(value,"v")) != RECOMMENDER_PROTOCOL { term Err("Use protocol version 1; reload the application."); };
+    term Ok(value);
+};
+defn protocol_encode_object(pairs: List<(String,JsonValue)>) -> Result<String,String> {
+    let encoded: Result<String,String> = json_stringify(Object(pairs));
+    when is_err(encoded) { term encoded; };
+    when unwrap(encoded) .^Length > PROTOCOL_JSON_LIMIT { term Err("Message exceeds 65536 UTF-8 bytes; split it into bounded messages."); };
+    term encoded;
+};

@@ -1,0 +1,425 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./worker_io.bv";
+import "./worker_lifecycle.bv";
+import { ServerModel, PopSignature } from "./model_types.bv";
+import { Means, SimCache, means_build, simcache_build } from "./cf_engine.bv";
+import { model_free } from "./server_model.bv";
+import { model_restore } from "./model_snapshot.bv";
+import { ActiveProfileEngine, active_engine_new, active_engine_free } from "./active_profile.bv";
+import { prediction_worker_handle } from "./prediction_worker.bv";
+import { PersistenceWorker, PersistenceWorkerConfig, PersistenceWorkerStep,
+    persistence_worker_open, persistence_worker_close, persistence_worker_handle } from "./persistence_worker.bv";
+import "std/posix/syscall.bv";
+import "std/os/fs.bv";
+import "std/env.bv";
+import "std/matrix.bv";
+import "std/rating_population.bv";
+import "./account_state.bv";
+import { buf_slice_string } from "std/net/http.bv";
+import "std/string_c.bv";
+
+const WORKER_SOCKET_STREAM: Int = 1;
+const WORKER_SIGCHLD: Int = 17;
+const WORKER_FRAME_MAGIC_VALUE: Int = 1112692273;
+const WORKER_MAX_FRAME: Int = 65544;
+const WORKER_CHILD_EXIT: Int = 60;
+const WORKER_RETRY_BASE_MS: Int = 100;
+const WORKER_RETRY_MAX_MS: Int = 10000;
+obj WorkerRestart { channel: WorkerChannel; exit: WorkerExit; delay_ms: Int; restarted: Bool; };
+obj WorkerModelState { model: ServerModel; engine: ActiveProfileEngine; generation: String; loaded: Bool; persistence: PersistenceWorker; };
+obj WorkerInstallResult { state: WorkerModelState; response: WorkerMessage; installed: Bool; };
+obj WorkerChildStep { state: WorkerModelState; response: WorkerMessage; };
+
+// Create one persistent Briev child connected by a private full-duplex Unix
+// socket. The caller transfers the complete list of parent-owned descriptors
+// to close in the child; the new child IPC endpoint must not be in that list.
+defn worker_spawn(role: String, epoch: String, inherited_fds: List<Int>, attempt: Int, restart_limit: Int, deadline_ms: Int) -> Result<WorkerChannel,String> {
+    when (role != "prediction" && role != "persistence") || !protocol_hex(epoch,32) ||
+        attempt < 1 || restart_limit < 0 || attempt > restart_limit+1 || deadline_ms < 0 {
+        term Err("Worker role, epoch, launch attempt, retry limit or deadline is invalid.");
+    };
+    let pair: Int = Malloc#(8) as Int;
+    when pair == 0 { term Err("Cannot allocate worker socketpair descriptors."); };
+    when syscall(SYS_SOCKETPAIR,1,WORKER_SOCKET_STREAM,0,pair) < 0 { Free#(pair as Ptr); term Err("Cannot create the worker IPC socketpair."); };
+    let parent_fd: Int = Load#(pair,4);
+    let child_fd: Int = Load#(pair+4,4);
+    let parent_pid: Int = syscall(SYS_GETPID);
+    let pid: Int = syscall(SYS_CLONE,WORKER_SIGCHLD,0);
+    when pid == 0 {
+        syscall(SYS_CLOSE,parent_fd);
+        when !worker_child_parent_guard(parent_pid) || !worker_child_close_inherited(inherited_fds) { syscall(WORKER_CHILD_EXIT,1); };
+        let code: Int = worker_child_serve(child_fd,role,epoch);
+        syscall(SYS_CLOSE,child_fd);
+        syscall(WORKER_CHILD_EXIT,code);
+    };
+    syscall(SYS_CLOSE,child_fd);
+    Free#(pair as Ptr);
+    when pid < 0 { syscall(SYS_CLOSE,parent_fd); term Err("Cannot fork a bounded worker process."); };
+    let opened: Result<WorkerChannel,String> = worker_channel_open(parent_fd,pid,role,epoch);
+    when is_err(opened) {
+        syscall(SYS_KILL,pid,9);
+        let status: Int = Malloc#(8) as Int;
+        when status != 0 { worker_wait_reap(pid,status); Free#(status as Ptr); };
+        when status == 0 { worker_wait_reap_no_status(pid); };
+        term Err(unwrap_err(opened));
+    };
+    term opened;
+};
+
+// One supervisor step: observe/reap the current child, release its channel
+// buffers exactly once, and start the next bounded attempt only after the
+// exponential backoff has elapsed. The caller owns the monotonic timer and
+// invokes this again when now_ms reaches retry_at_ms.
+defn worker_supervisor_step(channel: WorkerChannel, inherited_fds: List<Int>, attempt: Int,
+    restart_limit: Int, deadline_ms: Int, now_ms: Int, retry_at_ms: Int) -> WorkerRestart {
+    let child: WorkerChild = WorkerChild { pid: channel.pid, channel_fd: channel.fd,
+        deadline_ms: deadline_ms, attempt: attempt, restart_limit: restart_limit };
+    let observed: WorkerExit = worker_child_poll(child,now_ms);
+    when !observed.reaped { term WorkerRestart { channel: channel, exit: observed, delay_ms: 0, restarted: false }; };
+    worker_channel_release_after_child(channel);
+    when !observed.restart || now_ms < retry_at_ms {
+        term WorkerRestart { channel: WorkerChannel { fd: -1, pid: 0, role: channel.role, epoch: channel.epoch,
+            ready: false, partial_read: false, tx: GrowBuf { ptr: 0, len: 0, cap: 0 }, tx_offset: 0,
+            rx: GrowBuf { ptr: 0, len: 0, cap: 0 }, terminal: 1 }, exit: observed,
+            delay_ms: worker_retry_delay(attempt), restarted: false };
+    };
+    let next: Result<WorkerChannel,String> = worker_spawn(channel.role,channel.epoch,inherited_fds,
+        attempt+1,restart_limit,deadline_ms);
+    when is_err(next) {
+        term WorkerRestart { channel: WorkerChannel { fd: -1, pid: 0, role: channel.role,
+            epoch: channel.epoch, ready: false, partial_read: false, tx: GrowBuf { ptr: 0, len: 0, cap: 0 },
+            tx_offset: 0, rx: GrowBuf { ptr: 0, len: 0, cap: 0 }, terminal: 1 },
+            exit: observed, delay_ms: worker_retry_delay(attempt), restarted: false };
+    };
+    term WorkerRestart { channel: unwrap(next), exit: observed, delay_ms: worker_retry_delay(attempt), restarted: true };
+};
+
+defn worker_retry_delay(attempt: Int) -> Int {
+    when attempt <= 1 { term WORKER_RETRY_BASE_MS; };
+    when attempt >= 8 { term WORKER_RETRY_MAX_MS; };
+    let delay: Int = WORKER_RETRY_BASE_MS << (attempt-1);
+    when delay > WORKER_RETRY_MAX_MS { term WORKER_RETRY_MAX_MS; };
+    term delay;
+};
+
+defn worker_supervisor_restart(pending: WorkerRestart, inherited_fds: List<Int>,
+    now_ms: Int, retry_at_ms: Int) -> WorkerRestart {
+    when pending.restarted || !pending.exit.restart { term pending; };
+    when now_ms < retry_at_ms { term pending; };
+    let attempt: Int = pending.exit.child.attempt+1;
+    let spawned: Result<WorkerChannel,String> = worker_spawn(pending.channel.role,pending.channel.epoch,
+        inherited_fds,attempt,pending.exit.child.restart_limit,pending.exit.child.deadline_ms);
+    when is_err(spawned) { term WorkerRestart { channel: pending.channel, exit: pending.exit,
+        delay_ms: worker_retry_delay(pending.exit.child.attempt), restarted: false }; };
+    term WorkerRestart { channel: unwrap(spawned), exit: pending.exit,
+        delay_ms: worker_retry_delay(pending.exit.child.attempt), restarted: true };
+};
+
+defn worker_child_read_full(fd: Int, address: Int, bytes: Int, offset: Int) -> Int {
+    when offset >= bytes { term offset; };
+    let count: Int = syscall(SYS_READ,fd,address+offset,bytes-offset);
+    when count == -4 { term worker_child_read_full(fd,address,bytes,offset); };
+    when count <= 0 { when offset == 0 { term count; }; term offset; };
+    term worker_child_read_full(fd,address,bytes,offset+count);
+};
+
+defn worker_child_write_full(fd: Int, address: Int, bytes: Int, offset: Int) -> Int {
+    when offset >= bytes { term offset; };
+    let count: Int = syscall(SYS_SEND,fd,address+offset,bytes-offset,16384);
+    when count == -4 { term worker_child_write_full(fd,address,bytes,offset); };
+    when count <= 0 { term count; };
+    term worker_child_write_full(fd,address,bytes,offset+count);
+};
+
+defn worker_child_serve(fd: Int, role: String, epoch: String) -> Int {
+    let frame: Int = Malloc#(WORKER_MAX_FRAME) as Int;
+    when frame == 0 { term 1; };
+    let empty_result: Result<WorkerModelState,String> = worker_model_empty();
+    when is_err(empty_result) { Free#(frame as Ptr); term 10; };
+    let state: WorkerModelState = unwrap(empty_result);
+    when role == "persistence" {
+        let opened: Result<PersistenceWorker,String> = worker_child_persistence_open(epoch);
+        when is_err(opened) {
+            active_engine_free(state.engine); model_free(state.model); Free#(frame as Ptr); term 11;
+        };
+        state.persistence = unwrap(opened);
+    };
+    when !worker_child_send_started(fd,role,epoch) {
+        active_engine_free(state.engine); model_free(state.model); Free#(frame as Ptr); term 9;
+    };
+    let code: Int = worker_child_loop(fd,frame,role,state);
+    active_engine_free(state.engine);
+    model_free(state.model);
+    Free#(frame as Ptr);
+    term code;
+};
+
+defn worker_child_persistence_open(epoch: String) -> Result<PersistenceWorker,String> {
+    let schema: String = get_env("PGSCHEMA");
+    when schema .^Length == 0 { schema = "public"; };
+    let config: PersistenceWorkerConfig = PersistenceWorkerConfig {
+        addr: 2130706433, port: 5432, user: get_env("PGUSER"), database: get_env("PGDATABASE"),
+        schema: schema, password: get_env("PGPASSWORD"), server_epoch: epoch };
+    term persistence_worker_open(config);
+};
+
+defn worker_model_empty() -> Result<WorkerModelState,String> {
+    // 2026-10-25: even an empty one-row CSR needs two initialized offsets.
+    // Workspace construction reads both bounds and mean-presence flags before
+    // the first model arrives. Retire this seed only with optional model state.
+    let population: RatingPopulation = RatingPopulation { user_off: ivec_new(2), user_item: ivec_new(1),
+        user_val: vec_new(1), item_off: ivec_new(2), item_user: ivec_new(1), item_val: vec_new(1),
+        nusers: 1, nitems: 1, nnz: 0 };
+    ivec_set(population.user_off,0,0); ivec_set(population.user_off,1,0);
+    ivec_set(population.item_off,0,0); ivec_set(population.item_off,1,0);
+    let means: Means = Means { user_mean: vec_new(1), item_mean: vec_new(1),
+        user_has: ivec_new(1), item_has: ivec_new(1), global: 0.0 };
+    vec_set(means.user_mean,0,0.0); vec_set(means.item_mean,0,0.0);
+    ivec_set(means.user_has,0,0); ivec_set(means.item_has,0,0);
+    let cache: SimCache = SimCache { user_sim: mat_new(1,1), item_sim: mat_new(1,1),
+        user_mean: means.user_mean, item_mean: means.item_mean, nusers: 1, nitems: 1,
+        sig: PopSignature { nnz: 0, mtime: 0 } };
+    mat_set(cache.user_sim,0,0,0.0); mat_set(cache.item_sim,0,0,0.0);
+    let accounts: List<Int> = [];
+    let model: ServerModel = ServerModel { population: population, means: means, cache: cache,
+        accounts: accounts, baseline_users: 0, revision: "" };
+    let engine_result: Result<ActiveProfileEngine,String> = active_engine_new(model,"1",134217728);
+    when is_err(engine_result) { model_free(model); term Err(unwrap_err(engine_result)); };
+    let persistence: PersistenceWorker = PersistenceWorker { conn: PgConn { sock: Socket { fd: -1 }, pid: -1, key: 0 },
+        server_epoch: "", database_identity: "", ready: false };
+    term Ok(WorkerModelState { model: model, engine: unwrap(engine_result), generation: "0", loaded: false,
+        persistence: persistence });
+};
+
+defn worker_child_send_started(fd: Int, role: String, epoch: String) -> Bool {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "1", attempt: 1, model_generation: "0" };
+    let fields: List<(String,JsonValue)> = [("role",StrVal(role))];
+    let message: WorkerMessage = WorkerMessage { kind: "started", tag: tag, payload: Object(fields) };
+    let encoded: Result<String,String> = protocol_encode_worker(message);
+    when is_err(encoded) { term false; };
+    let wire: String = unwrap(encoded);
+    let result: Result<GrowBuf,String> = worker_frame_encode(wire);
+    Free#(((wire as Data) as Int) as Ptr);
+    when is_err(result) { term false; };
+    let frame: GrowBuf = unwrap(result);
+    let prefix: Int = worker_child_write_full(fd,frame.ptr,4,0);
+    let pause: Int = Malloc#(16) as Int;
+    when pause != 0 { Store#(pause,0,8); Store#(pause+8,1000000,8); syscall(SYS_NANOSLEEP,pause,0); Free#(pause as Ptr); };
+    let sent: Int = worker_child_write_full(fd,frame.ptr+4,frame.len-4,0);
+    grow_free(frame);
+    term prefix == 4 && sent > 0;
+};
+
+defn worker_child_loop(fd: Int, frame: Int, role: String, state: WorkerModelState) -> Int {
+    let header: Int = worker_child_read_full(fd,frame,8,0);
+    when header == 0 { term 0; };
+    when header != 8 { term 2; };
+    let magic: Int = (Load#(frame,1)<<24)|(Load#(frame+1,1)<<16)|(Load#(frame+2,1)<<8)|Load#(frame+3,1);
+    let size: Int = (Load#(frame+4,1)<<24)|(Load#(frame+5,1)<<16)|(Load#(frame+6,1)<<8)|Load#(frame+7,1);
+    when magic != WORKER_FRAME_MAGIC_VALUE || size < 1 || size > PROTOCOL_JSON_LIMIT { term 3; };
+    when worker_child_read_full(fd,frame+8,size,0) != size { term 4; };
+    let text: String = buf_slice_string(ByteBuf { ptr: frame, len: size+8, cap: WORKER_MAX_FRAME },8,size);
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(text);
+    Free#(((text as Data) as Int) as Ptr);
+    when is_err(decoded) { term 5; };
+    let request: WorkerMessage = unwrap(decoded);
+    when !worker_request_kind(request.kind) { term 5; };
+    when request.kind == "install" {
+        let installed: WorkerInstallResult = worker_child_install(role,request,state);
+        let sent: Int = worker_child_send_message(fd,installed.response);
+        when sent <= 0 { term 8; };
+        term worker_child_loop(fd,frame,role,installed.state);
+    };
+    let step: WorkerChildStep = worker_child_handle(request,role,state);
+    let sent: Int = worker_child_send_message(fd,step.response);
+    when sent <= 0 { term 8; };
+    when request.kind == "shutdown" && step.response.kind == "stopped" { term 0; };
+    term worker_child_loop(fd,frame,role,step.state);
+};
+
+defn worker_child_handle(request: WorkerMessage, role: String, state: WorkerModelState) -> WorkerChildStep {
+    when role == "persistence" {
+        when !state.persistence.ready {
+            let reopened: Result<PersistenceWorker,String> = worker_child_persistence_open(state.persistence.server_epoch);
+            when is_err(reopened) { term WorkerChildStep { state: state,
+                response: worker_child_error(request,"database-unavailable",unwrap_err(reopened),true) }; };
+            state.persistence = unwrap(reopened);
+        };
+        when request.kind == "login" || request.kind == "register" || request.kind == "hydrate" {
+            term WorkerChildStep { state: state, response: worker_child_account_request(state.persistence,request) };
+        };
+        let handled: PersistenceWorkerStep = persistence_worker_handle(state.persistence,request);
+        state.persistence = handled.worker;
+        when handled.reply.kind == "stopped" && state.persistence.ready {
+            persistence_worker_close(state.persistence);
+            state.persistence.ready = false;
+        };
+        term WorkerChildStep { state: state, response: handled.reply };
+    };
+    term WorkerChildStep { state: state, response: worker_child_response(request,role,state) };
+};
+
+defn worker_child_account_request(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    when request.tag.profile.server_epoch != worker.server_epoch ||
+        (request.kind == "hydrate" && protocol_text(protocol_member(request.payload,"database_identity")) != worker.database_identity) {
+        term worker_child_error(request,"worker-identity","The account request does not match this worker's database identity.",false);
+    };
+    when request.kind == "register" { term worker_child_register(worker,request); };
+    when request.kind == "login" { term worker_child_login(worker,request); };
+    term worker_child_hydrate(worker,request);
+};
+
+defn worker_child_register(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let account: AccountResult = register(worker.conn,protocol_text(protocol_member(request.payload,"username")),
+        protocol_text(protocol_member(request.payload,"password")));
+    when !account.ok { term worker_child_error(request,account.error,
+        "Account creation could not be completed; check the credentials and database, then retry.",false); };
+    let fields: List<(String,JsonValue)> = [("account_id",IntVal(account.account.id)),("username",StrVal(account.account.username))];
+    term WorkerMessage { kind: "registered", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_login(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let authenticated: LoginResult = login(worker.conn,sessions_new(),protocol_text(protocol_member(request.payload,"username")),
+        protocol_text(protocol_member(request.payload,"password")));
+    when !authenticated.result.ok { term worker_child_error(request,authenticated.result.error,
+        "Username or password does not match; check the credentials and retry.",authenticated.result.error == "database"); };
+    let identity: AccountState = account_state(worker.conn,authenticated.sessions,authenticated.token);
+    when !identity.result.ok { term worker_child_error(request,identity.result.error,
+        "The account profile could not be loaded; retry sign in.",identity.result.error == "database"); };
+    let ratings: List<ProfileRating> = worker_child_profile_ratings(identity.ratings,0,[]);
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(ratings);
+    when is_err(encoded) { term worker_child_error(request,"profile-invalid","The account profile exceeds the supported rating bounds.",false); };
+    let fields: List<(String,JsonValue)> = [("account_id",IntVal(identity.result.account.id)),
+        ("username",StrVal(identity.result.account.username)),("token",StrVal(authenticated.token)),("ratings",unwrap(encoded))];
+    term WorkerMessage { kind: "authenticated", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_hydrate(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let issued: SessionIssue = session_issue(sessions_new(),request.tag.profile.account_id,0);
+    when !issued.ok { term worker_child_error(request,"session","Cannot create a temporary profile lookup token; retry hydration.",true); };
+    let state: AccountState = account_state(worker.conn,issued.sessions,issued.token);
+    when !state.result.ok { term worker_child_error(request,state.result.error,
+        "The account profile could not be loaded; retry hydration.",state.result.error == "database"); };
+    let ratings: List<ProfileRating> = worker_child_profile_ratings(state.ratings,0,[]);
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(ratings);
+    when is_err(encoded) { term worker_child_error(request,"profile-invalid","The account profile exceeds the supported rating bounds.",false); };
+    let fields: List<(String,JsonValue)> = [("username",StrVal(state.result.account.username)),("ratings",unwrap(encoded))];
+    term WorkerMessage { kind: "hydrated", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_profile_ratings(rows: List<AccountRating>, idx: Int, ratings: List<ProfileRating>) -> List<ProfileRating> {
+    when idx >= rows .^Length { term ratings; };
+    let row: AccountRating = rows[idx];
+    let rating: List<ProfileRating> = [ProfileRating { item_id: row.item_id, rating: row.rating }];
+    term worker_child_profile_ratings(rows,idx+1,ratings+rating);
+};
+
+defn worker_child_send_message(fd: Int, message: WorkerMessage) -> Int {
+    let encoded: Result<String,String> = protocol_encode_worker(message);
+    when is_err(encoded) { term -1; };
+    let wire: String = unwrap(encoded);
+    let output: Result<GrowBuf,String> = worker_frame_encode(wire);
+    Free#(((wire as Data) as Int) as Ptr);
+    when is_err(output) { term -1; };
+    let bytes: GrowBuf = unwrap(output);
+    let sent: Int = worker_child_write_full(fd,bytes.ptr,bytes.len,0);
+    grow_free(bytes);
+    term sent;
+};
+
+// Read no more than the declared image size plus one byte. A changing or
+// malicious path therefore cannot make read_file grow beyond the 512 MiB
+// descriptor bound before the size/checksum validation runs.
+defn worker_read_snapshot(path: String, expected_bytes: Int) -> Result<String,String> {
+    when expected_bytes < 80 || expected_bytes > 536870912 { term Err("Model size is outside the 80-byte..512-MiB bound."); };
+    let cpath: Int = to_c_string(path);
+    let fd: Int = syscall(SYS_OPEN,cpath,0,0);
+    Free#(cpath as Ptr<Bit<8>>);
+    when fd < 0 { term Err("Cannot open the model snapshot path."); };
+    let address: Int = Malloc#(expected_bytes+9) as Int;
+    when address == 0 { syscall(SYS_CLOSE,fd); term Err("Cannot reserve bounded model snapshot memory."); };
+    let count: Int = worker_snapshot_read_loop(fd,address+8,expected_bytes+1,0);
+    let closed: Int = syscall(SYS_CLOSE,fd);
+    when count != expected_bytes || closed < 0 {
+        Free#(address as Ptr);
+        term Err("Model snapshot byte count does not match its immutable descriptor.");
+    };
+    Store#(address,expected_bytes,8);
+    term Ok((address as Data) as String);
+};
+
+defn worker_snapshot_read_loop(fd: Int, address: Int, limit: Int, offset: Int) -> Int {
+    when offset >= limit { term offset; };
+    let count: Int = syscall(SYS_READ,fd,address+offset,limit-offset);
+    when count == -4 { term worker_snapshot_read_loop(fd,address,limit,offset); };
+    when count < 0 { term count; };
+    when count == 0 { term offset; };
+    term worker_snapshot_read_loop(fd,address,limit,offset+count);
+};
+
+defn worker_wait_reap_no_status(pid: Int) -> Int {
+    let result: Int = syscall(SYS_WAIT4,pid,0,0,0);
+    when result == -4 { term worker_wait_reap_no_status(pid); };
+    term result;
+};
+
+defn worker_child_response(request: WorkerMessage, role: String, state: WorkerModelState) -> WorkerMessage {
+    when request.kind == "shutdown" {
+        let fields: List<(String,JsonValue)> = [("drained",BoolVal(true))];
+        term WorkerMessage { kind: "stopped", tag: request.tag, payload: Object(fields) };
+    };
+    when request.kind == "predict" && role == "prediction" && !state.loaded {
+        term worker_child_error(request,"model-not-installed","Install and validate a model generation before prediction.",true);
+    };
+    when request.kind == "predict" && role == "prediction" && state.loaded {
+        when request.tag.model_generation != state.generation {
+            term worker_child_error(request,"model-generation-mismatch","Prediction tag does not match the installed model generation.",true);
+        };
+        term prediction_worker_handle(state.engine,request);
+    };
+    term worker_child_error(request,"handler-unavailable","This worker role has no installed job handler.",false);
+};
+
+defn worker_child_error(request: WorkerMessage, code: String, message: String, retryable: Bool) -> WorkerMessage {
+    let fields: List<(String,JsonValue)> = [("error",StrVal(code)),("message",StrVal(message)),
+        ("retryable",BoolVal(retryable))];
+    term WorkerMessage { kind: "error", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_install(role: String, request: WorkerMessage, state: WorkerModelState) -> WorkerInstallResult {
+    when role != "prediction" { term WorkerInstallResult { state: state,
+        response: worker_child_error(request,"model-role-mismatch","Only prediction workers install model snapshots.",false), installed: false }; };
+    let payload: JsonValue = request.payload;
+    let path: String = protocol_text(protocol_member(payload,"path"));
+    let identity: String = protocol_text(protocol_member(payload,"identity"));
+    let expected_bytes: Int = protocol_integer(protocol_member(payload,"bytes"));
+    let image_result: Result<String,String> = worker_read_snapshot(path,expected_bytes);
+    when is_err(image_result) { term WorkerInstallResult { state: state,
+        response: worker_child_error(request,"model-read",unwrap_err(image_result),true), installed: false }; };
+    let image: String = unwrap(image_result);
+    let data: Int = ((image as Data) as Int)+8;
+    let items: Int = Load#(data+16,8);
+    let baseline: Int = Load#(data+32,8);
+    let restored: Result<ServerModel,PgResult> = model_restore_image(image,identity,baseline,items);
+    Free#(((image as Data) as Int) as Ptr);
+    when is_err(restored) { term WorkerInstallResult { state: state,
+        response: worker_child_error(request,"model-invalid","Model snapshot identity, checksum or geometry is invalid.",false), installed: false }; };
+    when unwrap(restored).revision != identity { model_free(unwrap(restored));
+        term WorkerInstallResult { state: state, response: worker_child_error(request,
+            "model-identity-mismatch","Loaded model identity does not match its generation descriptor.",false), installed: false }; };
+    let model: ServerModel = unwrap(restored);
+    let engine_result: Result<ActiveProfileEngine,String> = active_engine_new(model,request.tag.model_generation,134217728);
+    when is_err(engine_result) { model_free(model);
+        term WorkerInstallResult { state: state, response: worker_child_error(request,"model-engine",unwrap_err(engine_result),false), installed: false }; };
+    active_engine_free(state.engine);
+    model_free(state.model);
+    let next: WorkerModelState = WorkerModelState { model: model, engine: unwrap(engine_result),
+        generation: request.tag.model_generation, loaded: true, persistence: state.persistence };
+    let fields: List<(String,JsonValue)> = [("generation",StrVal(request.tag.model_generation)),
+        ("identity",StrVal(identity))];
+    let ready: WorkerMessage = WorkerMessage { kind: "ready", tag: request.tag, payload: Object(fields) };
+    term WorkerInstallResult { state: next, response: ready, installed: true };
+};

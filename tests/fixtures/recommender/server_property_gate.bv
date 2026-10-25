@@ -1,0 +1,26 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_state.bv";
+import "std/env.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let mode: String = get_env("PROPERTY_MODE");
+    when mode == "rating" {
+        let input: ApiInput = api_input("{\"item_id\":0,\"rating\":"+get_env("PROPERTY_VALUE")+"}");
+        println!("{}",api_rating_valid(input,8));
+    };
+    when mode == "threshold" { println!("{}",api_cold_start(get_env_int("PROPERTY_VALUE"))); };
+    when mode == "owner" {
+        let row: Int = Malloc#(128) as Int;
+        reactor_clear_words(row,16);
+        Store#(row,get_env_int("PROPERTY_FD"),8);
+        Store#(row+16,get_env_int("PROPERTY_UPGRADED"),8);
+        Store#(row+24,get_env_int("PROPERTY_BOUND_OWNER"),8);
+        Store#(row+112,get_env_int("PROPERTY_CLOSING"),8);
+        println!("{}",server_channel_owned(row,get_env_int("PROPERTY_OWNER")));
+        Free#(row as Ptr);
+    };
+    tick = 1; endprogram;
+};

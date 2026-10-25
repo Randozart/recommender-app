@@ -1,0 +1,202 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// Import the engine surface, excluding its standalone demonstration reactor.
+import { Means, SimCache, means_build, means_free, means_user, simcache_build,
+    simcache_free, simcache_user_mean, simcache_item_mean, simcache_item_sim,
+    sim_user, knn_aggregate, NEIGHBOR_K, TOP_N, clamp15 } from "./cf_engine.bv";
+import "std/rating_population.bv";
+import "./account_state.bv";
+import "./model_snapshot.bv";
+import { simcache_build_prepared } from "./cf_prepared.bv";
+
+defn model_account_row(model: ServerModel, id: Int, idx: Int) -> Int {
+    when idx >= model.accounts .^Length { term -1; };
+    when model.accounts[idx] == id { term model.baseline_users + idx; };
+    term model_account_row(model, id, idx + 1);
+};
+
+defn model_free(model: ServerModel) -> Bool {
+    simcache_free(model.cache);
+    means_free(model.means);
+    pop_free(model.population);
+    term true;
+};
+
+defn model_ids(conn: PgConn, ids: List<Int>) -> Result<List<Int>, PgResult> {
+    let rows: PgResult = pg_simple_query(conn, "FETCH 64 FROM account_ids");
+    when !rows.ok { term Err(rows); };
+    when rows.nrows == 0 { term Ok(ids); };
+    let added: List<Int> = ids;
+    foreach idx in 0..rows.nrows {
+        let entry: List<Int> = [pg_row_int(rows, idx, 0)];
+        added = added + entry;
+    };
+    term model_ids(conn, added);
+};
+
+defn model_read_rows(conn: PgConn, users: IntVec, items: IntVec, values: Vector, offset: Int, total: Int) -> PgResult {
+    when offset >= total { term pg_result_empty(); };
+    let rows: PgResult = pg_simple_query(conn, "FETCH 64 FROM population_rows");
+    when !rows.ok { term rows; };
+    when rows.nrows < 1 || rows.nrows > total - offset {
+        term store_error("Population rows changed within their snapshot; retry refresh.");
+    };
+    foreach idx in 0..rows.nrows {
+        ivec_set(users, offset + idx, pg_row_int(rows,idx,0));
+        ivec_set(items, offset + idx, pg_row_int(rows,idx,1));
+        vec_set(values, offset + idx, pg_row_int(rows,idx,2) as Float);
+    };
+    term model_read_rows(conn, users, items, values, offset + rows.nrows, total);
+};
+
+// 2026-10-21: repeatable-read plus SQL row_number gives a dense account map
+// even after IDs are deleted/skipped. Never alias login IDs with dataset rows.
+// Cursors bound wire-result size. Replace only with an equally consistent loader.
+defn model_load(conn: PgConn, baseline_users: Int, nitems: Int) -> Result<ServerModel, PgResult> {
+    term model_load_path(conn,baseline_users,nitems,model_cache_path());
+};
+
+defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: String) -> Result<ServerModel, PgResult> {
+    let begun: PgResult = pg_simple_query(conn, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    when !begun.ok { term Err(store_abort(conn,begun)); };
+    let version: Result<String,PgResult> = model_revision(conn);
+    when is_err(version) { term Err(store_abort(conn,unwrap_err(version))); };
+    let revision: String = unwrap(version);
+    let restored: Result<ServerModel,PgResult> = model_restore(path,revision,baseline_users,nitems);
+    when is_ok(restored) {
+        let committed: PgResult = pg_simple_query(conn,"COMMIT");
+        when !committed.ok { model_free(unwrap(restored)); term Err(committed); };
+        term restored;
+    };
+    let declared: PgResult = pg_simple_query(conn,
+        "DECLARE account_ids CURSOR FOR SELECT id FROM accounts ORDER BY id");
+    when !declared.ok { term Err(store_abort(conn,declared)); };
+    let empty: List<Int> = [];
+    let loaded: Result<List<Int>, PgResult> = model_ids(conn,empty);
+    when is_err(loaded) { term Err(store_abort(conn,unwrap_err(loaded))); };
+    let ids: List<Int> = unwrap(loaded);
+    let counted: PgResult = pg_simple_query(conn,
+        "SELECT (SELECT count(*) FROM baseline_ratings)+(SELECT count(*) FROM ratings), " +
+        "(SELECT count(*) FROM baseline_ratings WHERE user_idx >= " + baseline_users as String +
+        " OR item_id >= " + nitems as String + ") + (SELECT count(*) FROM ratings WHERE item_id >= " + nitems as String + ")");
+    when !counted.ok { term Err(store_abort(conn,counted)); };
+    let total: Int = pg_row_int(counted,0,0);
+    when total < 0 || total > 10000000 || pg_row_int(counted,0,1) != 0 || baseline_users < 1 || nitems < 1 || nitems > 65535 || baseline_users + ids .^Length > 65535 {
+        term Err(store_abort(conn,store_error("Population exceeds configured dimensions or the ten-million-rating memory limit; check the dataset and configuration.")));
+    };
+    let cursor: PgResult = pg_simple_query(conn,
+        "DECLARE population_rows CURSOR FOR WITH mapped AS (SELECT id, row_number() OVER (ORDER BY id)-1+" +
+        baseline_users as String + " AS row FROM accounts) " +
+        "SELECT user_idx,item_id,rating FROM baseline_ratings UNION ALL " +
+        "SELECT m.row,r.item_id,r.rating FROM ratings r JOIN mapped m ON m.id=r.account_id ORDER BY 1,2");
+    when !cursor.ok { term Err(store_abort(conn,cursor)); };
+    let users: IntVec = ivec_new(total + 1);
+    let items: IntVec = ivec_new(total + 1);
+    let values: Vector = vec_new(total + 1);
+    let read: PgResult = model_read_rows(conn,users,items,values,0,total);
+    when !read.ok {
+        ivec_free(users); ivec_free(items); vec_free(values);
+        term Err(store_abort(conn,read));
+    };
+    let committed: PgResult = pg_simple_query(conn,"COMMIT");
+    when !committed.ok {
+        ivec_free(users); ivec_free(items); vec_free(values);
+        term Err(committed);
+    };
+    let pop: RatingPopulation = pop_build(users,items,values,total,baseline_users + ids .^Length,nitems);
+    ivec_free(users); ivec_free(items); vec_free(values);
+    let means: Means = means_build(pop);
+    let cache: SimCache = simcache_build_prepared(pop,means,0);
+    let model: ServerModel = ServerModel { population: pop, means: means, cache: cache, accounts: ids, baseline_users: baseline_users, revision: revision };
+    when !model_save(model,path) { println!("Cannot persist the recommendation snapshot; check CACHE_PATH and directory permissions. The in-memory snapshot remains available."); };
+    term Ok(model);
+};
+
+obj ActivePrediction {
+    state: AccountState; model: ServerModel; similarities: Vector; mean: Float; excluded: Int;
+};
+
+defn active_copy_row(pop: RatingPopulation, user: Int, users: IntVec, items: IntVec, values: Vector, offset: Int) -> Int {
+    let count: Int = offset;
+    foreach idx in pop_user_begin(pop,user)..pop_user_end(pop,user) {
+        ivec_set(users,count,user);
+        ivec_set(items,count,ivec_get(pop.user_item,idx));
+        vec_set(values,count,vec_get(pop.user_val,idx));
+        count = count+1;
+    };
+    term count;
+};
+
+// Construct one temporary active row. Remove its old snapshot row first to
+// prevent a user from appearing as their own neighbor. All scratch is freed.
+// The served item matrix stays immutable until the explicit/periodic refresh.
+defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
+    let pop: RatingPopulation = model.population;
+    let excluded: Int = model_account_row(model,state.result.account.id,0);
+    let capacity: Int = pop.nnz + state.ratings .^Length + 1;
+    let users: IntVec = ivec_new(capacity);
+    let items: IntVec = ivec_new(capacity);
+    let values: Vector = vec_new(capacity);
+    let count: Int = 0;
+    foreach user_idx in 0..pop.nusers {
+        when user_idx != excluded {
+            count = active_copy_row(pop,user_idx,users,items,values,count);
+        };
+    };
+    foreach idx in 0..state.ratings .^Length {
+        ivec_set(users,count,pop.nusers);
+        ivec_set(items,count,state.ratings[idx].item_id);
+        vec_set(values,count,state.ratings[idx].rating as Float);
+        count = count + 1;
+    };
+    let overlay: RatingPopulation = pop_build(users,items,values,count,pop.nusers + 1,pop.nitems);
+    ivec_free(users); ivec_free(items); vec_free(values);
+    let means: Means = means_build(overlay);
+    let similarities: Vector = vec_new(pop.nusers);
+    foreach idx in 0..pop.nusers { vec_set(similarities,idx,sim_user(overlay,means,pop.nusers,idx)); };
+    let mean: Float = means_user(means,pop.nusers);
+    means_free(means); pop_free(overlay);
+    term ActivePrediction { state: state, model: model, similarities: similarities, mean: mean, excluded: excluded };
+};
+
+defn active_user_prediction(active: ActivePrediction, item: Int) -> Float {
+    let pop: RatingPopulation = active.model.population;
+    let begin: Int = pop_item_begin(pop,item);
+    let end: Int = pop_item_end(pop,item);
+    let users: IntVec = ivec_new(end - begin + 1);
+    let sims: Vector = vec_new(end - begin + 1);
+    let devs: Vector = vec_new(end - begin + 1);
+    let count: Int = 0;
+    foreach idx in begin..end {
+        let user: Int = ivec_get(pop.item_user,idx);
+        when user != active.excluded {
+            ivec_set(users,count,user);
+            vec_set(sims,count,vec_get(active.similarities,user));
+            vec_set(devs,count,vec_get(pop.item_val,idx) - simcache_user_mean(active.model.cache,user));
+            count = count + 1;
+        };
+    };
+    let (sum,eta): (Float,Float) = knn_aggregate(users,sims,devs,count,NEIGHBOR_K);
+    ivec_free(users); vec_free(sims); vec_free(devs);
+    when eta == 0.0 { term active.mean; };
+    term active.mean + sum / eta;
+};
+
+defn active_item_prediction(active: ActivePrediction, item: Int) -> Float {
+    let count: Int = active.state.ratings .^Length;
+    let items: IntVec = ivec_new(count + 1);
+    let sims: Vector = vec_new(count + 1);
+    let devs: Vector = vec_new(count + 1);
+    foreach idx in 0..count {
+        let rating: AccountRating = active.state.ratings[idx];
+        ivec_set(items,idx,rating.item_id);
+        vec_set(sims,idx,simcache_item_sim(active.model.cache,item,rating.item_id));
+        vec_set(devs,idx,(rating.rating as Float) - simcache_item_mean(active.model.cache,rating.item_id));
+    };
+    let (sum,eta): (Float,Float) = knn_aggregate(items,sims,devs,count,NEIGHBOR_K);
+    ivec_free(items); vec_free(sims); vec_free(devs);
+    let mean: Float = simcache_item_mean(active.model.cache,item);
+    when eta == 0.0 { term mean; };
+    term mean + sum / eta;
+};

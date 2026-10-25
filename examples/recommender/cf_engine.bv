@@ -1,0 +1,1780 @@
+// cf_engine - the AutAI-Fusion collaborative-filtering engine (recommender-app
+// APP code, NOT stdlib). Built on the general stdlib primitives (matrix.bv's
+// Vector/IntVec and rating_population.bv's dual-orientation CSR); the paper's
+// equations themselves are application knowledge and live here.
+//
+// 2026-10-20 (recommender-app Task 6, part 1): means + global-mean fallback.
+// The next increments add key-set imputation (6.3) and PCC similarity (6.5).
+//
+// CORRECTNESS ORACLE. Every value this engine produces is checked against
+// examples/recommender/reference.bv (the dense, straight-from-the-paper
+// oracle) on the hand-worked 4x4 fixture, within 1e-6 - NOT against
+// recommender_singlepass.cpp (whose three defects we must not reproduce).
+//
+// ── Part 1: means (Task 6.1) ─────────────────────────────────────────────────
+//
+// WHY A TRUE MEAN (corrects C++ defect #1). The AutAI-Fusion mean ua / ts is the
+// true arithmetic average of a user's / item's OBSERVED ratings. The C++
+// baseline substituted a degenerate constant; we compute the honest average and
+// fall back to the GLOBAL mean (the average of every observed rating) only when
+// a user or item has no ratings at all - never a magic number.
+
+import "std/matrix.bv";
+import "std/rating_population.bv";
+// Task 9.4 persistence calls std/os/fs.bv's read_file/write_file/remove_file.
+// The prelude makes their NAMES visible for typechecking, but a defn is only
+// EMITTED into a unit's IR when that unit imports the module (prelude visibility
+// grants capability; emission follows the import graph — the defn-liveness rule).
+// Without this explicit import the call site emitted but the body did not
+// (`undefined value @read_file` at link). Import the Result constructors +
+// predicates SELECTIVELY (a full import would drag option.bv's same-named
+// `unwrap` — the fs.bv lesson); cf_engine uses only is_err/is_ok/unwrap here.
+import "std/os/fs.bv";
+import { Ok, Err, is_ok, is_err, unwrap, unwrap_err } from "std/result.bv";
+
+// Means holds the per-user and per-item mean vectors plus a presence flag for
+// each (has_mean == true iff that user/item had >= 1 observed rating). The
+// global mean is the fallback a prediction uses when a row/column is empty.
+obj Means {
+    user_mean: Vector;     // len nusers
+    item_mean: Vector;     // len nitems
+    user_has:  IntVec;     // len nusers; 1 if the user had >= 1 rating, else 0
+    item_has:  IntVec;     // len nitems; 1 if the item had >= 1 rating, else 0
+    global:    Float;      // average of ALL observed ratings (empty-row fallback)
+};
+
+// means_build - compute both mean vectors + presence flags + the global mean
+// from a populated RatingPopulation. One pass per orientation over the CSR
+// value arrays (the offsets already group ratings by row/column).
+defn means_build(pop: RatingPopulation)
+    [pop.nnz >= 0 && pop.nusers >= 1 && pop.nitems >= 1][true]
+    -> Means
+{
+    let global: Float = means_global(pop);
+    let umean: Vector = vec_new(pop.nusers);
+    let uhas:  IntVec = ivec_new(pop.nusers);
+    means_fill_users(pop, umean, uhas, global, 0);
+    let imean: Vector = vec_new(pop.nitems);
+    let ihas:  IntVec = ivec_new(pop.nitems);
+    means_fill_items(pop, imean, ihas, global, 0);
+    term Means {
+        user_mean: umean, item_mean: imean,
+        user_has: uhas, item_has: ihas, global: global
+    };
+};
+
+// means_global - the average of every observed rating (sum of all user_val /
+// nnz). nnz == 0 (no ratings at all) => 0.0, the only honest value then.
+defn means_global(pop: RatingPopulation) [pop.nnz >= 0][true] -> Float {
+    when pop.nnz <= 0 {
+        term 0.0;
+    };
+    term means_sum_all(pop.user_val, pop.nnz, 0, 0.0) / (pop.nnz as Float);
+};
+
+// means_sum_all - sum the first nnz values of a CSR value vector. Tail recursion.
+defn means_sum_all(val: Vector, nnz: Int, k: Int, acc: Float)
+    [nnz >= 0 && k >= 0][true]
+    -> Float
+{
+    when k >= nnz {
+        term acc;
+    };
+    term means_sum_all(val, nnz, k + 1, acc + vec_get(val, k));
+};
+
+// means_fill_users - for each user u, write its true mean and presence flag.
+// The user's ratings are user_val[begin..end); the count end-begin is the
+// observed-rating count. Empty user (begin == end) => mean := global, has := 0.
+defn means_fill_users(pop: RatingPopulation, umean: Vector, uhas: IntVec, global: Float, u: Int)
+    [u >= 0][true]
+    -> Int
+{
+    when u >= pop.nusers {
+        term 0;
+    };
+    let begin: Int = pop_user_begin(pop, u);
+    let end:   Int = pop_user_end(pop, u);
+    means_write_row(pop.user_val, umean, uhas, global, u, begin, end);
+    term means_fill_users(pop, umean, uhas, global, u + 1);
+};
+
+// means_fill_items - the per-item mirror over item_val / item offsets.
+defn means_fill_items(pop: RatingPopulation, imean: Vector, ihas: IntVec, global: Float, i: Int)
+    [i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term 0;
+    };
+    let begin: Int = pop_item_begin(pop, i);
+    let end:   Int = pop_item_end(pop, i);
+    means_write_row(pop.item_val, imean, ihas, global, i, begin, end);
+    term means_fill_items(pop, imean, ihas, global, i + 1);
+};
+
+// means_write_row - shared writer: mean of val[begin..end) into dst[idx], or the
+// global fallback with has=0 when the slice is empty. val is the orientation's
+// value vector (user_val or item_val); the slice is contiguous in CSR order.
+defn means_write_row(val: Vector, dst: Vector, has: IntVec, global: Float, idx: Int, begin: Int, end: Int)
+    [idx >= 0 && begin >= 0 && end >= begin][true]
+    -> Int
+{
+    let cnt: Int = end - begin;
+    when cnt <= 0 {
+        vec_set(dst, idx, global);
+        ivec_set(has, idx, 0);
+        term 0;
+    };
+    let sum: Float = means_slice_sum(val, begin, end, 0.0);
+    vec_set(dst, idx, sum / (cnt as Float));
+    ivec_set(has, idx, 1);
+    term 0;
+};
+
+// means_slice_sum - sum val[begin..end). Tail recursion carrying the start
+// cursor forward to end.
+defn means_slice_sum(val: Vector, begin: Int, end: Int, acc: Float)
+    [begin >= 0 && end >= begin][true]
+    -> Float
+{
+    when begin >= end {
+        term acc;
+    };
+    term means_slice_sum(val, begin + 1, end, acc + vec_get(val, begin));
+};
+
+// ── accessors ─────────────────────────────────────────────────────────────────
+defn means_user(m: Means, u: Int) [u >= 0 && u < m.user_mean.len][true] -> Float {
+    term vec_get(m.user_mean, u);
+};
+defn means_item(m: Means, i: Int) [i >= 0 && i < m.item_mean.len][true] -> Float {
+    term vec_get(m.item_mean, i);
+};
+defn means_user_has(m: Means, u: Int) [u >= 0 && u < m.user_has.len][true] -> Bool {
+    term ivec_get(m.user_has, u) == 1;
+};
+defn means_item_has(m: Means, i: Int) [i >= 0 && i < m.item_has.len][true] -> Bool {
+    term ivec_get(m.item_has, i) == 1;
+};
+
+defn means_free(m: Means) -> Void {
+    vec_free(m.user_mean);
+    vec_free(m.item_mean);
+    ivec_free(m.user_has);
+    ivec_free(m.item_has);
+    term;
+};
+
+// ── Part 2a: base PCC over the RAW observed overlap (Task 6.3 prerequisite) ──
+//
+// WHY A "BASE" SIMILARITY. The served PCC (Task 6.5) is computed over the
+// IMPUTED key-set space, but the imputation itself (Eq. 7 / §3.2) needs
+// similarity weights — a definitional circularity. AutAI-Fusion resolves it in
+// two stages (design DAG: UMEAN → IMPUTE → SIM): a BASE similarity over the raw
+// observed overlap drives the imputation, then the served similarity is
+// recomputed over the now-dense imputed vectors. This section is that base
+// stage. It is exactly the oracle's `pcc_users` formula (mean-centered Pearson
+// over the items both users observed), but computed sparsely by merging the two
+// CSR rating lists instead of scanning a dense row.
+//
+// SPARSE OVERLAP MERGE. The counting-sort CSR (rating_population.bv) leaves each
+// row's (item, value) pairs in ITEM-ASCENDING order, so two users' rating lists
+// merge like two sorted runs: advance the smaller item index; on an equal index
+// the item is in the overlap and contributes to the three PCC sums.
+
+// base_sim_user - base PCC of users a,b over their raw observed item overlap,
+// mean-centered by each user's true mean. Zero-norm on either side => 0.0.
+defn base_sim_user(pop: RatingPopulation, m: Means, a: Int, b: Int)
+    [a >= 0 && a < pop.nusers && b >= 0 && b < pop.nusers][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    let mb: Float = means_user(m, b);
+    let (num, da, db): (Float, Float, Float) = overlap_acc(
+        pop.user_item, pop.user_val, pop.user_item, pop.user_val, ma, mb,
+        pop_user_begin(pop, a), pop_user_end(pop, a),
+        pop_user_begin(pop, b), pop_user_end(pop, b),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// base_sim_item - the item-space mirror: base PCC of items s,t over the raw
+// overlap of users who rated both, mean-centered by each item's true mean.
+defn base_sim_item(pop: RatingPopulation, m: Means, s: Int, t: Int)
+    [s >= 0 && s < pop.nitems && t >= 0 && t < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let mt: Float = means_item(m, t);
+    let (num, da, db): (Float, Float, Float) = overlap_acc(
+        pop.item_user, pop.item_val, pop.item_user, pop.item_val, ms, mt,
+        pop_item_begin(pop, s), pop_item_end(pop, s),
+        pop_item_begin(pop, t), pop_item_end(pop, t),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// overlap_acc - merge two sorted CSR runs and accumulate the three mean-centered
+// PCC sums over their shared keys. key_a[ia] is run A's current key (item index
+// for the user orientation, user index for the item orientation); val_a its
+// value. On a key match both contribute a centered product; otherwise advance
+// the run with the smaller key. Tail recursion over both cursors.
+defn overlap_acc(
+    key_a: IntVec, val_a: Vector, key_b: IntVec, val_b: Vector,
+    mean_a: Float, mean_b: Float,
+    ia: Int, enda: Int, ib: Int, endb: Int,
+    num: Float, da: Float, db: Float)
+    [ia >= 0 && ib >= 0][true]
+    -> (Float, Float, Float)
+{
+    when ia >= enda || ib >= endb {
+        term (num, da, db);
+    };
+    let ka: Int = ivec_get(key_a, ia);
+    let kb: Int = ivec_get(key_b, ib);
+    when ka == kb {
+        let ca: Float = vec_get(val_a, ia) - mean_a;
+        let cb: Float = vec_get(val_b, ib) - mean_b;
+        term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+            ia + 1, enda, ib + 1, endb,
+            num + ca * cb, da + ca * ca, db + cb * cb);
+    };
+    when ka < kb {
+        term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+            ia + 1, enda, ib, endb, num, da, db);
+    };
+    term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+        ia, enda, ib + 1, endb, num, da, db);
+};
+
+// pcc_finish - num / (sqrt(da)·sqrt(db)); zero-variance (either norm 0) => 0.0,
+// the design's zero-variance rule (avoids a NaN denominator). Shared by base
+// and (Task 6.5) imputed-space PCC.
+defn pcc_finish(num: Float, da: Float, db: Float) -> Float {
+    when da <= 0.0 || db <= 0.0 {
+        term 0.0;
+    };
+    term num / (Sqrt#(da) * Sqrt#(db));
+};
+
+// ── Part 2b: key-set imputation (Task 6.3) — Eq. 7 / §3.2, EXECUTED ──────────
+//
+// WHY IMPUTE (corrects C++ defect #2). Before the served PCC and prediction,
+// AutAI fills the missing entries of the active key neighborhood with an
+// estimate instead of leaving them absent. The C++ guarded this loop into dead
+// code; here it RUNS, so an imputed cell genuinely differs from the raw
+// (missing) cell — that difference is exactly what Property 10 checks.
+//
+// Eq. 7 (user side): a missing cell (a, i) is estimated as
+//   r̂ai = ūa + ( Σ_x basesim(a,x)·(rxi − ūx) ) / ( Σ_x |basesim(a,x)| )
+// over users x ≠ a who OBSERVED item i. The neighbors-who-rated-i are exactly
+// item i's CSR column (item_user[item_off[i]..]), so the item orientation drives
+// the user-side imputation — the reason the population is dual-oriented.
+// §3.2 (item side) is the mirror: a missing (s, u) cell uses item means and the
+// users's rated items as the neighbor set.
+
+// impute_user - the Eq. 7 user-side estimate for cell (a, i). An OBSERVED cell
+// returns its real rating (imputation only fills gaps); a missing cell returns
+// the similarity-weighted neighbor estimate, falling back to ūa when no
+// weighted neighbor rated i (Σ|sim| == 0).
+defn impute_user(pop: RatingPopulation, m: Means, a: Int, i: Int)
+    [a >= 0 && a < pop.nusers && i >= 0 && i < pop.nitems][true]
+    -> Float
+{
+    let observed: Float = lookup_user_item(pop, a, i);
+    when observed >= 0.0 {
+        term observed;
+    };
+    let ma: Float = means_user(m, a);
+    // neighbors who rated item i = item i's CSR column of users.
+    let (accum, wsum): (Float, Float) = impute_user_acc(
+        pop, m, a, ma, pop.item_user, pop.item_val,
+        pop_item_begin(pop, i), pop_item_end(pop, i), 0.0, 0.0);
+    when wsum <= 0.0 {
+        term ma;
+    };
+    term ma + accum / wsum;
+};
+
+// impute_user_acc - over item i's column (user x, rating rxi), accumulate
+// Σ basesim(a,x)·(rxi − ūx) and Σ|basesim(a,x)|, skipping x == a. Tail recursion
+// down the column slice [cur, end).
+defn impute_user_acc(
+    pop: RatingPopulation, m: Means, a: Int, ma: Float,
+    col_user: IntVec, col_val: Vector, cur: Int, end: Int,
+    accum: Float, wsum: Float)
+    [a >= 0 && cur >= 0 && end >= cur][true]
+    -> (Float, Float)
+{
+    when cur >= end {
+        term (accum, wsum);
+    };
+    let x: Int = ivec_get(col_user, cur);
+    when x == a {
+        term impute_user_acc(pop, m, a, ma, col_user, col_val, cur + 1, end, accum, wsum);
+    };
+    let sim: Float = base_sim_user(pop, m, a, x);
+    let rxi: Float = vec_get(col_val, cur);
+    let mx:  Float = means_user(m, x);
+    term impute_user_acc(pop, m, a, ma, col_user, col_val, cur + 1, end,
+        accum + sim * (rxi - mx), wsum + Fabs#(sim));
+};
+
+// impute_item - the §3.2 item-side mirror: estimate cell (s, u). Observed =>
+// real rating; missing => Σ basesim(s,t)·(rut − t̄t) / Σ|basesim| over items t
+// (t ≠ s) that user u rated (user u's CSR row), falling back to t̄s.
+defn impute_item(pop: RatingPopulation, m: Means, s: Int, u: Int)
+    [s >= 0 && s < pop.nitems && u >= 0 && u < pop.nusers][true]
+    -> Float
+{
+    let observed: Float = lookup_user_item(pop, u, s);
+    when observed >= 0.0 {
+        term observed;
+    };
+    let ms: Float = means_item(m, s);
+    // neighbors = items user u rated = user u's CSR row.
+    let (accum, wsum): (Float, Float) = impute_item_acc(
+        pop, m, s, pop.user_item, pop.user_val,
+        pop_user_begin(pop, u), pop_user_end(pop, u), 0.0, 0.0);
+    when wsum <= 0.0 {
+        term ms;
+    };
+    term ms + accum / wsum;
+};
+
+// impute_item_acc - over user u's row (item t, rating rut), accumulate
+// Σ basesim(s,t)·(rut − t̄t) and Σ|basesim(s,t)|, skipping t == s. Tail recursion.
+defn impute_item_acc(
+    pop: RatingPopulation, m: Means, s: Int,
+    row_item: IntVec, row_val: Vector, cur: Int, end: Int,
+    accum: Float, wsum: Float)
+    [s >= 0 && cur >= 0 && end >= cur][true]
+    -> (Float, Float)
+{
+    when cur >= end {
+        term (accum, wsum);
+    };
+    let t: Int = ivec_get(row_item, cur);
+    when t == s {
+        term impute_item_acc(pop, m, s, row_item, row_val, cur + 1, end, accum, wsum);
+    };
+    let sim: Float = base_sim_item(pop, m, s, t);
+    let rut: Float = vec_get(row_val, cur);
+    let mt:  Float = means_item(m, t);
+    term impute_item_acc(pop, m, s, row_item, row_val, cur + 1, end,
+        accum + sim * (rut - mt), wsum + Fabs#(sim));
+};
+
+// lookup_user_item - the observed rating of (user u, item i), or -1.0 when the
+// cell is missing. Walks user u's item-ascending CSR row; ratings are in [1,5]
+// so -1.0 is an unambiguous "missing" sentinel.
+defn lookup_user_item(pop: RatingPopulation, u: Int, i: Int)
+    [u >= 0 && u < pop.nusers && i >= 0][true]
+    -> Float
+{
+    term lookup_row(pop.user_item, pop.user_val, i,
+        pop_user_begin(pop, u), pop_user_end(pop, u));
+};
+defn lookup_row(row_item: IntVec, row_val: Vector, target: Int, cur: Int, end: Int)
+    [cur >= 0 && end >= cur][true]
+    -> Float
+{
+    when cur >= end {
+        term -1.0;
+    };
+    let it: Int = ivec_get(row_item, cur);
+    when it == target {
+        term vec_get(row_val, cur);
+    };
+    when it > target {
+        term -1.0;
+    };
+    term lookup_row(row_item, row_val, target, cur + 1, end);
+};
+
+// ── Part 2c: served PCC sim' over the imputed key-set space (Task 6.5) ───────
+//
+// The served similarity (Eq. 9 user-user, Eq. 10 item-item) is stage 2: the PCC
+// over the IMPUTED KEY-SET space, not the raw overlap. The key set is the UNION
+// of items either user rated (user-confirmed); within it each user's entry is
+// `impute_user` (real where observed, Eq. 7 where missing), mean-centered by the
+// user's true mean. Zero-norm => 0.0 (zero-variance rule); the NaN/Inf guard is
+// pcc_finish's domain check (no Sqrt# of a negative, no /0).
+//
+// SPARSE UNION MERGE. Unlike overlap_acc (which processes only shared keys), the
+// union walk processes EVERY key present in either row — advancing both cursors
+// on a match and the smaller-key cursor otherwise — because an item rated by
+// only one user is still in the key set (imputed for the other). The two CSR
+// rows are item-ascending, so the union is produced in order with no dedup pass.
+
+// sim_user - sim'(a,b): PCC over the imputed union key-set of users a,b, each
+// entry imputed (Eq. 7) and mean-centered by the user's true mean.
+defn sim_user(pop: RatingPopulation, m: Means, a: Int, b: Int)
+    [a >= 0 && a < pop.nusers && b >= 0 && b < pop.nusers][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    let mb: Float = means_user(m, b);
+    let (num, da, db): (Float, Float, Float) = sim_union_user(
+        pop, m, a, b, ma, mb,
+        pop_user_begin(pop, a), pop_user_end(pop, a),
+        pop_user_begin(pop, b), pop_user_end(pop, b),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// sim_union_user - walk the UNION of users a,b item indices (item-ascending CSR
+// rows). At each union item, both users' imputed, mean-centered values feed the
+// three PCC sums. On a match advance both; otherwise advance the smaller item,
+// but ALWAYS process the item (the non-rater's value is the Eq. 7 imputation).
+defn sim_union_user(
+    pop: RatingPopulation, m: Means, a: Int, b: Int, ma: Float, mb: Float,
+    ia: Int, enda: Int, ib: Int, endb: Int,
+    num: Float, da: Float, db: Float)
+    [ia >= 0 && ib >= 0][true]
+    -> (Float, Float, Float)
+{
+    when ia >= enda && ib >= endb {
+        term (num, da, db);
+    };
+    let item: Int = sim_next_item(pop.user_item, ia, enda, pop.user_item, ib, endb);
+    let va: Float = impute_user(pop, m, a, item) - ma;
+    let vb: Float = impute_user(pop, m, b, item) - mb;
+    let (na, nb): (Int, Int) = sim_advance(pop.user_item, ia, enda, pop.user_item, ib, endb, item);
+    term sim_union_user(pop, m, a, b, ma, mb, na, enda, nb, endb,
+        num + va * vb, da + va * va, db + vb * vb);
+};
+
+// sim_item - sim'(s,t): the item-space mirror over the imputed union user-set.
+defn sim_item(pop: RatingPopulation, m: Means, s: Int, t: Int)
+    [s >= 0 && s < pop.nitems && t >= 0 && t < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let mt: Float = means_item(m, t);
+    let (num, da, db): (Float, Float, Float) = sim_union_item(
+        pop, m, s, t, ms, mt,
+        pop_item_begin(pop, s), pop_item_end(pop, s),
+        pop_item_begin(pop, t), pop_item_end(pop, t),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+defn sim_union_item(
+    pop: RatingPopulation, m: Means, s: Int, t: Int, ms: Float, mt: Float,
+    is: Int, ends: Int, it: Int, endt: Int,
+    num: Float, da: Float, db: Float)
+    [is >= 0 && it >= 0][true]
+    -> (Float, Float, Float)
+{
+    when is >= ends && it >= endt {
+        term (num, da, db);
+    };
+    let usr: Int = sim_next_item(pop.item_user, is, ends, pop.item_user, it, endt);
+    // imputed cell (item, user): impute_item(pop, m, item=s|t, user=usr).
+    let va: Float = impute_item(pop, m, s, usr) - ms;
+    let vb: Float = impute_item(pop, m, t, usr) - mt;
+    let (ns, nt): (Int, Int) = sim_advance(pop.item_user, is, ends, pop.item_user, it, endt, usr);
+    term sim_union_item(pop, m, s, t, ms, mt, ns, ends, nt, endt,
+        num + va * vb, da + va * va, db + vb * vb);
+};
+
+// sim_next_item - the next union key = the smaller of the two cursors' current
+// keys (or whichever run is non-exhausted). Shared by the user and item walks.
+defn sim_next_item(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: Int)
+    [ia >= 0 && ib >= 0][true]
+    -> Int
+{
+    when ia >= enda {
+        term ivec_get(kb, ib);
+    };
+    when ib >= endb {
+        term ivec_get(ka, ia);
+    };
+    let va: Int = ivec_get(ka, ia);
+    let vb: Int = ivec_get(kb, ib);
+    when va <= vb {
+        term va;
+    };
+    term vb;
+};
+
+// sim_advance - advance each cursor past `key` if it currently sits on `key`
+// (a cursor only moves off a key it actually holds — the merge invariant).
+defn sim_advance(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: Int, key: Int)
+    [ia >= 0 && ib >= 0][true]
+    -> (Int, Int)
+{
+    let na: Int = sim_step(ka, ia, enda, key);
+    let nb: Int = sim_step(kb, ib, endb, key);
+    term (na, nb);
+};
+defn sim_step(k: IntVec, i: Int, end: Int, key: Int) [i >= 0][true] -> Int {
+    when i >= end {
+        term i;
+    };
+    when ivec_get(k, i) == key {
+        term i + 1;
+    };
+    term i;
+};
+
+// ── Part 3: kNN prediction (Task 7.1) — Eq. 29/30, k=30, η-normalized ────────
+//
+// Eq. 29 (user-based): r̂ᵘas = ūa + ( Σ_x sim'(a,x)·(rxs − ūx) ) / η_u, where
+// η_u = Σ_x sim'(a,x) over the k NEAREST user-neighbors who rated item s. The
+// weight is the SERVED sim' (Task 6.5), not the base sim. Eq. 30 is the mirror.
+//
+// NEIGHBOR SELECTION (corrects C++ defect #3). Candidates = users who rated s
+// (item s's CSR column). We gather each candidate's sim' into a scratch buffer,
+// select the k LARGEST by sim', then aggregate over EXACTLY that selected set,
+// each neighbor ONCE — no `+first −last` off-by-one. η is the sim' sum over the
+// SAME selected set as the numerator (Req 4.10/4.11). When candidates ≤ k every
+// candidate is selected (the 4×4 case: <30 neighbors); the truncation path is
+// exercised by the ≥31-neighbor probe in the harness.
+
+const NEIGHBOR_K: Int = 30;   // Neighbor_Count default (Req 4.12)
+
+// predict_user - user-based Eq. 29 for cell (a, s). Zero-η (no selected neighbor
+// rated s, or all sims zero) => the active user's true mean (Req 4.15 fallback).
+defn predict_user(pop: RatingPopulation, m: Means, a: Int, s: Int)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    // candidates = users who rated item s = item s's CSR column.
+    let begin: Int = pop_item_begin(pop, s);
+    let cnt:   Int = pop_item_end(pop, s) - begin;
+    when cnt <= 0 {
+        term ma;
+    };
+    // scratch parallel buffers: candidate user, their sim'(a,x), their (rxs−ūx).
+    let cu:  IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pu_gather(pop, m, a, s, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
+    let (accum, eta): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, NEIGHBOR_K);
+    ivec_free(cu); vec_free(csim); vec_free(cdev);
+    when eta == 0.0 {
+        term ma;
+    };
+    term ma + accum / eta;
+};
+
+// pu_gather - walk item s's column (user x, rxs). For each x≠a, record the
+// candidate: cu[n]=x, csim[n]=sim'(a,x), cdev[n]=rxs−ūx. Returns the fill count
+// n (≤ cnt; x==a is skipped). Tail recursion over the column slice.
+defn pu_gather(
+    pop: RatingPopulation, m: Means, a: Int, s: Int,
+    col_user: IntVec, col_val: Vector, cur: Int, end: Int, n: Int,
+    cu: IntVec, csim: Vector, cdev: Vector)
+    [a >= 0 && cur >= 0 && n >= 0][true]
+    -> Int
+{
+    when cur >= end {
+        term n;
+    };
+    let x: Int = ivec_get(col_user, cur);
+    when x == a {
+        term pu_gather(pop, m, a, s, col_user, col_val, cur + 1, end, n, cu, csim, cdev);
+    };
+    ivec_set(cu, n, x);
+    vec_set(csim, n, sim_user(pop, m, a, x));
+    vec_set(cdev, n, vec_get(col_val, cur) - means_user(m, x));
+    term pu_gather(pop, m, a, s, col_user, col_val, cur + 1, end, n + 1, cu, csim, cdev);
+};
+
+// predict_item - item-based Eq. 30 for cell (a, s): candidates = items the
+// active user a rated (user a's CSR row); weight sim'(s,t); dev = (rat − t̄t).
+// Zero-η => the active item's true mean (Req 4.16 fallback).
+defn predict_item(pop: RatingPopulation, m: Means, a: Int, s: Int)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let begin: Int = pop_user_begin(pop, a);
+    let cnt:   Int = pop_user_end(pop, a) - begin;
+    when cnt <= 0 {
+        term ms;
+    };
+    let ct:   IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pi_gather(pop, m, s, pop.user_item, pop.user_val, begin, begin + cnt, 0, ct, csim, cdev);
+    let (accum, eta): (Float, Float) = knn_aggregate(ct, csim, cdev, nfill, NEIGHBOR_K);
+    ivec_free(ct); vec_free(csim); vec_free(cdev);
+    when eta == 0.0 {
+        term ms;
+    };
+    term ms + accum / eta;
+};
+
+// pi_gather - walk user a's row (item t, rat). For each t≠s, record ct[n]=t,
+// csim[n]=sim'(s,t), cdev[n]=rat−t̄t. Tail recursion.
+defn pi_gather(
+    pop: RatingPopulation, m: Means, s: Int,
+    row_item: IntVec, row_val: Vector, cur: Int, end: Int, n: Int,
+    ct: IntVec, csim: Vector, cdev: Vector)
+    [s >= 0 && cur >= 0 && n >= 0][true]
+    -> Int
+{
+    when cur >= end {
+        term n;
+    };
+    let t: Int = ivec_get(row_item, cur);
+    when t == s {
+        term pi_gather(pop, m, s, row_item, row_val, cur + 1, end, n, ct, csim, cdev);
+    };
+    ivec_set(ct, n, t);
+    vec_set(csim, n, sim_item(pop, m, s, t));
+    vec_set(cdev, n, vec_get(row_val, cur) - means_item(m, t));
+    term pi_gather(pop, m, s, row_item, row_val, cur + 1, end, n + 1, ct, csim, cdev);
+};
+
+// knn_aggregate - select the k LARGEST by csim[] from the n candidates, then sum
+// Σ csim·cdev (numerator) and Σ csim (η) over EXACTLY the selected set, each
+// candidate once. Returns (accum, eta). When n ≤ k all candidates are selected.
+// Selection: a `used` marker + k passes each taking the max remaining sim — the
+// contribution is added the moment a candidate is selected, so each is counted
+// exactly once (defect-#3 correction is structural, not a fragile index walk).
+defn knn_aggregate(cand: IntVec, csim: Vector, cdev: Vector, n: Int, k: Int)
+    [n >= 0 && k >= 0][true]
+    -> (Float, Float)
+{
+    let used: IntVec = ivec_new(knn_cap(n));
+    knn_zero(used, n, 0);
+    let take: Int = knn_min(n, k);
+    let (accum, eta): (Float, Float) = knn_select(csim, cdev, used, n, take, 0, 0.0, 0.0);
+    ivec_free(used);
+    term (accum, eta);
+};
+
+// 2026-10-22: active prediction scans every catalogue item using one worker-
+// owned candidate workspace. Reset only the used prefix so ties and selection
+// order exactly match knn_aggregate while avoiding per-item marker allocation.
+defn knn_aggregate_reuse(csim: Vector, cdev: Vector, used: IntVec, n: Int, k: Int)
+    [n >= 0 && k >= 0 && n <= csim.len && n <= cdev.len && n <= used.len][true]
+    -> (Float, Float)
+{
+    knn_zero(used,n,0);
+    term knn_select(csim,cdev,used,n,knn_min(n,k),0,0.0,0.0);
+};
+defn knn_cap(n: Int) [n >= 0][term >= 1] -> Int {
+    when n <= 0 { term 1; };
+    term n;
+};
+defn knn_min(a: Int, b: Int) -> Int {
+    when a <= b { term a; };
+    term b;
+};
+defn knn_zero(used: IntVec, n: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
+    when i >= n { term 0; };
+    ivec_set(used, i, 0);
+    term knn_zero(used, n, i + 1);
+};
+
+// knn_select - `take` passes; each finds the max-sim UNUSED candidate, marks it,
+// and adds its contribution to accum/eta. Done when `take` neighbors selected or
+// no unused candidate remains. Tail recursion over the passes.
+defn knn_select(csim: Vector, cdev: Vector, used: IntVec, n: Int, take: Int, done: Int, accum: Float, eta: Float)
+    [n >= 0 && take >= 0 && done >= 0][true]
+    -> (Float, Float)
+{
+    when done >= take {
+        term (accum, eta);
+    };
+    let best: Int = knn_argmax(csim, used, n, 0, -1, 0.0);
+    when best < 0 {
+        term (accum, eta);
+    };
+    ivec_set(used, best, 1);
+    let sim: Float = vec_get(csim, best);
+    term knn_select(csim, cdev, used, n, take, done + 1,
+        accum + sim * vec_get(cdev, best), eta + sim);
+};
+
+// knn_argmax - index of the max csim among unused candidates [0,n); -1 if none
+// unused. `bi` is the best index so far, `bv` its sim. Tail recursion.
+defn knn_argmax(csim: Vector, used: IntVec, n: Int, i: Int, bi: Int, bv: Float)
+    [n >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= n {
+        term bi;
+    };
+    when ivec_get(used, i) == 1 {
+        term knn_argmax(csim, used, n, i + 1, bi, bv);
+    };
+    let si: Float = vec_get(csim, i);
+    when bi < 0 || si > bv {
+        term knn_argmax(csim, used, n, i + 1, i, si);
+    };
+    term knn_argmax(csim, used, n, i + 1, bi, bv);
+};
+
+// ── Part 3b: λ fusion + clamp + zero-η fallbacks (Task 7.5) ───────────────────
+//
+// cf_predict: r̂as = λ·r̂ᵘas + (1−λ)·r̂ⁱas (Eq. 31), clamped to [1,5]. The zero-η
+// fallbacks live INSIDE predict_user/predict_item (η_u=0 ⇒ ūa, η_i=0 ⇒ t̄s), so
+// a both-zero cell fuses the two means and clamps (Req 4.15/4.16/4.17) with no
+// extra branch here. λ ∈ [0,1], default 0.5 (env-configurable in Task 10/12).
+defn cf_predict(pop: RatingPopulation, m: Means, a: Int, s: Int, lam: Float)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems && lam >= 0.0 && lam <= 1.0][true]
+    -> Float
+{
+    let ru: Float = predict_user(pop, m, a, s);
+    let ri: Float = predict_item(pop, m, a, s);
+    term clamp15(lam * ru + (1.0 - lam) * ri);
+};
+defn clamp15(v: Float) -> Float {
+    when v < 1.0 { term 1.0; };
+    when v > 5.0 { term 5.0; };
+    term v;
+};
+
+// ── Part 4: top-N serving (Task 8.1) — exclude rated, desc, item-asc tie ─────
+//
+// cf_recommend: rank the items the active user has NOT rated by fused cf_predict
+// DESCENDING, ties broken by item index ASCENDING, take the top `topn`. Writes
+// the ordered item indices into out_items (an IntVec of length ≥ topn) and
+// returns the count = min(topn, eligible items) (Req 4.18, 4.19).
+//
+// EXCLUSION. An item the user already rated is in the user's CSR row; rec_rated
+// checks membership (the row is item-ascending, early-out). Excluded items are
+// never scored or emitted.
+//
+// SELECTION. Dense selection over all nitems: each pass picks the unpicked,
+// unrated item with the max fused score (ties → smaller index via strict `>`),
+// marks it picked, records it. O(topn · nitems · predict) — fine for serving a
+// single user (the design's O(k)-per-request lives in the cached matrices, Task
+// 9); here correctness first.
+
+const TOP_N: Int = 5;   // Top_N default (Req 4.19 / design)
+
+// cf_recommend - top-N for user `a`. out_items must have capacity ≥ topn.
+defn cf_recommend(pop: RatingPopulation, m: Means, a: Int, topn: Int, lam: Float, out_items: IntVec)
+    [a >= 0 && a < pop.nusers && topn >= 0 && lam >= 0.0 && lam <= 1.0][true]
+    -> Int
+{
+    let picked: IntVec = ivec_new(knn_cap(pop.nitems));
+    knn_zero(picked, pop.nitems, 0);
+    rec_init(pop, a, picked, 0);
+    let n: Int = rec_fill(pop, m, a, topn, lam, picked, out_items, 0);
+    ivec_free(picked);
+    term n;
+};
+// rec_init - picked[i] = 1 for every item user a already rated (so it is
+// excluded from serving). Runs AFTER knn_zero cleared the array, so unrated
+// items stay 0 (ivec_new memory is uninitialized — never rely on it being 0).
+// Walks all nitems. Tail recursion.
+defn rec_init(pop: RatingPopulation, a: Int, picked: IntVec, i: Int)
+    [a >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term 0;
+    };
+    when rec_rated(pop, a, i) {
+        ivec_set(picked, i, 1);
+    };
+    term rec_init(pop, a, picked, i + 1);
+};
+// rec_rated - true iff user a's CSR row contains item i (observed). Item-ascending
+// row, so early-out once we pass i.
+defn rec_rated(pop: RatingPopulation, a: Int, i: Int) [a >= 0 && i >= 0][true] -> Bool {
+    term rec_row_has(pop.user_item, i, pop_user_begin(pop, a), pop_user_end(pop, a));
+};
+defn rec_row_has(row_item: IntVec, target: Int, cur: Int, end: Int)
+    [cur >= 0 && end >= cur][true]
+    -> Bool
+{
+    when cur >= end {
+        term false;
+    };
+    let it: Int = ivec_get(row_item, cur);
+    when it == target {
+        term true;
+    };
+    when it > target {
+        term false;
+    };
+    term rec_row_has(row_item, target, cur + 1, end);
+};
+// rec_fill - emit up to `topn` items by descending fused score, item-ascending
+// tie-break. Each pass selects the best unpicked item, marks it, records it.
+defn rec_fill(pop: RatingPopulation, m: Means, a: Int, topn: Int, lam: Float, picked: IntVec, out_items: IntVec, done: Int)
+    [a >= 0 && topn >= 0 && done >= 0][true]
+    -> Int
+{
+    when done >= topn {
+        term done;
+    };
+    let best: Int = rec_argbest(pop, m, a, lam, picked, 0, -1, 0.0);
+    when best < 0 {
+        term done;
+    };
+    ivec_set(picked, best, 1);
+    ivec_set(out_items, done, best);
+    term rec_fill(pop, m, a, topn, lam, picked, out_items, done + 1);
+};
+// rec_argbest - index of the unpicked item with the max fused cf_predict; ties
+// broken by SMALLER index (strict `>` leaves the first/smaller on a tie). -1 if
+// none unpicked remain. Items scan ascending so the tie-break is automatic.
+defn rec_argbest(pop: RatingPopulation, m: Means, a: Int, lam: Float, picked: IntVec, i: Int, bi: Int, bscore: Float)
+    [a >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term bi;
+    };
+    when ivec_get(picked, i) == 1 {
+        term rec_argbest(pop, m, a, lam, picked, i + 1, bi, bscore);
+    };
+    let score: Float = cf_predict(pop, m, a, i, lam);
+    when bi < 0 || score > bscore {
+        term rec_argbest(pop, m, a, lam, picked, i + 1, i, score);
+    };
+    term rec_argbest(pop, m, a, lam, picked, i + 1, bi, bscore);
+};
+
+// ── Part 5: Similarity_Cache (Task 9.1) — the served snapshot ────────────────
+//
+// WHY A CACHE. Everything above recomputes means + both PCC matrices INSIDE
+// every prediction (sim_user/sim_item walk the CSR rows, and impute_user/
+// impute_item themselves call base_sim_* — so a single cf_predict is
+// O(population²) in the worst case). That is correct but far too slow to serve a
+// request. The design's fix (Req 6.3 / 10.4) is to PRECOMPUTE both similarity
+// matrices and both mean vectors ONCE into a SimCache, so a served prediction is
+// O(k) table reads (mat_get) instead of O(population) recomputation.
+//
+// WHAT IT HOLDS (design "Similarity_Cache"): the two dense PCC matrices
+// (user-user nusers², item-item nitems²), the two mean vectors (reused straight
+// from Means — same Malloc# blocks, the cache does not copy them), and a
+// PopSignature (Task 9.4) that records which population the snapshot was built
+// from. The matrices are Matrix (matrix.bv): flat row-major Float blocks indexed
+// at an 8-byte stride — exactly the risk-ledger large-Malloc path at 943/1682
+// scale, exercised here at 4×4 for correctness.
+//
+// CORRECTNESS = MEMOIZATION. A cached entry is DEFINED to equal the engine's
+// on-the-fly sim' (sim_user/sim_item), which Task 6.5 already anchors to
+// reference.bv's pcc_imputed_users/pcc_imputed_items. So the 9.1 gate is
+// "simcache_user_sim(sc,a,b) == sim_user(pop,m,a,b)" for every pair — the cache
+// introduces no new numeric claim, it just stores the same value once.
+//
+// SYMMETRY. sim'(a,b) == sim'(b,a) (PCC is symmetric), so we compute the lower
+// triangle (b <= a) once and mirror into both [a][b] and [b][a]; the diagonal is
+// 1.0 by construction (a centered vector correlated with itself). This halves the
+// PCC work building the matrix.
+
+// PopSignature (Task 9.4) — the freshness key. A persisted cache is FRESH iff
+// its signature equals the current population's: same record count (nnz) AND
+// same backing-source modification time (mtime). Any mismatch is STALE (Req
+// 6.6). mtime is the mtime of the rating source the population was built from
+// (u.data / the DB load); at Task 9 the mechanism COMPARES whatever mtime the
+// caller records — the real stat(2) of u.data is wired in Task 10/12.
+obj PopSignature {
+    nnz:   Int;    // observed-rating record count
+    mtime: Int;    // backing-source modification time (seconds / ns — caller's unit)
+};
+
+obj SimCache {
+    user_sim:  Matrix;       // nusers × nusers PCC (sim', Eq. 9)
+    item_sim:  Matrix;       // nitems × nitems PCC (sim', Eq. 10)
+    user_mean: Vector;       // nusers true means  (borrowed from Means)
+    item_mean: Vector;       // nitems true means  (borrowed from Means)
+    nusers: Int;
+    nitems: Int;
+    sig:    PopSignature;    // which population this snapshot was built from
+};
+
+// pop_signature - the freshness key for `pop` at source-mtime `mtime`.
+defn pop_signature(pop: RatingPopulation, mtime: Int) -> PopSignature {
+    term PopSignature { nnz: pop.nnz, mtime: mtime };
+};
+
+// sig_fresh - a persisted signature `art` is fresh against the current `cur` iff
+// BOTH the record count and the mtime match. Any mismatch ⇒ stale (Req 6.6).
+defn sig_fresh(art: PopSignature, cur: PopSignature) -> Bool {
+    term art.nnz == cur.nnz && art.mtime == cur.mtime;
+};
+
+// simcache_build - precompute the served snapshot from a (pop, Means) and record
+// its PopSignature at source-mtime `mtime`. The mean vectors are the SAME blocks
+// Means already holds (a value handle, not a copy); simcache_free therefore does
+// NOT free them (means_free owns them). The two matrices are fresh Malloc# blocks
+// the cache owns.
+defn simcache_build(pop: RatingPopulation, m: Means, mtime: Int)
+    [pop.nusers >= 1 && pop.nitems >= 1][true]
+    -> SimCache
+{
+    let usim: Matrix = mat_new(pop.nusers, pop.nusers);
+    sc_fill_user(pop, m, usim, 0);
+    let isim: Matrix = mat_new(pop.nitems, pop.nitems);
+    sc_fill_item(pop, m, isim, 0);
+    term SimCache {
+        user_sim: usim, item_sim: isim,
+        user_mean: m.user_mean, item_mean: m.item_mean,
+        nusers: pop.nusers, nitems: pop.nitems,
+        sig: pop_signature(pop, mtime)
+    };
+};
+
+// sc_fill_user - fill row a of the user-user matrix. For each b in [0, a] compute
+// sim_user once and write BOTH [a][b] and [b][a] (symmetry); the diagonal [a][a]
+// is 1.0 (sim' of a user with itself). Tail recursion over rows a, inner over b.
+defn sc_fill_user(pop: RatingPopulation, m: Means, usim: Matrix, a: Int)
+    [a >= 0][true]
+    -> Int
+{
+    when a >= pop.nusers {
+        term 0;
+    };
+    sc_fill_user_row(pop, m, usim, a, 0);
+    term sc_fill_user(pop, m, usim, a + 1);
+};
+defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: Matrix, a: Int, b: Int)
+    [a >= 0 && b >= 0][true]
+    -> Int
+{
+    when b > a {
+        term 0;
+    };
+    let s: Float = sim_user(pop, m, a, b);
+    mat_set(usim, a, b, s);
+    mat_set(usim, b, a, s);
+    term sc_fill_user_row(pop, m, usim, a, b + 1);
+};
+
+// sc_fill_item - the item-space mirror: lower-triangle sim_item once, mirrored.
+defn sc_fill_item(pop: RatingPopulation, m: Means, isim: Matrix, s: Int)
+    [s >= 0][true]
+    -> Int
+{
+    when s >= pop.nitems {
+        term 0;
+    };
+    sc_fill_item_row(pop, m, isim, s, 0);
+    term sc_fill_item(pop, m, isim, s + 1);
+};
+defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: Matrix, s: Int, t: Int)
+    [s >= 0 && t >= 0][true]
+    -> Int
+{
+    when t > s {
+        term 0;
+    };
+    let v: Float = sim_item(pop, m, s, t);
+    mat_set(isim, s, t, v);
+    mat_set(isim, t, s, v);
+    term sc_fill_item_row(pop, m, isim, s, t + 1);
+};
+
+// ── O(k) accessors the served predictor reads (replaces the recompute) ───────
+defn simcache_user_sim(sc: SimCache, a: Int, b: Int)
+    [a >= 0 && a < sc.nusers && b >= 0 && b < sc.nusers][true] -> Float
+{
+    term mat_get(sc.user_sim, a, b);
+};
+defn simcache_item_sim(sc: SimCache, s: Int, t: Int)
+    [s >= 0 && s < sc.nitems && t >= 0 && t < sc.nitems][true] -> Float
+{
+    term mat_get(sc.item_sim, s, t);
+};
+defn simcache_user_mean(sc: SimCache, a: Int)
+    [a >= 0 && a < sc.nusers][true] -> Float
+{
+    term vec_get(sc.user_mean, a);
+};
+defn simcache_item_mean(sc: SimCache, s: Int)
+    [s >= 0 && s < sc.nitems][true] -> Float
+{
+    term vec_get(sc.item_mean, s);
+};
+
+// simcache_free - release the two matrices the cache OWNS. The mean vectors are
+// borrowed from Means (not copied), so they are freed by means_free, NOT here —
+// freeing them twice would double-free the shared blocks.
+defn simcache_free(sc: SimCache) -> Void {
+    mat_free(sc.user_sim);
+    mat_free(sc.item_sim);
+    term;
+};
+
+// ── Part 5b: served snapshot + atomic pointer swap (Task 9.2) ────────────────
+//
+// WHY A HOLDER, AND WHY THE SWAP IS ATOMIC HERE. The CF_Engine serves every
+// request from ONE snapshot (Req 6.3); a refresh must not tear it. The design's
+// mechanism (Req 6.4/6.5): build a WHOLE new SimCache off to the side in fresh
+// Malloc# blocks, then hand it over in a SINGLE logical step, and free the old
+// snapshot only AFTER readers have drained. Because the backend is a
+// single-process POLL event loop (design "Concurrency Model"), there is no
+// preemptive reader: a refresh runs BETWEEN poll sweeps, never interleaved with
+// a request. So the handover is atomic BY CONSTRUCTION — no lock, no CAS. (In a
+// THREADED backend this same multi-field update WOULD tear and need a real
+// atomic pointer or RCU; the poll model is exactly why we can avoid that.)
+//
+// THE MODEL. A Served holder is a small IntVec "control block" holding the
+// CURRENT snapshot's four Malloc# addresses + two dims. A read reconstructs a
+// SimCache value handle from those slots in O(1) (no copy — same blocks). The
+// swap (served_install) overwrites the six slots with the new snapshot's
+// addresses; between sweeps that rewrite is indivisible from any reader's view.
+// This is a genuine POINTER swap — the served matrices change by rewriting
+// pointer slots — using only the proven ivec primitives (objs are value handles,
+// not mutable cells, so the indirection lives in the control block, not a field).
+
+const SV_USER_SIM: Int = 0;   // control-block slot layout
+const SV_ITEM_SIM: Int = 1;
+const SV_USER_MEAN: Int = 2;
+const SV_ITEM_MEAN: Int = 3;
+const SV_NUSERS: Int = 4;
+const SV_NITEMS: Int = 5;
+const SV_NNZ: Int = 6;        // the served snapshot's signature (nnz, mtime)
+const SV_MTIME: Int = 7;
+const SV_SLOTS: Int = 8;
+
+obj Served {
+    slots: IntVec;    // SV_SLOTS addresses+dims of the currently-served snapshot
+};
+
+// served_new - allocate a holder and install `sc` as the first served snapshot.
+// The control-block cell is populated BEFORE the Served handle is constructed,
+// so the handle is built once in `term` position (the proven obj-literal form —
+// a `let x: T = T { .. }` initializer tripped the parser at this field shape).
+defn served_new(sc: SimCache) -> Served {
+    let cell: IntVec = ivec_new(SV_SLOTS);
+    served_write(cell, sc);
+    term Served { slots: cell };
+};
+
+// served_write - store snapshot `sc`'s four block addresses + two dims into the
+// control block `cell`. The shared helper behind both served_new and
+// served_install (it takes the IntVec directly so served_new can fill it before
+// the Served handle exists).
+defn served_write(cell: IntVec, sc: SimCache) -> Void {
+    ivec_set(cell, SV_USER_SIM,  sc.user_sim.ptr);
+    ivec_set(cell, SV_ITEM_SIM,  sc.item_sim.ptr);
+    ivec_set(cell, SV_USER_MEAN, sc.user_mean.ptr);
+    ivec_set(cell, SV_ITEM_MEAN, sc.item_mean.ptr);
+    ivec_set(cell, SV_NUSERS,    sc.nusers);
+    ivec_set(cell, SV_NITEMS,    sc.nitems);
+    ivec_set(cell, SV_NNZ,       sc.sig.nnz);
+    ivec_set(cell, SV_MTIME,     sc.sig.mtime);
+    term;
+};
+
+// served_read - reconstruct the currently-served SimCache handle from the
+// control block (O(1), no copy — the handle points at the same blocks). This is
+// what the predictor calls once per request to get its snapshot.
+defn served_read(sv: Served) -> SimCache {
+    let nu: Int = ivec_get(sv.slots, SV_NUSERS);
+    let ni: Int = ivec_get(sv.slots, SV_NITEMS);
+    term SimCache {
+        user_sim:  Matrix { ptr: ivec_get(sv.slots, SV_USER_SIM),  rows: nu, cols: nu },
+        item_sim:  Matrix { ptr: ivec_get(sv.slots, SV_ITEM_SIM),  rows: ni, cols: ni },
+        user_mean: Vector { ptr: ivec_get(sv.slots, SV_USER_MEAN), len: nu },
+        item_mean: Vector { ptr: ivec_get(sv.slots, SV_ITEM_MEAN), len: ni },
+        nusers: nu, nitems: ni,
+        sig: PopSignature {
+            nnz: ivec_get(sv.slots, SV_NNZ), mtime: ivec_get(sv.slots, SV_MTIME)
+        }
+    };
+};
+
+// served_install - THE SWAP. `newsc` was built off to the side (fresh blocks).
+// Overwrite the control block to point at it, then return the OLD snapshot
+// handle so the caller can free it AFTER reads drain (never before the swap —
+// that would free blocks a reader might still hold). The rewrite is atomic here
+// because it runs between poll sweeps (no concurrent reader).
+defn served_install(sv: Served, newsc: SimCache) -> SimCache {
+    let old: SimCache = served_read(sv);
+    served_write(sv.slots, newsc);
+    term old;
+};
+
+// served_free - release the holder's control block (NOT the served snapshot's
+// blocks — those are owned by whatever SimCache handle served_read hands out and
+// freed via simcache_free + means_free on shutdown).
+defn served_free(sv: Served) -> Void {
+    ivec_free(sv.slots);
+    term;
+};
+
+// ── Part 5c: binary persistence to simlist.txt.bin (Task 9.4) ────────────────
+//
+// WHY PERSIST. Recomputing both PCC matrices at 943²/1682² scale is expensive;
+// the design (Req 6.1/6.2) persists the served snapshot to a binary artifact and
+// RELOADS it on startup WHEN FRESH, recomputing only on a stale/absent/corrupt
+// artifact. Freshness is the PopSignature (Req 6.6): the artifact records
+// (nnz, mtime); a load first checks the header's signature against the current
+// population and treats ANY mismatch — or a bad magic / wrong dims / short read —
+// as "not usable" ⇒ recompute + rewrite. A partial write is never served as a
+// good cache (Req 6.2): a truncated file fails the length check and is rejected.
+//
+// THE LAYOUT. A flat byte image: a 5-word header [magic, nusers, nitems, nnz,
+// mtime] (5×8 bytes) followed by the four raw Malloc# blocks back-to-back —
+// user_sim (nusers²×8), item_sim (nitems²×8), user_mean (nusers×8), item_mean
+// (nitems×8). The matrices hold f64 bit patterns; Copy# moves raw bytes, so
+// there is NO float round-trip (the IntVec-vs-Vector lesson applies to typed
+// slots, not to a raw byte copy of the whole block). The image is wrapped in a
+// Briev String ([len:i64][bytes]) and written with std/os/fs.bv's write_file;
+// load is read_file + header parse + Copy# back into fresh matrices.
+
+const SC_MAGIC: Int = 5929566;   // "simlist.bin" sentinel (arbitrary nonzero tag)
+const SC_HDR_WORDS: Int = 5;     // magic, nusers, nitems, nnz, mtime
+
+// sc_byte_size - total image bytes for a SimCache: header + the four blocks.
+defn sc_byte_size(sc: SimCache) -> Int {
+    let usim: Int = sc.nusers * sc.nusers * 8;
+    let isim: Int = sc.nitems * sc.nitems * 8;
+    let umean: Int = sc.nusers * 8;
+    let imean: Int = sc.nitems * 8;
+    term SC_HDR_WORDS * 8 + usim + isim + umean + imean;
+};
+
+// simcache_save - serialize `sc` to `path` as the flat image above. Builds a
+// String-shaped buffer (Alloc# 8+total, length at offset 0, data at +8), writes
+// the header words with Store#, Copy#s the four blocks in order, then write_file.
+// Returns the write_file result (bytes >= 0, or -errno). The String buffer is
+// freed after the write.
+defn simcache_save(sc: SimCache, path: String) -> Int {
+    let total: Int = sc_byte_size(sc);
+    let buf: Int = Alloc#(8 + total) as Int;
+    Store#(buf, total, 8);                        // String length header
+    let data: Int = buf + 8;                      // image start
+    // header words
+    Store#(data,            SC_MAGIC,   8);
+    Store#(data + 8,        sc.nusers,  8);
+    Store#(data + 16,       sc.nitems,  8);
+    Store#(data + 24,       sc.sig.nnz, 8);
+    Store#(data + 32,       sc.sig.mtime, 8);
+    // blocks, back-to-back after the header
+    let off0: Int = data + SC_HDR_WORDS * 8;
+    let usim_bytes: Int = sc.nusers * sc.nusers * 8;
+    let isim_bytes: Int = sc.nitems * sc.nitems * 8;
+    let umean_bytes: Int = sc.nusers * 8;
+    let imean_bytes: Int = sc.nitems * 8;
+    Copy#(off0,                                      sc.user_sim.ptr,  usim_bytes);
+    Copy#(off0 + usim_bytes,                         sc.item_sim.ptr,  isim_bytes);
+    Copy#(off0 + usim_bytes + isim_bytes,            sc.user_mean.ptr, umean_bytes);
+    Copy#(off0 + usim_bytes + isim_bytes + umean_bytes, sc.item_mean.ptr, imean_bytes);
+    let rc: Result<Int, Int> = write_file(path, (buf as Data) as String);
+    Free#(buf as Ptr<Bit<8>>);
+    when is_err(rc) {
+        term unwrap_err(rc);                      // -errno (negative)
+    };
+    term unwrap(rc);                              // bytes written (>= 0)
+};
+
+// sc_load_status - the result of inspecting a persisted artifact against the
+// current population. Decouples "is it usable?" from the actual block load, so
+// the startup flow is: probe → (fresh ⇒ load) else (recompute + save).
+//   0 = absent / unreadable
+//   1 = present but UNUSABLE (bad magic, wrong dims, short read, or STALE)
+//   2 = present, valid, and FRESH
+const SC_LOAD_ABSENT: Int = 0;
+const SC_LOAD_STALE:  Int = 1;
+const SC_LOAD_FRESH:  Int = 2;
+
+// simcache_probe - read `path` and classify it against the current (cur_nnz,
+// cur_mtime, nusers, nitems). FRESH requires: readable, correct magic, matching
+// dims, a byte length that covers the full declared image (a truncated/partial
+// write fails HERE — never served as good), and a signature equal to the
+// current population. Any failure ⇒ ABSENT/STALE. This reads the file twice in
+// the demo (probe then load); the real startup reads once and keeps the String.
+defn simcache_probe(path: String, cur_nnz: Int, cur_mtime: Int, nusers: Int, nitems: Int)
+    [nusers >= 1 && nitems >= 1][term >= 0 && term <= 2]
+    -> Int
+{
+    let r: Result<String, Int> = read_file(path);
+    when is_err(r) {
+        term SC_LOAD_ABSENT;
+    };
+    let img: String = unwrap(r);
+    let len: Int = img .^Length;
+    when len < SC_HDR_WORDS * 8 {
+        term SC_LOAD_ABSENT;                      // too short to even hold a header
+    };
+    let data: Int = (img as Data) as Int + 8;
+    let magic: Int = Load#(data, 8);
+    when magic != SC_MAGIC {
+        term SC_LOAD_STALE;                       // not our artifact
+    };
+    let fnusers: Int = Load#(data + 8, 8);
+    let fnitems: Int = Load#(data + 16, 8);
+    when fnusers != nusers || fnitems != nitems {
+        term SC_LOAD_STALE;                       // built for a different shape
+    };
+    // full declared image length (a partial write is caught here).
+    let want: Int = SC_HDR_WORDS * 8
+        + fnusers * fnusers * 8 + fnitems * fnitems * 8
+        + fnusers * 8 + fnitems * 8;
+    when len < want {
+        term SC_LOAD_STALE;                       // truncated — reject, don't serve
+    };
+    let fnnz: Int = Load#(data + 24, 8);
+    let fmtime: Int = Load#(data + 32, 8);
+    when fnnz != cur_nnz || fmtime != cur_mtime {
+        term SC_LOAD_STALE;                       // signature mismatch (Req 6.6)
+    };
+    term SC_LOAD_FRESH;
+};
+
+// simcache_load - read `path` and reconstruct a SimCache by Copy#ing the four
+// blocks into FRESH Malloc# matrices/vectors (the loaded cache OWNS its blocks,
+// unlike a build where the means are borrowed — so simcache_load_free frees all
+// four). Precondition: the caller has already probed FRESH, so the header is
+// trusted here. The mean vectors are reconstructed as owned Vectors.
+defn simcache_load(path: String) -> SimCache {
+    let r: Result<String, Int> = read_file(path);
+    let img: String = unwrap(r);                  // probe guaranteed readable
+    let data: Int = (img as Data) as Int + 8;
+    let nu: Int = Load#(data + 8, 8);
+    let ni: Int = Load#(data + 16, 8);
+    let nnz: Int = Load#(data + 24, 8);
+    let mtime: Int = Load#(data + 32, 8);
+    let off0: Int = data + SC_HDR_WORDS * 8;
+    let usim_bytes: Int = nu * nu * 8;
+    let isim_bytes: Int = ni * ni * 8;
+    let umean_bytes: Int = nu * 8;
+    let imean_bytes: Int = ni * 8;
+    let usim: Matrix = mat_new(nu, nu);
+    let isim: Matrix = mat_new(ni, ni);
+    let umean: Vector = vec_new(nu);
+    let imean: Vector = vec_new(ni);
+    Copy#(usim.ptr,  off0,                                      usim_bytes);
+    Copy#(isim.ptr,  off0 + usim_bytes,                         isim_bytes);
+    Copy#(umean.ptr, off0 + usim_bytes + isim_bytes,            umean_bytes);
+    Copy#(imean.ptr, off0 + usim_bytes + isim_bytes + umean_bytes, imean_bytes);
+    term SimCache {
+        user_sim: usim, item_sim: isim, user_mean: umean, item_mean: imean,
+        nusers: nu, nitems: ni,
+        sig: PopSignature { nnz: nnz, mtime: mtime }
+    };
+};
+
+// simcache_load_free - free a LOADED cache: unlike simcache_free (which leaves
+// the borrowed mean vectors to means_free), a loaded cache OWNS all four blocks,
+// so all four are freed here.
+defn simcache_load_free(sc: SimCache) -> Void {
+    mat_free(sc.user_sim);
+    mat_free(sc.item_sim);
+    vec_free(sc.user_mean);
+    vec_free(sc.item_mean);
+    term;
+};
+
+// ── harness: means over the oracle's hand-worked 4x4 (Task 6.1 gate) ──────────
+//
+// Same fixture as reference.bv (0 = missing, so NOT stored in the sparse pop):
+//        i0  i1  i2  i3
+//   u0:   5   3   4   4      mean 4.0
+//   u1:   3   1   2   3      mean 2.25
+//   u2:   4   3   4   3      mean 3.5
+//   u3:   3   3   5   -      mean 11/3 ≈ 3.666667
+//   item means: i0=3.75  i1=2.5  i2=3.75  i3=10/3 ≈ 3.333333
+//
+// The 15 observed cells become 15 parallel (user, item, value) triples.
+defn approx(a: Float, b: Float) -> Bool {
+    term Fabs#(a - b) <= 0.000001;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let nnz: Int = 15;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+
+    // u0 row (i0..i3)
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,3.0);
+    ivec_set(us,2,0); ivec_set(it,2,2); vec_set(val,2,4.0);
+    ivec_set(us,3,0); ivec_set(it,3,3); vec_set(val,3,4.0);
+    // u1 row
+    ivec_set(us,4,1); ivec_set(it,4,0); vec_set(val,4,3.0);
+    ivec_set(us,5,1); ivec_set(it,5,1); vec_set(val,5,1.0);
+    ivec_set(us,6,1); ivec_set(it,6,2); vec_set(val,6,2.0);
+    ivec_set(us,7,1); ivec_set(it,7,3); vec_set(val,7,3.0);
+    // u2 row
+    ivec_set(us,8,2);  ivec_set(it,8,0);  vec_set(val,8,4.0);
+    ivec_set(us,9,2);  ivec_set(it,9,1);  vec_set(val,9,3.0);
+    ivec_set(us,10,2); ivec_set(it,10,2); vec_set(val,10,4.0);
+    ivec_set(us,11,2); ivec_set(it,11,3); vec_set(val,11,3.0);
+    // u3 row (i3 missing — only 3 cells)
+    ivec_set(us,12,3); ivec_set(it,12,0); vec_set(val,12,3.0);
+    ivec_set(us,13,3); ivec_set(it,13,1); vec_set(val,13,3.0);
+    ivec_set(us,14,3); ivec_set(it,14,2); vec_set(val,14,5.0);
+
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, 4, 4);
+    let m: Means = means_build(pop);
+
+    println!("u0_mean={} ok={}", means_user(m,0), approx(means_user(m,0), 4.0));
+    println!("u1_mean={} ok={}", means_user(m,1), approx(means_user(m,1), 2.25));
+    println!("u2_mean={} ok={}", means_user(m,2), approx(means_user(m,2), 3.5));
+    println!("u3_mean={} ok={}", means_user(m,3), approx(means_user(m,3), 3.666667));
+    println!("i0_mean={} ok={}", means_item(m,0), approx(means_item(m,0), 3.75));
+    println!("i1_mean={} ok={}", means_item(m,1), approx(means_item(m,1), 2.5));
+    println!("i2_mean={} ok={}", means_item(m,2), approx(means_item(m,2), 3.75));
+    println!("i3_mean={} ok={}", means_item(m,3), approx(means_item(m,3), 3.333333));
+    println!("all_have_means={}",
+        means_user_has(m,0) && means_user_has(m,3) && means_item_has(m,3));
+
+    // base similarity (raw-overlap PCC) — oracle anchor sim(u0,u1)=0.852802,
+    // symmetry, and self-sim=1.0 (reference.bv).
+    println!("base_sim(u0,u1)={} ok={}",
+        base_sim_user(pop,m,0,1), approx(base_sim_user(pop,m,0,1), 0.852802));
+    println!("base_sim_symmetric={}",
+        approx(base_sim_user(pop,m,0,1), base_sim_user(pop,m,1,0)));
+    println!("base_sim(u0,u0)={} ok={}",
+        base_sim_user(pop,m,0,0), approx(base_sim_user(pop,m,0,0), 1.0));
+    // item-side base similarity: symmetric and self-sim=1.0 (the item space is
+    // exercised fully by the engine; the oracle anchors the user side).
+    println!("base_sim_item_symmetric={}",
+        approx(base_sim_item(pop,m,0,1), base_sim_item(pop,m,1,0)));
+    println!("base_sim_item(i0,i0)={} ok={}",
+        base_sim_item(pop,m,0,0), approx(base_sim_item(pop,m,0,0), 1.0));
+
+    // imputation (Task 6.3). Property 10: the loop EXECUTES, so a missing cell
+    // is FILLED with a similarity-weighted estimate that DIFFERS from the raw
+    // fallback mean. (u3,i3) is the fixture's one missing cell; ū3≈3.666667.
+    let imp_u33: Float = impute_user(pop, m, 3, 3);
+    println!("impute_user(u3,i3)={}", imp_u33);
+    println!("impute_differs_from_mean={}", !approx(imp_u33, means_user(m,3)));
+    // an OBSERVED cell returns its real rating untouched (imputation fills gaps
+    // only): (u0,i0)=5.0.
+    println!("impute_observed(u0,i0)={} ok={}",
+        impute_user(pop,m,0,0), approx(impute_user(pop,m,0,0), 5.0));
+    // §3.2 item side: the mirror estimate for the same missing cell (item 3,
+    // user 3) also fills and differs from the item mean t̄3≈3.333333.
+    let imp_i33: Float = impute_item(pop, m, 3, 3);
+    println!("impute_item(i3,u3)={}", imp_i33);
+    println!("impute_item_differs_from_mean={}", !approx(imp_i33, means_item(m,3)));
+    println!("impute_item_observed(i0,u0)={} ok={}",
+        impute_item(pop,m,0,0), approx(impute_item(pop,m,0,0), 5.0));
+
+    // served similarity sim' over the imputed union key-set (Task 6.5).
+    // Anchors are reference.bv's pcc_imputed_users (printed by the oracle run).
+    println!("simp(u0,u1)={} ok={}",
+        sim_user(pop,m,0,1), approx(sim_user(pop,m,0,1), 0.852802813));
+    println!("simp(u0,u2)={} ok={}",
+        sim_user(pop,m,0,2), approx(sim_user(pop,m,0,2), 0.707106769));
+    println!("simp(u0,u3)={} ok={}",
+        sim_user(pop,m,0,3), approx(sim_user(pop,m,0,3), 0.0));
+    println!("simp(u1,u2)={} ok={}",
+        sim_user(pop,m,1,2), approx(sim_user(pop,m,1,2), 0.301511347));
+    println!("simp(u1,u3)={} ok={}",
+        sim_user(pop,m,1,3), approx(sim_user(pop,m,1,3), -0.132410213));
+    println!("simp(u2,u3)={} ok={}",
+        sim_user(pop,m,2,3), approx(sim_user(pop,m,2,3), 0.536745071));
+    println!("simp_symmetric={}",
+        approx(sim_user(pop,m,0,3), sim_user(pop,m,3,0)));
+    println!("simp(u0,u0)={} ok={}",
+        sim_user(pop,m,0,0), approx(sim_user(pop,m,0,0), 1.0));
+    // item-side sim': symmetric + self-sim'=1.0 (the full item-based Eq. 30
+    // in Task 7 anchors its values; here the structural guards).
+    println!("simp_item_symmetric={}",
+        approx(sim_item(pop,m,0,3), sim_item(pop,m,3,0)));
+    println!("simp_item(i0,i0)={} ok={}",
+        sim_item(pop,m,0,0), approx(sim_item(pop,m,0,0), 1.0));
+
+    // kNN prediction sim'-weighted (Task 7.1). Anchors = reference.bv predui().
+    println!("predui(u3,i3)={} ok={}",
+        predict_user(pop,m,3,3), approx(predict_user(pop,m,3,3), 2.75732088));
+    println!("predui(u0,i0)={} ok={}",
+        predict_user(pop,m,0,0), approx(predict_user(pop,m,0,0), 4.63667488));
+    println!("predui(u1,i2)={} ok={}",
+        predict_user(pop,m,1,2), approx(predict_user(pop,m,1,2), 2.22476125));
+    // item-side prediction: a value + sanity that it is finite & in a sane band.
+    let ri33: Float = predict_item(pop,m,3,3);
+    println!("predict_item(u3,i3)={} sane={}", ri33, ri33 >= 0.0 && ri33 <= 6.0);
+
+    // fusion + clamp (Task 7.5). cf_predict(u3,i3,λ=0.5) must be in [1,5]; and
+    // equal clamp(0.5·predui + 0.5·predict_item).
+    let fu: Float = cf_predict(pop,m,3,3,0.5);
+    println!("cf_predict(u3,i3,0.5)={} in[1,5]={}", fu, fu >= 1.0 && fu <= 5.0);
+    println!("fuse_matches={}",
+        approx(fu, clamp15(0.5 * predict_user(pop,m,3,3) + 0.5 * predict_item(pop,m,3,3))));
+    // λ edges (Property-14 shape): λ=1 ⇒ user side, λ=0 ⇒ item side (pre-clamp
+    // both are in-band here, so the clamp is identity).
+    println!("lambda1_is_user={}",
+        approx(cf_predict(pop,m,3,3,1.0), clamp15(predict_user(pop,m,3,3))));
+    println!("lambda0_is_item={}",
+        approx(cf_predict(pop,m,3,3,0.0), clamp15(predict_item(pop,m,3,3))));
+
+    // top-N serving (Task 8). u3 has one unrated item (i3) ⇒ [i3]; u0 rated all
+    // ⇒ empty. Anchors reference.bv's recommend_user.
+    let recs: IntVec = ivec_new(TOP_N);
+    let n3: Int = cf_recommend(pop,m,3,TOP_N,0.5,recs);
+    println!("rec_u3_len={} first={} ok={}", n3, ivec_get(recs,0), n3 == 1 && ivec_get(recs,0) == 3);
+    let n0: Int = cf_recommend(pop,m,0,TOP_N,0.5,recs);
+    println!("rec_u0_len={} ok={}", n0, n0 == 0);
+    ivec_free(recs);
+
+    // ── Similarity_Cache (Task 9.1) ──────────────────────────────────────────
+    // Build the served snapshot and confirm every cached value EQUALS the
+    // engine's on-the-fly sim' (the cache is a memoization — it introduces no
+    // new numeric claim). All 10 user-pairs + diagonal + symmetry; a spot-check
+    // of the item side; and the borrowed mean vectors.
+    let sc: SimCache = simcache_build(pop, m, 1000);
+    println!("sc_user_sim_matches_engine={}",
+        approx(simcache_user_sim(sc,0,1), sim_user(pop,m,0,1)) &&
+        approx(simcache_user_sim(sc,0,2), sim_user(pop,m,0,2)) &&
+        approx(simcache_user_sim(sc,0,3), sim_user(pop,m,0,3)) &&
+        approx(simcache_user_sim(sc,1,2), sim_user(pop,m,1,2)) &&
+        approx(simcache_user_sim(sc,1,3), sim_user(pop,m,1,3)) &&
+        approx(simcache_user_sim(sc,2,3), sim_user(pop,m,2,3)));
+    println!("sc_user_sim_diag1={}",
+        approx(simcache_user_sim(sc,0,0), 1.0) &&
+        approx(simcache_user_sim(sc,3,3), 1.0));
+    println!("sc_user_sim_symmetric={}",
+        approx(simcache_user_sim(sc,1,3), simcache_user_sim(sc,3,1)) &&
+        approx(simcache_user_sim(sc,0,2), simcache_user_sim(sc,2,0)));
+    // item side: cached == engine, diagonal 1.0, symmetric.
+    println!("sc_item_sim_matches_engine={}",
+        approx(simcache_item_sim(sc,0,1), sim_item(pop,m,0,1)) &&
+        approx(simcache_item_sim(sc,0,3), sim_item(pop,m,0,3)) &&
+        approx(simcache_item_sim(sc,2,3), sim_item(pop,m,2,3)));
+    println!("sc_item_sim_diag1={}",
+        approx(simcache_item_sim(sc,0,0), 1.0) &&
+        approx(simcache_item_sim(sc,3,3), 1.0));
+    println!("sc_item_sim_symmetric={}",
+        approx(simcache_item_sim(sc,1,3), simcache_item_sim(sc,3,1)));
+    // borrowed mean vectors read through the cache.
+    println!("sc_means_match={}",
+        approx(simcache_user_mean(sc,0), means_user(m,0)) &&
+        approx(simcache_user_mean(sc,3), means_user(m,3)) &&
+        approx(simcache_item_mean(sc,3), means_item(m,3)));
+    // ── PopSignature freshness (Task 9.4) ────────────────────────────────────
+    // fresh iff BOTH nnz and mtime match; any mismatch is stale (Req 6.6).
+    let sigA: PopSignature = pop_signature(pop, 1000);
+    let sig_same: PopSignature = pop_signature(pop, 1000);
+    println!("sig_fresh_same={}", sig_fresh(sigA, sig_same));       // expect true
+    let sig_newtime: PopSignature = PopSignature { nnz: pop.nnz, mtime: 2000 };
+    println!("sig_stale_mtime={}", !sig_fresh(sigA, sig_newtime));  // expect true
+    let sig_newcount: PopSignature = PopSignature { nnz: pop.nnz + 1, mtime: 1000 };
+    println!("sig_stale_nnz={}", !sig_fresh(sigA, sig_newcount));   // expect true
+    // the built cache carries the signature it was built with.
+    println!("sc_sig_recorded={}", sc.sig.nnz == pop.nnz && sc.sig.mtime == 1000);
+
+    simcache_free(sc);
+
+    means_free(m);
+    pop_free(pop);
+    ivec_free(us);
+    ivec_free(it);
+    vec_free(val);
+
+    // ── k=30 truncation probe (Property 12 / defect #3) ───────────────────────
+    // A synthetic population where item 0 is rated by 31 users with STRICTLY
+    // increasing similarity-driving values, so exactly one neighbor must be
+    // dropped by k=30. We check the selection truncates: the engine's predict_
+    // user over the 31 candidates must equal a reference that uses ONLY the top
+    // 30 sims, and must DIFFER from one that sums all 31 — proving truncation.
+    probe_knn_truncation();
+    probe_serving();
+    probe_swap();
+    probe_persist();
+    tick = 1;
+    endprogram;
+};
+
+// probe_persist - the Task 9.4 persistence gate: save → probe-fresh → load →
+// values identical → stale-signature rejection → truncation rejection.
+// Uses a SCRATCH path (NOT the shipped simlist.txt.bin fixture), cleaned up at
+// the end. Builds the 4×4 fixture cache, writes it, and round-trips.
+defn probe_persist() -> Int {
+    let path: String = "examples/recommender/sim_cache_test.bin";
+    let pop: RatingPopulation = probe_swap_pop(3.0);   // the fixture population
+    let m: Means = means_build(pop);
+    let sc: SimCache = simcache_build(pop, m, 1000);
+
+    // 1) save, then probe with the SAME signature ⇒ FRESH.
+    let wrc: Int = simcache_save(sc, path);
+    println!("persist_write_ok={}", wrc > 0);
+    let st_fresh: Int = simcache_probe(path, pop.nnz, 1000, 4, 4);
+    println!("persist_probe_fresh={}", st_fresh == SC_LOAD_FRESH);
+
+    // 2) load it back; every matrix value must equal the in-memory cache.
+    let lc: SimCache = simcache_load(path);
+    println!("persist_roundtrip_user_sim={}",
+        approx(simcache_user_sim(lc,0,1), simcache_user_sim(sc,0,1)) &&
+        approx(simcache_user_sim(lc,1,2), simcache_user_sim(sc,1,2)) &&
+        approx(simcache_user_sim(lc,2,3), simcache_user_sim(sc,2,3)));
+    println!("persist_roundtrip_item_sim={}",
+        approx(simcache_item_sim(lc,0,1), simcache_item_sim(sc,0,1)) &&
+        approx(simcache_item_sim(lc,2,3), simcache_item_sim(sc,2,3)));
+    println!("persist_roundtrip_means={}",
+        approx(simcache_user_mean(lc,3), simcache_user_mean(sc,3)) &&
+        approx(simcache_item_mean(lc,3), simcache_item_mean(sc,3)));
+    println!("persist_roundtrip_sig={}",
+        lc.sig.nnz == pop.nnz && lc.sig.mtime == 1000);
+
+    // 3) a different signature (bumped mtime) ⇒ STALE ⇒ recompute path.
+    let st_mtime: Int = simcache_probe(path, pop.nnz, 2000, 4, 4);
+    println!("persist_probe_stale_mtime={}", st_mtime == SC_LOAD_STALE);
+    // a different record count ⇒ STALE.
+    let st_nnz: Int = simcache_probe(path, pop.nnz + 1, 1000, 4, 4);
+    println!("persist_probe_stale_nnz={}", st_nnz == SC_LOAD_STALE);
+    // a different shape ⇒ STALE (built for another nusers/nitems).
+    let st_shape: Int = simcache_probe(path, pop.nnz, 1000, 5, 5);
+    println!("persist_probe_stale_shape={}", st_shape == SC_LOAD_STALE);
+
+    simcache_load_free(lc);
+    simcache_free(sc);
+    means_free(m);
+    pop_free(pop);
+
+    // 4) truncation: write a 3-byte file to the same path and confirm the probe
+    // rejects it as unusable (ABSENT — too short to hold a header), never served
+    // as a good cache (Req 6.2 partial-write safety).
+    let trc: Result<Int, Int> = write_file(path, "abc");
+    println!("persist_truncated_write_ok={}", is_ok(trc));
+    let st_trunc: Int = simcache_probe(path, 15, 1000, 4, 4);
+    println!("persist_probe_truncated_rejected={}", st_trunc == SC_LOAD_ABSENT);
+
+    // cleanup the scratch artifact.
+    let rm: Result<Int, Int> = remove_file(path);
+    println!("persist_cleanup_ok={}", is_ok(rm));
+    term 0;
+};
+
+// probe_swap - the Task 9.2 gate: off-to-the-side build + atomic pointer swap.
+//
+// Two populations over the SAME 4×4 shape: popA is the oracle fixture; popB is
+// identical EXCEPT user 1's rating of item 0 is lowered (3.0 → 1.0), which
+// changes sim'(u0,u1) but leaves sim'(u2,u3) untouched. We:
+//   1. build cacheA, install into a Served holder, read sim'(u0,u1) through it;
+//   2. build cacheB OFF TO THE SIDE (holder still serves A) and confirm the
+//      holder STILL reads A's value — the new snapshot is invisible pre-swap;
+//   3. served_install(B) — the single-step swap — returns the OLD handle;
+//   4. read through the holder again: sim'(u0,u1) now equals B's value (changed)
+//      while sim'(u2,u3) is unchanged (the swap replaced the WHOLE snapshot
+//      consistently, not a partial mix);
+//   5. free the OLD snapshot only AFTER the swap (never before).
+defn probe_swap() -> Int {
+    let popA: RatingPopulation = probe_swap_pop(3.0);   // u1,i0 = 3.0 (fixture)
+    let mA: Means = means_build(popA);
+    let cacheA: SimCache = simcache_build(popA, mA, 1000);
+    let a01: Float = sim_user(popA, mA, 0, 1);          // engine value for A
+    let a23: Float = sim_user(popA, mA, 2, 3);
+
+    let sv: Served = served_new(cacheA);
+    // (1) the holder serves A.
+    let r0: SimCache = served_read(sv);
+    println!("swap_serves_A={}", approx(simcache_user_sim(r0, 0, 1), a01));
+
+    // (2) build B off to the side; the holder must STILL serve A.
+    let popB: RatingPopulation = probe_swap_pop(1.0);   // u1,i0 = 1.0 (changed)
+    let mB: Means = means_build(popB);
+    let cacheB: SimCache = simcache_build(popB, mB, 2000);
+    let b01: Float = sim_user(popB, mB, 0, 1);
+    let r1: SimCache = served_read(sv);
+    println!("swap_pre_swap_still_A={}", approx(simcache_user_sim(r1, 0, 1), a01));
+    println!("swap_B_differs_from_A={}", !approx(b01, a01));   // the change is real
+
+    // (3) THE SWAP — single step; returns the old snapshot handle.
+    let old: SimCache = served_install(sv, cacheB);
+
+    // (4) the holder now serves B, whole-snapshot-consistently.
+    let r2: SimCache = served_read(sv);
+    println!("swap_post_swap_is_B={}", approx(simcache_user_sim(r2, 0, 1), b01));
+    println!("swap_unaffected_pair_consistent={}",
+        approx(simcache_user_sim(r2, 2, 3), sim_user(popB, mB, 2, 3)));
+    // the old handle `old` still named A's blocks right up to the swap (its
+    // nusers/nitems survived the handover) — proof the swap didn't corrupt it.
+    println!("swap_old_handle_intact={}", old.nusers == 4 && old.nitems == 4);
+
+    // (5) free the OLD snapshot now (reads have drained), then B on teardown.
+    simcache_free(old);
+    means_free(mA);
+    pop_free(popA);
+    served_free(sv);
+    simcache_free(cacheB);
+    means_free(mB);
+    pop_free(popB);
+    term 0;
+};
+
+// probe_swap_pop - the 4×4 oracle fixture, but user 1's item-0 rating is the
+// parameter `u1i0` (3.0 = the real fixture; 1.0 = the mutated variant). Only
+// that one cell differs between the two populations the swap test compares.
+defn probe_swap_pop(u1i0: Float) -> RatingPopulation {
+    let nnz: Int = 15;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,3.0);
+    ivec_set(us,2,0); ivec_set(it,2,2); vec_set(val,2,4.0);
+    ivec_set(us,3,0); ivec_set(it,3,3); vec_set(val,3,4.0);
+    ivec_set(us,4,1); ivec_set(it,4,0); vec_set(val,4,u1i0);   // the varied cell
+    ivec_set(us,5,1); ivec_set(it,5,1); vec_set(val,5,1.0);
+    ivec_set(us,6,1); ivec_set(it,6,2); vec_set(val,6,2.0);
+    ivec_set(us,7,1); ivec_set(it,7,3); vec_set(val,7,3.0);
+    ivec_set(us,8,2);  ivec_set(it,8,0);  vec_set(val,8,4.0);
+    ivec_set(us,9,2);  ivec_set(it,9,1);  vec_set(val,9,3.0);
+    ivec_set(us,10,2); ivec_set(it,10,2); vec_set(val,10,4.0);
+    ivec_set(us,11,2); ivec_set(it,11,3); vec_set(val,11,3.0);
+    ivec_set(us,12,3); ivec_set(it,12,0); vec_set(val,12,3.0);
+    ivec_set(us,13,3); ivec_set(it,13,1); vec_set(val,13,3.0);
+    ivec_set(us,14,3); ivec_set(it,14,2); vec_set(val,14,5.0);
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, 4, 4);
+    ivec_free(us);
+    ivec_free(it);
+    vec_free(val);
+    term pop;
+};
+
+// probe_serving - exercise exclusion + descending order + the item-ascending
+// tie-break on a crafted 5×5 population. The active user u0 rated items 0,1
+// (excluded); items 2,3,4 are eligible. Items 3 and 4 are given IDENTICAL
+// rating columns, so they produce IDENTICAL fused scores — a forced tie the
+// serving must resolve by emitting the smaller index (3) before the larger (4).
+defn probe_serving() -> Int {
+    let nu: Int = 5;
+    let ni: Int = 5;
+    // ratings: build a list; count them as we go.
+    // u0 rates items 0,1 (the excluded set).
+    // users u1..u4 rate items 2,3,4 so those have neighbors; 3 and 4 share the
+    // EXACT same column (same users, same values) ⇒ tie. item 2 differs.
+    let cap: Int = 32;
+    let us:  IntVec = ivec_new(cap);
+    let it:  IntVec = ivec_new(cap);
+    let val: Vector = vec_new(cap);
+    // u0 profile (items 0,1) — also gives u0 a row so sim' is defined.
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,4.0);
+    // u1..u4 each rate items 0 and 1 too (so u0 has overlap ⇒ nonzero sim'),
+    // plus items 2,3,4. Items 3 and 4 get the SAME values as each other per user.
+    let k: Int = probe_serv_fill(us, it, val, 2, 1, nu);
+    let pop: RatingPopulation = pop_build(us, it, val, k, nu, ni);
+    let m: Means = means_build(pop);
+
+    let recs: IntVec = ivec_new(TOP_N);
+    let n: Int = cf_recommend(pop, m, 0, TOP_N, 0.5, recs);
+    let r0: Int = ivec_get(recs, 0);
+    let r1: Int = ivec_get(recs, 1);
+    let r2: Int = ivec_get(recs, 2);
+    println!("serv_len={} order=[{},{},{}] (expect 3 eligible: 2,3,4)", n, r0, r1, r2);
+    // exclusion: none of the emitted items is 0 or 1.
+    println!("serv_excludes_rated={}",
+        r0 != 0 && r0 != 1 && r1 != 0 && r1 != 1 && r2 != 0 && r2 != 1);
+    // descending score: score(r0) >= score(r1) >= score(r2).
+    let s0: Float = cf_predict(pop, m, 0, r0, 0.5);
+    let s1: Float = cf_predict(pop, m, 0, r1, 0.5);
+    let s2: Float = cf_predict(pop, m, 0, r2, 0.5);
+    println!("serv_descending={}", s0 >= s1 && s1 >= s2);
+    // tie-break: items 3 and 4 tie (identical columns) ⇒ 3 must precede 4.
+    println!("serv_tie_3_before_4={}", probe_pos(recs, n, 3) < probe_pos(recs, n, 4));
+    println!("serv_tie_scores_equal={}",
+        approx(cf_predict(pop,m,0,3,0.5), cf_predict(pop,m,0,4,0.5)));
+
+    ivec_free(recs);
+    means_free(m); pop_free(pop);
+    ivec_free(us); ivec_free(it); vec_free(val);
+    term 0;
+};
+// probe_serv_fill - users u1..(nu-1) each rate items 0,1 (overlap with u0) and
+// 2,3,4. Item 2's value differs from 3/4; items 3 and 4 share the SAME value per
+// user (the forced tie). `k` is the running write cursor. Tail recursion over u.
+defn probe_serv_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+    [k >= 0 && u >= 1][true]
+    -> Int
+{
+    when u >= nu {
+        term k;
+    };
+    let base: Float = (u as Float);                 // varies the overlap profile
+    ivec_set(us,k,u);   ivec_set(it,k,0);   vec_set(val,k, base);
+    ivec_set(us,k+1,u); ivec_set(it,k+1,1); vec_set(val,k+1, base + 1.0);
+    ivec_set(us,k+2,u); ivec_set(it,k+2,2); vec_set(val,k+2, 2.0);       // item 2 distinct
+    ivec_set(us,k+3,u); ivec_set(it,k+3,3); vec_set(val,k+3, base);      // item 3 \ identical
+    ivec_set(us,k+4,u); ivec_set(it,k+4,4); vec_set(val,k+4, base);      // item 4 / columns ⇒ tie
+    term probe_serv_fill(us, it, val, k + 5, u + 1, nu);
+};
+// probe_pos - the position of item `want` in the first n of recs, or n if absent.
+defn probe_pos(recs: IntVec, n: Int, want: Int) [n >= 0][true] -> Int {
+    term probe_pos_go(recs, n, want, 0);
+};
+defn probe_pos_go(recs: IntVec, n: Int, want: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
+    when i >= n {
+        term n;
+    };
+    when ivec_get(recs, i) == want {
+        term i;
+    };
+    term probe_pos_go(recs, n, want, i + 1);
+};
+
+// probe_knn_truncation - build 31 users all rating item 0, plus a shared set of
+// "profile" items so the 31 users have DISTINCT sim' to user 0. Then confirm
+// predict_user(0, target) selected exactly 30 neighbors: the engine's η must
+// equal the sum of the 30 largest sims, not all 31. We expose η via a direct
+// re-aggregation at k=30 vs k=31 over the same candidate set.
+defn probe_knn_truncation() -> Int {
+    // 32 users (user 0 = active, users 1..31 = 31 candidates), 2 items:
+    // item 0 is the TARGET everyone rates; item 1 is a shared profile item that
+    // gives each candidate a different rating pattern ⇒ different sim' to user 0.
+    // nnz = 32 users × 2 items = 64 ratings.
+    let nu: Int = 32;
+    let ni: Int = 2;
+    let nnz: Int = nu * ni;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+    probe_fill(us, it, val, 0, 0, nu);
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, nu, ni);
+    let m: Means = means_build(pop);
+
+    // Gather user 0's candidate sims for the item-0 column, then compare the
+    // k=30 aggregate η against the k=31 (all) aggregate η over the SAME set.
+    let begin: Int = pop_item_begin(pop, 0);
+    let cnt:   Int = pop_item_end(pop, 0) - begin;
+    let cu:   IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pu_gather(pop, m, 0, 0, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
+    let (_a30, eta30): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 30);
+    let (_a31, eta31): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 31);
+    println!("probe_candidates={} (expect 31)", nfill);
+    println!("probe_k30_truncates={} (eta30 != eta31)", !approx(eta30, eta31));
+    // the dropped neighbor is the SMALLEST sim; eta31 − eta30 == min sim.
+    let minsim: Float = probe_min_sim(csim, nfill, 0, 1000000.0);
+    println!("probe_dropped_is_min={}", approx(eta31 - eta30, minsim));
+
+    ivec_free(cu); vec_free(csim); vec_free(cdev);
+    means_free(m); pop_free(pop);
+    ivec_free(us); ivec_free(it); vec_free(val);
+    term 0;
+};
+
+// probe_fill - user u (0..nu) rates item 0 with value 3, and item 1 with a value
+// that varies by u (1..5 cycling) so each user's centered profile differs,
+// yielding 31 distinct sim' to user 0. Tail recursion over users.
+defn probe_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+    [k >= 0 && u >= 0][true]
+    -> Int
+{
+    when u >= nu {
+        term k;
+    };
+    ivec_set(us, k, u);     ivec_set(it, k, 0);     vec_set(val, k, 3.0);
+    ivec_set(us, k + 1, u); ivec_set(it, k + 1, 1); vec_set(val, k + 1, probe_profile(u));
+    term probe_fill(us, it, val, k + 2, u + 1, nu);
+};
+// probe_profile - a per-user item-1 rating in [1,5] that varies with u (so the
+// 31 candidates have distinct sim'). A simple (u mod 5)+1 spread.
+defn probe_profile(u: Int) [u >= 0][term >= 1.0 && term <= 5.0] -> Float {
+    term ((u % 5) + 1) as Float;
+};
+// probe_min_sim - the smallest of the first n sims. Tail recursion.
+defn probe_min_sim(csim: Vector, n: Int, i: Int, acc: Float) [n >= 0 && i >= 0][true] -> Float {
+    when i >= n {
+        term acc;
+    };
+    let s: Float = vec_get(csim, i);
+    when s < acc {
+        term probe_min_sim(csim, n, i + 1, s);
+    };
+    term probe_min_sim(csim, n, i + 1, acc);
+};

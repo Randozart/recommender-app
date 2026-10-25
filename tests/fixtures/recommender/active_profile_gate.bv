@@ -1,0 +1,72 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./active_profile_support.bv";
+
+defn active_gate_request(count: Int, edit: Int) -> PredictionRequest {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", account_id: 42, revision: "1" };
+    term PredictionRequest { tag: WorkerTag { profile: profile, model_generation: "1", job_id: "1", attempt: 1 },
+        ratings: active_gate_ratings(count,edit) };
+};
+
+defn active_gate_boundary(engine: ActiveProfileEngine) -> Bool {
+    let original_storage: Int = engine.scratch.storage;
+    let cold: Result<RecommendationResult,String> = active_engine_predict(engine,active_gate_request(4,0),0.5);
+    let eligible: Result<RecommendationResult,String> = active_engine_predict(engine,active_gate_request(5,0),0.5);
+    when is_err(cold) || is_err(eligible) { term false; };
+    let original: RecommendationResult = unwrap(eligible);
+    let original_id: Int = -1; let original_score: Float = 0.0;
+    when original.items .^Length > 0 { original_id = original.items[0].item_id; original_score = original.items[0].score; };
+    let changed: Result<RecommendationResult,String> = active_engine_predict(engine,active_gate_request(5,1),0.5);
+    let bad: PredictionRequest = active_gate_request(5,0); bad.tag.model_generation = "2";
+    let duplicate: List<ProfileRating> = [ProfileRating { item_id: 1, rating: 3 },ProfileRating { item_id: 1, rating: 4 }];
+    let rejected_duplicate: Bool = is_err(active_profile_prepare(engine,42,duplicate));
+    let rejected_budget: Bool = is_err(active_engine_new(engine.model,"1",1));
+    let retained: Bool = original.tag.model_generation == "1" && original.items .^Length <= 3 &&
+        original_storage == engine.scratch.storage && engine.scratch.used.ptr % 8 == 0 &&
+        engine.scratch.picked.ptr+engine.scratch.picked.len*8 == original_storage+engine.scratch.bytes;
+    when original.items .^Length > 0 { retained = retained && original.items[0].item_id == original_id && original.items[0].score == original_score; };
+    term unwrap(cold).cold_start && unwrap(cold).items .^Length == 0 && !original.cold_start &&
+        is_ok(changed) && is_err(active_engine_predict(engine,bad,0.5)) && rejected_duplicate && rejected_budget && retained;
+};
+
+defn active_gate_endpoints(engine: ActiveProfileEngine) -> Bool {
+    let ratings: List<ProfileRating> = active_gate_ratings(5,0);
+    let reference: ActivePrediction = active_build(engine.model,active_gate_state(42,ratings));
+    let profile: ActiveProfileEngine = unwrap(active_profile_prepare(engine,42,ratings));
+    active_profile_build(profile);
+    let valid: Bool = active_profile_scores(profile,0.0);
+    foreach item in 0..engine.model.population.nitems {
+        when Fabs#(vec_get(engine.scratch.scores,item)-clamp15(active_item_prediction(reference,item))) > 0.000001 { valid = false; };
+    };
+    valid = active_profile_scores(profile,1.0) && valid;
+    foreach item in 0..engine.model.population.nitems {
+        when Fabs#(vec_get(engine.scratch.scores,item)-clamp15(active_user_prediction(reference,item))) > 0.000001 { valid = false; };
+    };
+    vec_free(reference.similarities);
+    term valid;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let valid: Bool = true;
+    foreach mode in 0..3 {
+        let users: Int = 40;
+        when mode == 0 { users = 1; };
+        let model: ServerModel = active_gate_model(users,8,mode);
+        let built: Result<ActiveProfileEngine,String> = active_engine_new(model,"1",134217728);
+        when is_err(built) { println!("engine rejected={}",unwrap_err(built)); endprogram 1; };
+        let engine: ActiveProfileEngine = unwrap(built);
+        valid = active_gate_compare(engine,42,0,0) && valid;
+        valid = active_gate_compare(engine,42,4,0) && valid;
+        valid = active_gate_compare(engine,42,5,1) && valid;
+        valid = active_gate_compare(engine,99,5,2) && valid;
+        valid = active_gate_compare(engine,42,8,0) && valid;
+        valid = active_gate_boundary(engine) && valid;
+        valid = active_gate_endpoints(engine) && valid;
+        active_engine_free(engine); model_free(model);
+    };
+    println!("active_profile_edge_gate={}",valid);
+    when !valid { endprogram 1; };
+    tick = 1; endprogram;
+};

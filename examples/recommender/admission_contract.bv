@@ -1,0 +1,29 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// I02 data boundaries only. I04 owns executable admission/hydration; no socket,
+// database, worker-success placeholder or admission implementation lives here.
+import "./protocol.bv";
+
+obj RevisionClock { server_epoch: String; revision: String; };
+obj AdmissionLimits { profiles: Int; pending_global: Int; pending_owner: Int; receipt_slots: Int; retained_bytes: Int; };
+obj QueueReservation { id: String; owner: Int; profile_bytes: Int; operation_bytes: Int; prediction_slot: Bool; persistence_slot: Bool; };
+enum AdmissionReservation { NoAdmissionReservation, ReservedAdmission(QueueReservation), };
+enum OperationJob { NoOperationJob, OwnedOperationJob(WorkerTag), };
+obj AdmissionContext { owner: Int; session_generation: String; timestamp: String; database_identity: String; reservation: AdmissionReservation; };
+obj OperationStatus { accepted: RatingAccepted; phase: PersistencePhase; timestamp: String; job: OperationJob; reservation: AdmissionReservation; error: String; };
+obj ProfileSnapshot {
+    version: ProfileVersion; ratings: List<ProfileRating>; committed: List<ProfileRating>;
+    model_generation: String; prediction_running: OperationJob; prediction_pending: Bool;
+    last_active: String;
+};
+obj AdmissionState { clock: RevisionClock; limits: AdmissionLimits; profiles: List<ProfileSnapshot>; operations: List<OperationStatus>; };
+obj AdmissionError { code: String; message: String; retryable: Bool; };
+enum AdmissionOutcome { NewAdmission(RatingAccepted), KnownAdmission(OperationStatus), AdmissionRejected(AdmissionError), };
+obj ReceiptRequest { tag: WorkerTag; operation_ids: List<String>; database_identity: String; };
+enum ProfileAction {
+    ComputeProfile(ProfileVersion), PersistOperation(RatingSaved),
+    PublishEvent(RatingEvent), ResolveReceipt(ReceiptRequest),
+};
+obj ProfileUpdate { state: AdmissionState; actions: List<ProfileAction>; };
+obj AdmissionDecision { update: ProfileUpdate; outcome: AdmissionOutcome; };

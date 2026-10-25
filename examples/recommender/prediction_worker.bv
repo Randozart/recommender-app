@@ -1,0 +1,284 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./active_profile.bv";
+import "./worker_messages.bv";
+
+const PREDICTION_MAX_ATTEMPTS: Int = 3;
+enum PredictionPending { NoPredictionPending, PendingPrediction(PredictionRequest), };
+enum PredictionRunning { IdlePrediction, RunningPrediction(Int,PredictionRequest), };
+obj PredictionOwnerQueue { owner: Int; running: PredictionRunning; pending: PredictionPending; latest: WorkerTag; };
+obj PredictionPool { owners: List<PredictionOwnerQueue>; cursor: Int; worker_limit: Int; owner_limit: Int; in_flight: Int; epoch: String; };
+obj PredictionWorkerReady { worker_id: Int; generation: String; ready: Bool; busy: Bool; };
+obj PredictionDispatch { pool: PredictionPool; worker_id: Int; request: PredictionRequest; dispatched: Bool; };
+obj PredictionCompletion { pool: PredictionPool; deliver: Bool; accepted: Bool; result: WorkerMessage; };
+obj PredictionWorkerLoss { pool: PredictionPool; retry_queued: Bool; exhausted: Bool; tag: WorkerTag; };
+
+// I08 connects the exact active-profile engine to the I05 persistent child.
+// The payload carries the application's configured lambda; the engine and its
+// scratch remain worker-owned for the installed model generation.
+defn prediction_worker_handle(engine: ActiveProfileEngine, request: WorkerMessage) -> WorkerMessage {
+    when request.kind != "predict" || !worker_message_valid(request) {
+        term prediction_worker_error(request,"invalid-prediction","Supply a valid tagged prediction request and lambda from 0 to 1000.",false);
+    };
+    let ratings: Result<List<ProfileRating>,String> = protocol_ratings(protocol_member(request.payload,"ratings"));
+    when is_err(ratings) { term prediction_worker_error(request,"invalid-prediction",unwrap_err(ratings),false); };
+    let lambda_milli: Int = protocol_integer(protocol_member(request.payload,"lambda_milli"));
+    let query: PredictionRequest = PredictionRequest { tag: request.tag, ratings: unwrap(ratings) };
+    let predicted: Result<RecommendationResult,String> = active_engine_predict(engine,query,lambda_milli as Float/1000.0);
+    when is_err(predicted) { term prediction_worker_error(request,"prediction-failed",unwrap_err(predicted),false); };
+    let encoded: Result<String,String> = protocol_encode_event(PredictedRatings(unwrap(predicted)));
+    when is_err(encoded) { term prediction_worker_error(request,"prediction-encode",unwrap_err(encoded),false); };
+    let payload: Result<JsonValue,String> = protocol_document(unwrap(encoded));
+    when is_err(payload) { term prediction_worker_error(request,"prediction-encode",unwrap_err(payload),false); };
+    term WorkerMessage { kind: "result", tag: request.tag, payload: unwrap(payload) };
+};
+
+defn prediction_worker_error(request: WorkerMessage, code: String, message: String, retryable: Bool) -> WorkerMessage {
+    let fields: List<(String,JsonValue)> = [("error",StrVal(code)),("message",StrVal(message)),("retryable",BoolVal(retryable))];
+    term WorkerMessage { kind: "error", tag: request.tag, payload: Object(fields) };
+};
+
+defn prediction_pool_new(worker_limit: Int, owner_limit: Int) -> Result<PredictionPool,String> {
+    when worker_limit < 1 || worker_limit > 16 || owner_limit < 1 || owner_limit > 100000 {
+        term Err("Prediction capacity must allow 1..16 workers and 1..100000 owners.");
+    };
+    let owners: List<PredictionOwnerQueue> = [];
+    term Ok(PredictionPool { owners: owners, cursor: 0, worker_limit: worker_limit,
+        owner_limit: owner_limit, in_flight: 0, epoch: "" });
+};
+
+defn prediction_pool_reset_epoch(pool: PredictionPool, epoch: String) -> Result<PredictionPool,String> {
+    when !protocol_hex(epoch,32) || pool.in_flight != 0 { term Err("Reset prediction scheduling only to a valid epoch with no running jobs."); };
+    let owners: List<PredictionOwnerQueue> = [];
+    term Ok(PredictionPool { owners: owners, cursor: 0, worker_limit: pool.worker_limit,
+        owner_limit: pool.owner_limit, in_flight: 0, epoch: epoch });
+};
+
+defn prediction_request_valid(request: PredictionRequest) -> Bool {
+    when !worker_tag_valid(request.tag,"predict") || request.tag.attempt < 1 || request.tag.attempt > 65535 ||
+        request.ratings .^Length > PROTOCOL_ITEMS { term false; };
+    let previous: Int = -1;
+    foreach idx in 0..request.ratings .^Length {
+        when request.ratings[idx].item_id <= previous || request.ratings[idx].item_id >= 1682 ||
+            request.ratings[idx].rating < 1 || request.ratings[idx].rating > 5 { term false; };
+        previous = request.ratings[idx].item_id;
+    };
+    term true;
+};
+
+defn prediction_tag_same(left: WorkerTag, right: WorkerTag) -> Bool {
+    term worker_same_tag(left,right);
+};
+
+defn prediction_tag_current(incoming: WorkerTag, latest: WorkerTag) -> Bool {
+    when incoming.profile.server_epoch != latest.profile.server_epoch { term false; };
+    when incoming.profile.account_id != latest.profile.account_id { term false; };
+    term protocol_counter_at_least(incoming.profile.revision,latest.profile.revision);
+};
+
+defn prediction_pool_offer(pool: PredictionPool, request: PredictionRequest) -> Result<PredictionPool,String> {
+    when !prediction_request_valid(request) { term Err("Supply an ordered, bounded profile and a current prediction job tag."); };
+    when pool.epoch != "" && pool.epoch != request.tag.profile.server_epoch { term Err("Prediction request belongs to a stale or uninitialized server epoch."); };
+    let epoch: String = pool.epoch;
+    when epoch == "" { epoch = request.tag.profile.server_epoch; };
+    let owner: Int = request.tag.profile.account_id;
+    let idx: Int = prediction_pool_owner(pool.owners,owner);
+    when idx < 0 {
+        when pool.owners .^Length >= pool.owner_limit { term Err("Prediction owner capacity is full; reject before accepting work."); };
+        let pending: PredictionPending = PendingPrediction(request);
+        let entry: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner, running: IdlePrediction(), pending: pending, latest: request.tag };
+        let appended: List<PredictionOwnerQueue> = [entry];
+        term Ok(PredictionPool { owners: pool.owners+appended, cursor: pool.cursor,
+            worker_limit: pool.worker_limit, owner_limit: pool.owner_limit, in_flight: pool.in_flight, epoch: epoch });
+    };
+    let offered: Result<PredictionPool,String> = prediction_pool_offer_owner(pool,idx,request);
+    when is_err(offered) { term Err(unwrap_err(offered)); };
+    let next: PredictionPool = unwrap(offered);
+    term Ok(PredictionPool { owners: next.owners, cursor: next.cursor, worker_limit: next.worker_limit,
+        owner_limit: next.owner_limit, in_flight: next.in_flight, epoch: epoch });
+};
+
+defn prediction_pool_offer_owner(pool: PredictionPool, idx: Int, request: PredictionRequest) -> Result<PredictionPool,String> {
+    let owner: PredictionOwnerQueue = pool.owners[idx];
+    when !prediction_tag_current(request.tag,owner.latest) { term Err("Discard a prediction request older than the owner's latest accepted profile."); };
+    when prediction_tag_same(request.tag,owner.latest) { term Ok(pool); };
+    let pending: PredictionPending = PendingPrediction(request);
+    let updated: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner.owner, running: owner.running,
+        pending: pending, latest: request.tag };
+    term Ok(prediction_pool_replace_owner(pool,idx,updated));
+};
+
+defn prediction_pool_owner(owners: List<PredictionOwnerQueue>, owner: Int) -> Int {
+    foreach idx in 0..owners .^Length { when owners[idx].owner == owner { term idx; }; };
+    term -1;
+};
+
+defn prediction_pool_remove_owner(pool: PredictionPool, owner: Int) -> Result<PredictionPool,String> {
+    let idx: Int = prediction_pool_owner(pool.owners,owner);
+    when idx < 0 { term Err("Prediction owner is not present in this pool."); };
+    let entry: PredictionOwnerQueue = pool.owners[idx];
+    when prediction_running(entry.running) { term Err("Cannot evict an owner with a running prediction."); };
+    match entry.pending {
+        PendingPrediction(_) => { term Err("Cannot evict an owner with pending latest work."); },
+        _ => {},
+    };
+    let owners: List<PredictionOwnerQueue> = [];
+    foreach at in 0..pool.owners .^Length { when at != idx { owners <- pool.owners[at]; }; };
+    let cursor: Int = pool.cursor;
+    when idx < cursor { cursor = cursor-1; };
+    when owners .^Length == 0 { cursor = 0; };
+    when owners .^Length > 0 { cursor = cursor%owners .^Length; };
+    term Ok(PredictionPool { owners: owners, cursor: cursor, worker_limit: pool.worker_limit,
+        owner_limit: pool.owner_limit, in_flight: pool.in_flight, epoch: pool.epoch });
+};
+
+defn prediction_pool_replace_owner(pool: PredictionPool, idx: Int, entry: PredictionOwnerQueue) -> PredictionPool {
+    let owners: List<PredictionOwnerQueue> = [];
+    foreach at in 0..pool.owners .^Length {
+        when at == idx { owners <- entry; };
+        when at != idx { owners <- pool.owners[at]; };
+    };
+    term PredictionPool { owners: owners, cursor: pool.cursor, worker_limit: pool.worker_limit,
+        owner_limit: pool.owner_limit, in_flight: pool.in_flight, epoch: pool.epoch };
+};
+
+defn prediction_pool_schedule(pool: PredictionPool, workers: List<PredictionWorkerReady>) -> PredictionDispatch {
+    let idle: PredictionDispatch = PredictionDispatch { pool: pool, worker_id: -1,
+        request: prediction_empty_request(), dispatched: false };
+    when pool.in_flight >= pool.worker_limit || pool.owners .^Length == 0 { term idle; };
+    term prediction_pool_schedule_scan(pool,workers,pool.cursor,0);
+};
+
+defn prediction_pool_schedule_scan(pool: PredictionPool, workers: List<PredictionWorkerReady>,
+    start: Int, scanned: Int) -> PredictionDispatch {
+    when scanned >= pool.owners .^Length {
+        term PredictionDispatch { pool: pool, worker_id: -1, request: prediction_empty_request(), dispatched: false };
+    };
+    let idx: Int = (start+scanned)%pool.owners .^Length;
+    let owner: PredictionOwnerQueue = pool.owners[idx];
+    when prediction_running(owner.running) { term prediction_pool_schedule_scan(pool,workers,start,scanned+1); };
+    match owner.pending {
+        PendingPrediction(request) => {
+            let worker_idx: Int = prediction_pool_idle_worker(pool,workers,request.tag.model_generation,0);
+            when worker_idx >= 0 { term prediction_pool_dispatch(pool,workers,idx,worker_idx,request); };
+        },
+        _ => {},
+    };
+    term prediction_pool_schedule_scan(pool,workers,start,scanned+1);
+};
+
+defn prediction_pool_idle_worker(pool: PredictionPool, workers: List<PredictionWorkerReady>, generation: String, idx: Int) -> Int {
+    when idx >= workers .^Length { term -1; };
+    foreach idx in 0..workers .^Length {
+        when prediction_worker_eligible(pool,workers[idx],generation) { term idx; };
+    };
+    term -1;
+};
+
+defn prediction_worker_eligible(pool: PredictionPool, worker: PredictionWorkerReady, generation: String) -> Bool {
+    when !worker.ready { term false; };
+    when worker.busy { term false; };
+    when worker.generation != generation { term false; };
+    term prediction_pool_worker_owner(pool.owners,worker.worker_id) < 0;
+};
+
+defn prediction_pool_dispatch(pool: PredictionPool, workers: List<PredictionWorkerReady>, idx: Int,
+    worker_idx: Int, request: PredictionRequest) -> PredictionDispatch {
+    let owner: PredictionOwnerQueue = pool.owners[idx];
+    let running: PredictionRunning = RunningPrediction(workers[worker_idx].worker_id,request);
+    let updated: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner.owner, running: running,
+        pending: NoPredictionPending(), latest: owner.latest };
+    let next_pool: PredictionPool = prediction_pool_replace_owner(pool,idx,updated);
+    let next_cursor: Int = (idx+1)%pool.owners .^Length;
+    let scheduled: PredictionPool = PredictionPool { owners: next_pool.owners, cursor: next_cursor,
+        worker_limit: pool.worker_limit, owner_limit: pool.owner_limit, in_flight: pool.in_flight+1, epoch: pool.epoch };
+    term PredictionDispatch { pool: scheduled, worker_id: workers[worker_idx].worker_id, request: request, dispatched: true };
+};
+
+defn prediction_empty_request() -> PredictionRequest {
+    let ratings: List<ProfileRating> = [];
+    let tag: WorkerTag = WorkerTag { profile: ProfileVersion { server_epoch: "", account_id: 0, revision: "0" },
+        job_id: "0", attempt: 0, model_generation: "0" };
+    term PredictionRequest { tag: tag, ratings: ratings };
+};
+
+defn prediction_running(running: PredictionRunning) -> Bool {
+    match running { RunningPrediction(_,_) => true, _ => false, }
+};
+
+defn prediction_pending_generation(pending: PredictionPending, generation: String) -> Bool {
+    match pending { PendingPrediction(request) => request.tag.model_generation == generation, _ => false, }
+};
+
+defn prediction_pending_request(pending: PredictionPending) -> PredictionRequest {
+    match pending { PendingPrediction(request) => request, _ => prediction_empty_request(), }
+};
+
+defn prediction_pool_complete(pool: PredictionPool, worker_id: Int, result: WorkerMessage) -> PredictionCompletion {
+    let owner_idx: Int = prediction_pool_running_owner(pool.owners,worker_id,result.tag);
+    when owner_idx < 0 || (result.kind != "result" && result.kind != "error") || !worker_message_valid(result) {
+        term PredictionCompletion { pool: pool, deliver: false, accepted: false, result: result };
+    };
+    let owner: PredictionOwnerQueue = pool.owners[owner_idx];
+    let current: Bool = prediction_tag_same(result.tag,owner.latest);
+    let updated: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner.owner, running: IdlePrediction(),
+        pending: owner.pending, latest: owner.latest };
+    let next: PredictionPool = prediction_pool_replace_owner(pool,owner_idx,updated);
+    let settled: PredictionPool = PredictionPool { owners: next.owners, cursor: next.cursor,
+        worker_limit: next.worker_limit, owner_limit: next.owner_limit, in_flight: next.in_flight-1, epoch: next.epoch };
+    term PredictionCompletion { pool: settled, deliver: current, accepted: true, result: result };
+};
+
+defn prediction_pool_running_owner(owners: List<PredictionOwnerQueue>, worker_id: Int, tag: WorkerTag) -> Int {
+    foreach idx in 0..owners .^Length {
+        match owners[idx].running {
+            RunningPrediction(id,request) => { when id == worker_id { when prediction_tag_same(request.tag,tag) { term idx; }; }; },
+            _ => {},
+        };
+    };
+    term -1;
+};
+
+defn prediction_pool_worker_died(pool: PredictionPool, worker_id: Int) -> PredictionWorkerLoss {
+    let idx: Int = prediction_pool_worker_owner(pool.owners,worker_id);
+    when idx < 0 { term PredictionWorkerLoss { pool: pool, retry_queued: false, exhausted: false,
+        tag: WorkerTag { profile: ProfileVersion { server_epoch: "", account_id: 0, revision: "0" }, job_id: "0", attempt: 0, model_generation: "0" } }; };
+    let owner: PredictionOwnerQueue = pool.owners[idx];
+    let request: PredictionRequest = prediction_running_request(owner.running);
+    let replacement: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner.owner, running: IdlePrediction(),
+        pending: owner.pending, latest: owner.latest };
+    let base: PredictionPool = prediction_pool_replace_owner(pool,idx,replacement);
+    let settled: PredictionPool = PredictionPool { owners: base.owners, cursor: base.cursor,
+        worker_limit: base.worker_limit, owner_limit: base.owner_limit, in_flight: base.in_flight-1, epoch: base.epoch };
+    match owner.pending {
+        PendingPrediction(_) => { term PredictionWorkerLoss { pool: settled, retry_queued: false, exhausted: false, tag: request.tag }; },
+        _ => prediction_pool_retry_lost(settled,idx,request),
+    }
+};
+
+defn prediction_pool_worker_owner(owners: List<PredictionOwnerQueue>, worker_id: Int) -> Int {
+    foreach idx in 0..owners .^Length { match owners[idx].running {
+        RunningPrediction(id,_) => { when id == worker_id { term idx; }; }, _ => {},
+    }; };
+    term -1;
+};
+
+defn prediction_running_request(running: PredictionRunning) -> PredictionRequest {
+    match running { RunningPrediction(_,request) => request, _ => prediction_empty_request(), }
+};
+
+defn prediction_pool_retry_lost(pool: PredictionPool, idx: Int, request: PredictionRequest) -> PredictionWorkerLoss {
+    when request.tag.attempt >= PREDICTION_MAX_ATTEMPTS {
+        term PredictionWorkerLoss { pool: pool, retry_queued: false, exhausted: true, tag: request.tag };
+    };
+    let tag: WorkerTag = WorkerTag { profile: request.tag.profile, job_id: request.tag.job_id,
+        attempt: request.tag.attempt+1, model_generation: request.tag.model_generation };
+    let retry: PredictionRequest = PredictionRequest { tag: tag, ratings: request.ratings };
+    let owner: PredictionOwnerQueue = pool.owners[idx];
+    let pending: PredictionPending = PendingPrediction(retry);
+    let updated: PredictionOwnerQueue = PredictionOwnerQueue { owner: owner.owner, running: owner.running,
+        pending: pending, latest: tag };
+    term PredictionWorkerLoss { pool: prediction_pool_replace_owner(pool,idx,updated), retry_queued: true, exhausted: false, tag: tag };
+};
+

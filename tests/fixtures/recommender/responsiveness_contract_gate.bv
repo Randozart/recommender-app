@@ -1,0 +1,17 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_contract_checks.bv";
+import "std/env.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let epoch: String = get_env("PROTOCOL_TEST_EPOCH");
+    when epoch .^Length == 0 { epoch = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; };
+    println!("commands={} counters={} profiles={}",contract_command_checks(epoch),contract_counter_checks(),contract_ratings_checks()); stdout_flush();
+    println!("events={} policy={} workers={}",contract_event_checks(epoch),contract_policy_checks(),contract_worker_checks(epoch)); stdout_flush();
+    when !contract_base_checks(epoch) { println!("protocol base contract failed"); stdout_flush(); endprogram 1; };
+    println!("protocol base contract passed (128 commands and profiles)");
+    tick = 1; endprogram;
+};

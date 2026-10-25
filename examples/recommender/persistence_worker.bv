@@ -1,0 +1,293 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./operation_store.bv";
+import "./admission.bv";
+import "std/posix/syscall.bv";
+
+const PERSIST_RETRY_BASE_MS: Int = 100;
+const PERSIST_RETRY_MAX_MS: Int = 10000;
+obj PersistenceWorkerConfig {
+    addr: Int; port: Int; user: String; database: String; schema: String;
+    password: String; server_epoch: String;
+};
+obj PersistenceWorker {
+    conn: PgConn; server_epoch: String; database_identity: String; ready: Bool;
+};
+obj PersistenceWorkerStep { worker: PersistenceWorker; reply: WorkerMessage; reconnect: Bool; };
+obj PersistenceRetrySlot { operation_id: String; attempt: Int; retry_at_ms: Int; };
+obj PersistenceJob { command: RatingCommand; saved: RatingSaved; timestamp: String; discard: Bool; attempt: Int; };
+obj PersistenceSchedule { jobs: List<PersistenceJob>; next_owner: Int; };
+obj PersistenceRetryDecision { allowed: Bool; exhausted: Bool; attempt: Int; delay_ms: Int; retry_at_ms: Int; };
+
+// Each child opens and configures its own connection. The expected identity
+// excludes model/population revision but includes DB, schema and server epoch.
+defn persistence_worker_open(config: PersistenceWorkerConfig) -> Result<PersistenceWorker,String> {
+    when !protocol_hex(config.server_epoch,32) || config.database .^Length == 0 || config.schema .^Length == 0 {
+        term Err("Persistence worker configuration requires a database, schema and current server epoch.");
+    };
+    let conn: PgConn = pg_connect(config.addr,config.port,config.user,config.database,config.password);
+    when conn.sock.fd < 0 || conn.pid < 0 { term Err("Persistence worker could not open its private PostgreSQL connection."); };
+    let params: List<String> = [config.schema];
+    let selected: PgResult = pg_exec(conn,"SELECT set_config('search_path',quote_ident($1),false)",params);
+    when !selected.ok { pg_close(conn); term Err("Persistence worker could not select its configured schema."); };
+    let identity: Result<String,String> = operation_store_database_identity(conn,config.server_epoch);
+    when is_err(identity) { pg_close(conn); term Err(unwrap_err(identity)); };
+    let expected: String = config.database+"/"+config.schema+"/"+config.server_epoch;
+    when unwrap(identity) != expected { pg_close(conn); term Err("PostgreSQL connected to a different database, schema or server epoch."); };
+    term Ok(PersistenceWorker { conn: conn, server_epoch: config.server_epoch,
+        database_identity: expected, ready: true });
+};
+
+defn persistence_worker_close(worker: PersistenceWorker) -> Bool {
+    when !worker.ready || worker.conn.sock.fd < 0 { term true; };
+    pg_close(worker.conn);
+    term true;
+};
+
+// Call after a database response leaves the commit outcome uncertain. The
+// socket is raw-closed: a protocol Terminate on a desynchronized connection is
+// unsafe. The supervisor opens a fresh connection before another job.
+defn persistence_worker_abandon(worker: PersistenceWorker) -> PersistenceWorker {
+    when worker.ready && worker.conn.sock.fd >= 0 { syscall(SYS_CLOSE,worker.conn.sock.fd); };
+    term PersistenceWorker { conn: PgConn { sock: worker.conn.sock, pid: -1, key: 0 },
+        server_epoch: worker.server_epoch, database_identity: worker.database_identity, ready: false };
+};
+
+defn persistence_worker_handle(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
+    when !worker.ready || !worker_message_valid(request) || request.tag.profile.server_epoch != worker.server_epoch {
+        term persistence_worker_error_step(worker,request,"worker-identity","The persistence request does not match this worker's database identity.",false,false);
+    };
+    // 2026-10-25: shutdown is an epoch-scoped control message with only a
+    // deadline payload (protocol v1). Database identity gates data operations;
+    // requiring it here rejected every graceful supervisor shutdown.
+    when request.kind == "shutdown" { term persistence_worker_stopped(worker,request); };
+    when protocol_text(protocol_member(request.payload,"database_identity")) != worker.database_identity {
+        term persistence_worker_error_step(worker,request,"worker-identity","The persistence request does not match this worker's database identity.",false,false);
+    };
+    when request.kind == "persist" { term persistence_worker_handle_save(worker,request); };
+    when request.kind == "discard" { term persistence_worker_handle_discard(worker,request); };
+    when request.kind == "receipt" { term persistence_worker_handle_receipts(worker,request); };
+    term persistence_worker_error_step(worker,request,"worker-kind","This persistence worker accepts persist, discard, receipt and shutdown requests.",false,false);
+};
+
+defn persistence_worker_handle_save(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
+    let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(request.payload,"operation"));
+    when is_err(command) {
+        term persistence_worker_failure_step(worker,request,"invalid-operation","The rating operation is not a valid version-1 command.",false);
+    };
+    let result: OperationWriteResult = operation_store_save(worker.conn,unwrap(command),request.tag.profile,
+        protocol_text(protocol_member(request.payload,"timestamp")));
+    term persistence_worker_save_reply(worker,request,result);
+};
+
+defn persistence_worker_handle_discard(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
+    let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(request.payload,"operation"));
+    when is_err(command) || unwrap(command).operation_id != protocol_text(protocol_member(request.payload,"operation_id")) {
+        term persistence_worker_failure_step(worker,request,"invalid-operation","The discard must carry the original accepted rating operation.",false);
+    };
+    let result: OperationWriteResult = operation_store_discard(worker.conn,
+        RatingSaved { profile: request.tag.profile, operation_id: unwrap(command).operation_id },
+        unwrap(command).item_id,unwrap(command).rating,protocol_text(protocol_member(request.payload,"timestamp")));
+    term persistence_worker_save_reply(worker,request,result);
+};
+
+defn persistence_worker_save_reply(worker: PersistenceWorker, request: WorkerMessage, result: OperationWriteResult) -> PersistenceWorkerStep {
+    match result.outcome {
+        OperationApplied(receipt) => persistence_worker_receipt_ack(worker,request,receipt),
+        OperationReplayed(receipt) => persistence_worker_receipt_ack(worker,request,receipt),
+        OperationAlreadyDiscarded(receipt) => persistence_worker_failure_step(worker,request,"operation-discarded",
+            "This operation already has a durable discard tombstone; it cannot be reinserted.",false),
+        OperationConflict(message) => persistence_worker_failure_step(worker,request,"operation-conflict",message,false),
+        OperationFailed(detail) => persistence_worker_sql_failure(worker,request,detail),
+        OperationUncertain(message) => persistence_worker_error_step(worker,request,"commit-uncertain",message,true,true),
+    }
+};
+
+defn persistence_worker_receipt_ack(worker: PersistenceWorker, request: WorkerMessage,
+    receipt: DurableOperationReceipt) -> PersistenceWorkerStep {
+    when receipt.status != "saved" && request.kind != "discard" {
+        term persistence_worker_failure_step(worker,request,"operation-discarded",
+            "This operation already has a durable discard tombstone; it cannot be reinserted.",false);
+    };
+    let saved: RatingSaved = RatingSaved { profile: receipt.profile, operation_id: receipt.operation_id };
+    term persistence_worker_event_step(worker,request,"saved",SavedRating(saved),false);
+};
+
+defn persistence_worker_sql_failure(worker: PersistenceWorker, request: WorkerMessage, detail: PgResult) -> PersistenceWorkerStep {
+    let retryable: Bool = persistence_sql_retryable(detail.err_code);
+    term persistence_worker_failure_step(worker,request,"persistence-failed",
+        "The database rejected the rating transaction; the write was rolled back.",retryable);
+};
+
+defn persistence_sql_retryable(code: String) -> Bool {
+    term code == "40001" || code == "40P01" || code == "55P03" ||
+        code == "57P01" || code == "57P02" || code == "57P03";
+};
+
+defn persistence_worker_handle_receipts(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
+    let raw: JsonValue = protocol_member(request.payload,"operation_ids");
+    let entries: List<JsonValue> = protocol_array(raw);
+    let empty: List<String> = [];
+    let operations: List<String> = persistence_worker_operation_ids(entries,0,empty);
+    let batch: OperationReceiptBatch = operation_store_receipts(worker.conn,request.tag.profile.account_id,
+        worker.server_epoch,operations);
+    when !batch.ok {
+        when batch.uncertain { term persistence_worker_error_step(worker,request,batch.error,batch.message,true,true); };
+        term persistence_worker_error_step(worker,request,batch.error,batch.message,false,false);
+    };
+    let payload: JsonValue = persistence_worker_receipt_payload(worker.server_epoch,batch.receipts);
+    term PersistenceWorkerStep { worker: worker,
+        reply: WorkerMessage { kind: "receipts", tag: request.tag, payload: payload }, reconnect: false };
+};
+
+defn persistence_worker_operation_ids(entries: List<JsonValue>, idx: Int, operations: List<String>) -> List<String> {
+    when idx >= entries .^Length { term operations; };
+    let operation: List<String> = [protocol_text(entries[idx])];
+    term persistence_worker_operation_ids(entries,idx+1,operations+operation);
+};
+
+defn persistence_worker_receipt_payload(epoch: String, receipts: List<DurableOperationReceipt>) -> JsonValue {
+    let operations: List<JsonValue> = [];
+    foreach idx in 0..receipts .^Length { operations <- persistence_worker_receipt_value(receipts[idx]); };
+    let fields: List<(String,JsonValue)> = [("current_server_epoch",StrVal(epoch)),("operations",Array(operations))];
+    term Object(fields);
+};
+
+defn persistence_worker_receipt_value(receipt: DurableOperationReceipt) -> JsonValue {
+    when receipt.status == "unknown" {
+        let fields: List<(String,JsonValue)> = [("operation_id",StrVal(receipt.operation_id)),("status",StrVal("unknown"))];
+        term Object(fields);
+    };
+    let profile: ProfileVersion = receipt.profile;
+    let fields: List<(String,JsonValue)> = [("operation_id",StrVal(receipt.operation_id)),("status",StrVal(receipt.status)),
+        ("server_epoch",StrVal(profile.server_epoch)),("account_id",IntVal(profile.account_id)),
+        ("revision",StrVal(profile.revision)),("item_id",IntVal(receipt.item_id)),("rating",IntVal(receipt.rating))];
+    term Object(fields);
+};
+
+defn persistence_worker_event_step(worker: PersistenceWorker, request: WorkerMessage, kind: String,
+    event: RatingEvent, reconnect: Bool) -> PersistenceWorkerStep {
+    let encoded: Result<String,String> = protocol_encode_event(event);
+    when is_err(encoded) {
+        term persistence_worker_error_step(worker,request,"reply-encode","The persistence worker could not encode its bounded result.",false,reconnect);
+    };
+    let payload: Result<JsonValue,String> = protocol_document(unwrap(encoded));
+    when is_err(payload) {
+        term persistence_worker_error_step(worker,request,"reply-encode","The persistence worker could not encode its bounded result.",false,reconnect);
+    };
+    term PersistenceWorkerStep { worker: worker, reply: WorkerMessage { kind: kind, tag: request.tag, payload: unwrap(payload) }, reconnect: reconnect };
+};
+
+defn persistence_worker_failure_step(worker: PersistenceWorker, request: WorkerMessage,
+    code: String, message: String, retryable: Bool) -> PersistenceWorkerStep {
+    let operation_id: String = protocol_text(protocol_member(request.payload,"operation_id"));
+    when operation_id .^Length == 0 {
+        let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(request.payload,"operation"));
+        when is_ok(command) { operation_id = unwrap(command).operation_id; };
+    };
+    let failed: RatingSaveFailed = RatingSaveFailed { profile: request.tag.profile,
+        operation_id: operation_id,
+        error: code, message: message, retryable: retryable };
+    term persistence_worker_event_step(worker,request,"save-failed",FailedRating(failed),false);
+};
+
+defn persistence_worker_error_step(worker: PersistenceWorker, request: WorkerMessage,
+    code: String, message: String, retryable: Bool, reconnect: Bool) -> PersistenceWorkerStep {
+    let fields: List<(String,JsonValue)> = [("error",StrVal(code)),("message",StrVal(message)),("retryable",BoolVal(retryable))];
+    term PersistenceWorkerStep { worker: worker, reply: WorkerMessage { kind: "error", tag: request.tag, payload: Object(fields) }, reconnect: reconnect };
+};
+
+defn persistence_worker_stopped(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
+    let fields: List<(String,JsonValue)> = [("drained",BoolVal(true))];
+    term PersistenceWorkerStep { worker: worker,
+        reply: WorkerMessage { kind: "stopped", tag: request.tag, payload: Object(fields) }, reconnect: false };
+};
+
+// I04 owns the authoritative operation list. This selector only exposes each
+// account's first unresolved queued/retry-ready head; a failed or uncertain
+// head blocks that owner while unrelated owners remain schedulable.
+defn persistence_schedule(admission: AdmissionState, owners: List<Int>, retries: List<PersistenceRetrySlot>,
+    now_ms: Int, worker_slots: Int, start_owner: Int) -> PersistenceSchedule {
+    when worker_slots < 0 || worker_slots > 16 || now_ms < 0 || owners .^Length == 0 {
+        let empty: List<PersistenceJob> = [];
+        term PersistenceSchedule { jobs: empty, next_owner: 0 };
+    };
+    let start: Int = persistence_schedule_start(owners,start_owner);
+    let empty: List<PersistenceJob> = [];
+    term persistence_schedule_scan(admission,owners,retries,now_ms,worker_slots,start,0,empty,start);
+};
+
+defn persistence_schedule_start(owners: List<Int>, start_owner: Int) -> Int {
+    when start_owner < 0 { term 0; };
+    when start_owner >= owners .^Length { term start_owner % owners .^Length; };
+    term start_owner;
+};
+
+defn persistence_schedule_scan(admission: AdmissionState, owners: List<Int>, retries: List<PersistenceRetrySlot>,
+    now_ms: Int, worker_slots: Int, start: Int, scanned: Int, jobs: List<PersistenceJob>, next_owner: Int) -> PersistenceSchedule {
+    when scanned >= owners .^Length || jobs .^Length >= worker_slots {
+        term PersistenceSchedule { jobs: jobs, next_owner: next_owner };
+    };
+    let owner_idx: Int = (start+scanned) % owners .^Length;
+    let owner: Int = owners[owner_idx];
+    let head: Int = profile_first_unresolved(admission,owner);
+    when head < 0 { term persistence_schedule_scan(admission,owners,retries,now_ms,worker_slots,start,scanned+1,jobs,next_owner); };
+    let operation: OperationStatus = admission.operations[head];
+    when !persistence_phase_dispatchable(operation.phase,retries,operation.accepted.operation_id,now_ms) {
+        term persistence_schedule_scan(admission,owners,retries,now_ms,worker_slots,start,scanned+1,jobs,next_owner);
+    };
+    let saved: RatingSaved = RatingSaved { profile: operation.accepted.profile, operation_id: operation.accepted.operation_id };
+    let command: RatingCommand = RatingCommand { server_epoch: saved.profile.server_epoch,
+        operation_id: saved.operation_id, item_id: operation.accepted.delta.item_id, rating: operation.accepted.delta.rating };
+    let discard: Bool = persistence_phase_is_discard(operation.phase);
+    let attempt: Int = persistence_retry_attempt(retries,saved.operation_id);
+    let job: PersistenceJob = PersistenceJob { command: command, saved: saved, timestamp: operation.timestamp, discard: discard, attempt: attempt };
+    let added: List<PersistenceJob> = [job];
+    term persistence_schedule_scan(admission,owners,retries,now_ms,worker_slots,start,scanned+1,jobs+added,(owner_idx+1)%owners .^Length);
+};
+
+defn persistence_phase_dispatchable(phase: PersistencePhase, retries: List<PersistenceRetrySlot>, operation: String, now_ms: Int) -> Bool {
+    match phase {
+        PersistQueued() => true,
+        PersistDiscardQueued() => true,
+        PersistRetryWait() => persistence_retry_due(retries,operation,now_ms),
+        PersistDiscardFailed() => persistence_retry_due(retries,operation,now_ms),
+        _ => false,
+    }
+};
+
+defn persistence_phase_is_discard(phase: PersistencePhase) -> Bool {
+    match phase { PersistDiscardQueued() => true, PersistDiscardRunning() => true,
+        PersistDiscardFailed() => true, PersistDiscardUncertain() => true, _ => false, }
+};
+
+defn persistence_retry_attempt(retries: List<PersistenceRetrySlot>, operation: String) -> Int {
+    foreach idx in 0..retries .^Length { when retries[idx].operation_id == operation { term retries[idx].attempt; }; };
+    term 1;
+};
+
+defn persistence_retry_due(retries: List<PersistenceRetrySlot>, operation: String, now_ms: Int) -> Bool {
+    foreach idx in 0..retries .^Length {
+        when retries[idx].operation_id == operation { term now_ms >= retries[idx].retry_at_ms; };
+    };
+    term false;
+};
+
+defn persistence_retry_decide(attempt: Int, max_attempts: Int, now_ms: Int) -> PersistenceRetryDecision {
+    when attempt < 0 || max_attempts < 0 || max_attempts > 10 || now_ms < 0 || attempt >= max_attempts || now_ms > 9223372036854765807 {
+        term PersistenceRetryDecision { allowed: false, exhausted: attempt >= max_attempts, attempt: attempt, delay_ms: 0, retry_at_ms: now_ms };
+    };
+    let next_attempt: Int = attempt+1;
+    let delay: Int = persistence_retry_delay(next_attempt);
+    term PersistenceRetryDecision { allowed: true, exhausted: false, attempt: next_attempt,
+        delay_ms: delay, retry_at_ms: now_ms+delay };
+};
+
+defn persistence_retry_delay(attempt: Int) -> Int {
+    when attempt <= 1 { term PERSIST_RETRY_BASE_MS; };
+    when attempt >= 8 { term PERSIST_RETRY_MAX_MS; };
+    let delay: Int = PERSIST_RETRY_BASE_MS << (attempt-1);
+    when delay > PERSIST_RETRY_MAX_MS { term PERSIST_RETRY_MAX_MS; };
+    term delay;
+};

@@ -1,0 +1,52 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/worker_lifecycle.bv";
+
+defn worker_test_model(generation: String) -> ModelDescriptor {
+    term ModelDescriptor { generation: generation, path: "/tmp/recommender.snapshot",
+        identity: "fixture-model-"+generation, bytes: 64 };
+};
+
+defn worker_install_model(registry: ModelRegistry, generation: String) -> ModelRegistry {
+    let installed: ModelInstall = model_install(registry,worker_test_model(generation));
+    when !installed.installed { term registry; };
+    term installed.registry;
+};
+
+defn worker_model_run() -> Bool {
+    let registry: ModelRegistry = model_registry_new();
+    registry = worker_install_model(registry,"1");
+    let acquired_one: Result<ModelAcquisition,String> = model_acquire(registry,"1");
+    when is_err(acquired_one) { term false; };
+    registry = unwrap(acquired_one).registry;
+    registry = worker_install_model(registry,"2");
+    let acquired_two: Result<ModelAcquisition,String> = model_acquire(registry,"2");
+    when is_err(acquired_two) { term false; };
+    registry = unwrap(acquired_two).registry;
+    registry = worker_install_model(registry,"3");
+    let acquired_three: Result<ModelAcquisition,String> = model_acquire(registry,"3");
+    when is_err(acquired_three) { term false; };
+    registry = unwrap(acquired_three).registry;
+    registry = worker_install_model(registry,"4");
+    let acquired_four: Result<ModelAcquisition,String> = model_acquire(registry,"4");
+    when is_err(acquired_four) { term false; };
+    registry = unwrap(acquired_four).registry;
+    let refused: ModelInstall = model_install(registry,worker_test_model("5"));
+    when refused.installed || refused.error != "model-reader-capacity" { term false; };
+    let released: Result<ModelRegistry,String> = model_release(registry,unwrap(acquired_one).lease);
+    when is_err(released) || model_reader_count(unwrap(released),"1") != 0 { term false; };
+    let installed_five: ModelInstall = model_install(unwrap(released),worker_test_model("5"));
+    let duplicate_release: Result<ModelRegistry,String> = model_release(unwrap(released),unwrap(acquired_one).lease);
+    println!("model_reader_hold={} capacity_refused={} reclaimed_after_release={} double_release_rejected={}",
+        model_reader_count(registry,"1") == 1,refused.error == "model-reader-capacity",installed_five.installed,is_err(duplicate_release));
+    term installed_five.installed && is_err(duplicate_release);
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let passed: Bool = worker_model_run();
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

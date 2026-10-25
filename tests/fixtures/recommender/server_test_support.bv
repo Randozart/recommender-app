@@ -1,0 +1,147 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_loop.bv";
+import { operation_store_create_schema } from "../../../examples/recommender/operation_store.bv";
+import "std/env.bv";
+
+obj TestExchange { server: ServerState; response: String; };
+
+defn test_abort() -> Bool {
+    stdout_flush();
+    let exited: Int = syscall(60,1);
+    term false;
+};
+
+defn test_port(fd: Int) -> Int {
+    let memory: Int = Malloc#(24) as Int;
+    Store#(memory+16,16,4);
+    let result: Int = syscall(51,fd,memory,memory+16);
+    let port: Int = Load#(memory+2,1)*256+Load#(memory+3,1);
+    Free#(memory as Ptr);
+    when result < 0 { term -1; };
+    term port;
+};
+
+defn test_pump(state: ServerState) -> ServerState {
+    let updated: ServerState = state;
+    let idle_sweeps: Int = 0;
+    // 2026-10-25: drain asynchronous fixture work before the next request;
+    // allow queued HTTP replies to flush after worker completion as well.
+    foreach step in 0..2000 {
+        updated = server_step(updated,1);
+        when !updated.workers.persistence_busy && !updated.workers.prediction_busy { idle_sweeps += 1; };
+        when updated.workers.persistence_busy || updated.workers.prediction_busy { idle_sweeps = 0; };
+        // 100 one-millisecond sweeps also give loopback socket readiness a
+        // bounded settle window when a frame arrives just after a poll.
+        when step >= 100 && idle_sweeps >= 3 { term updated; };
+    };
+    term updated;
+};
+
+// 2026-10-21: refresh now runs in a child. Keep driving actual socket sweeps
+// while awaiting installation; a fixed six-tick assumption tests scheduler
+// speed rather than refresh completion. Timeout remains a failing assertion
+// in callers, not an implicit successful synchronous refresh.
+defn test_refresh_complete(state: ServerState) -> ServerState {
+    let updated: ServerState = state;
+    foreach step in 0..1000 {
+        updated = server_step(updated,10);
+        when updated.worker.pid == 0 && !updated.refresh && updated.worker.owners .^Length == 0 { term updated; };
+    };
+    term updated;
+};
+
+defn test_send(socket: Socket, text: String) -> Bool {
+    let buffer: GrowBuf = put_str(grow_new(text .^Length+1),text);
+    let sent: Int = sock_send(socket,ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap },buffer.len);
+    grow_free(buffer);
+    term sent == text .^Length;
+};
+
+defn test_read(socket: Socket) -> String {
+    let buffer: ByteBuf = buf_new(65536);
+    let count: Int = syscall(SYS_RECV,socket.fd,buffer.ptr,buffer.cap,0);
+    when count <= 0 { buf_free(buffer); term ""; };
+    let text: String = buf_slice_string(ByteBuf { ptr: buffer.ptr, len: count, cap: buffer.cap },0,count);
+    buf_free(buffer);
+    term text;
+};
+
+defn test_wire(method: String, path: String, body: String) -> String {
+    term method+" "+path+" HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: "+body .^Length as String+"\r\n\r\n"+body;
+};
+
+defn test_http(state: ServerState, method: String, path: String, body: String) -> TestExchange {
+    let socket: Socket = sock_tcp();
+    let connected: Int = sock_connect(socket,LOOPBACK,test_port(state.reactor.listener));
+    when connected < 0 { println!("test connect failed={}",connected); test_abort(); };
+    let sent: Bool = test_send(socket,test_wire(method,path,body));
+    let nonblocking: Int = sock_set_nonblocking(socket);
+    let updated: ServerState = test_pump(state);
+    let text: String = test_read(socket);
+    let closed: Int = sock_close(socket);
+    when !sent || nonblocking < 0 { test_abort(); };
+    term TestExchange { server: updated, response: text };
+};
+
+defn test_body(text: String) -> String {
+    let end: Int = str_find(text,"\r\n\r\n");
+    when end < 0 { term ""; };
+    term text[end+4:text .^Length];
+};
+
+defn test_ws(socket: Socket, opcode: Int, fin: Bool, text: String) -> Bool {
+    let frame: GrowBuf = ws_encode(grow_new(text .^Length+16),fin,opcode,true,16909060,(((text as Data) as Int)+8),text .^Length);
+    let sent: Int = sock_send(socket,ByteBuf { ptr: frame.ptr, len: frame.len, cap: frame.cap },frame.len);
+    let success: Bool = sent == frame.len;
+    grow_free(frame);
+    term success;
+};
+
+defn test_ws_payload(text: String) -> String {
+    when text .^Length == 0 { term ""; };
+    let buffer: GrowBuf = put_str(grow_new(text .^Length+1),text);
+    let message: WsMessage = ws_message(ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap },0);
+    grow_free(buffer);
+    when message.status != WS_COMPLETE { term ""; };
+    term message.payload;
+};
+
+defn test_upgrade(socket: Socket, token: String) -> Bool {
+    term test_send(socket,"GET /live?token="+token+" HTTP/1.1\r\nHost: localhost\r\nUpgrade:\twebsocket \t\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version:\t13 \t\r\nSec-WebSocket-Key:\tdGhlIHNhbXBsZSBub25jZQ== \t\r\n\r\n");
+};
+
+defn test_catalogue_rows(idx: Int, count: Int, movies: List<CatalogueMovie>) -> MovieCatalogue {
+    when idx >= count { term MovieCatalogue { ok: true, movies: movies, error: "" }; };
+    let movie: CatalogueMovie = CatalogueMovie { item_id: idx, title: "Test movie "+(idx as String) };
+    term test_catalogue_rows(idx+1,count,movies+[movie]);
+};
+
+defn test_catalogue(count: Int) -> MovieCatalogue {
+    let empty: List<CatalogueMovie> = [];
+    term test_catalogue_rows(0,count,empty);
+};
+
+defn test_server() -> ServerState {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.pid < 0 { println!("test database unavailable"); test_abort(); };
+    let schema: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_server_loop_gate; SET search_path TO briev_server_loop_gate");
+    let created: PgResult = store_create_schema(conn);
+    let receipts: PgResult = operation_store_create_schema(conn);
+    let seeded: PgResult = pg_simple_query(conn,"TRUNCATE rating_operation_receipts,ratings,accounts,baseline_ratings RESTART IDENTITY CASCADE; INSERT INTO baseline_ratings SELECT usr,itm,1+(usr+itm)%5,1 FROM generate_series(0,2) usr CROSS JOIN generate_series(0,7) itm");
+    when !schema.ok || !created.ok || !receipts.ok || !seeded.ok {
+        println!("test schema failed setup={} store={} receipts={} seed={}",schema.err_msg,created.err_msg,receipts.err_msg,seeded.err_msg);
+        test_abort();
+    };
+    let loaded: Result<ServerModel,PgResult> = model_load(conn,3,8);
+    when is_err(loaded) { println!("test model failed={}",unwrap_err(loaded).err_msg); test_abort(); };
+    let reactor: Reactor = reactor_open(0,16);
+    when reactor.listener < 0 { test_abort(); };
+    let initial: ServerState = server_new(reactor,conn,unwrap(loaded),test_catalogue(8),0.5,3600000);
+    // 2026-10-25: loopback login and rating gates exercise the same required
+    // worker startup as the real server; server_new intentionally stays pure.
+    let started: Result<ServerState,String> = server_workers_start(initial);
+    when is_err(started) { println!("test workers failed={}",unwrap_err(started)); test_abort(); };
+    term unwrap(started);
+};

@@ -1,0 +1,156 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/admission_contract.bv";
+import "./worker_contract_checks.bv";
+
+defn contract_command_checks(epoch: String) -> Bool {
+    let operation: String = unwrap(protocol_operation_id(epoch,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    foreach idx in 0..128 {
+        let command: RatingCommand = RatingCommand { server_epoch: epoch, operation_id: operation, item_id: idx, rating: 1+idx%5 };
+        let encoded: Result<String,String> = protocol_encode_command(command);
+        when is_err(encoded) { term false; };
+        let decoded: Result<RatingCommand,String> = protocol_decode_command(unwrap(encoded));
+        when is_err(decoded) { term false; };
+        let result: RatingCommand = unwrap(decoded);
+        when result.server_epoch != epoch || result.operation_id != operation || result.item_id != idx || result.rating != 1+idx%5 { term false; };
+    };
+    let prefix: String = "{\"v\":1,\"server_epoch\":\""+epoch+"\",\"operation_id\":\""+operation+"\",";
+    when is_ok(protocol_decode_command(prefix+"\"item_id\":0,\"rating\":0}")) { term false; };
+    when is_ok(protocol_decode_command(prefix+"\"item_id\":1682,\"rating\":5}")) { term false; };
+    when is_ok(protocol_decode_command(prefix+"\"item_id\":0,\"rating\":1.0}")) { term false; };
+    when is_ok(protocol_decode_command(prefix+"\"item_id\":0,\"rating\":1,\"rating\":2}")) { term false; };
+    when is_ok(protocol_decode_command(prefix+"\"item_id\":0,\"rating\":1} trailing")) { term false; };
+    let foreign_claim: Result<RatingCommand,String> = protocol_decode_command(prefix+"\"item_id\":0,\"rating\":1,\"account_id\":999,\"future\":\"雪\"}");
+    // Claims outside the command type cannot supply admission authority.
+    term is_ok(foreign_claim) && unwrap(foreign_claim).operation_id == operation;
+};
+defn contract_counter_checks() -> Bool {
+    when !protocol_counter("0") || !protocol_counter("9007199254740993") ||
+        !protocol_counter("9223372036854775807") || protocol_counter("9223372036854775808") ||
+        protocol_counter("01") || protocol_counter("-1") || protocol_counter("1.0") ||
+        protocol_counter("") || protocol_positive("0") { term false; };
+    when unwrap(protocol_counter_next("99")) != "100" || is_ok(protocol_counter_next("9223372036854775807")) { term false; };
+    let counter: String = "9007199254740993";
+    foreach idx in 0..128 {
+        let next: Result<String,String> = protocol_counter_next(counter);
+        when is_err(next) { term false; };
+        counter = unwrap(next);
+    };
+    term counter == "9007199254741121";
+};
+defn contract_ratings_checks() -> Bool {
+    let rows: List<ProfileRating> = [];
+    foreach idx in 0..128 { rows <- ProfileRating { item_id: idx, rating: 1+idx%5 }; };
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(rows);
+    when is_err(encoded) { term false; };
+    let decoded: Result<List<ProfileRating>,String> = protocol_ratings(unwrap(encoded));
+    when is_err(decoded) { term false; };
+    let result: List<ProfileRating> = unwrap(decoded);
+    when result .^Length != 128 || result[127].rating != 3 { term false; };
+    let duplicates: List<ProfileRating> = [ProfileRating { item_id: 1, rating: 2 },ProfileRating { item_id: 1, rating: 3 }];
+    term is_err(protocol_ratings_value(duplicates));
+};
+defn contract_base_checks(epoch: String) -> Bool {
+    when !protocol_hex(epoch,32) { term false; };
+    term contract_command_checks(epoch) && contract_counter_checks() && contract_ratings_checks() &&
+        contract_event_checks(epoch) && contract_policy_checks() && contract_worker_checks(epoch) && contract_guard_checks(epoch);
+};
+
+defn contract_guard_int(flag: Bool, value: Int) -> Int {
+    let chosen: Bool = flag && { value = 20; true; };
+    when chosen { term value; };
+    term value;
+};
+
+defn contract_guard_string(flag: Bool, value: String) -> Int {
+    let chosen: Bool = flag && { value = "newer"; true; };
+    when chosen { term value .^Length; };
+    term value .^Length;
+};
+
+defn contract_guard_checks(epoch: String) -> Bool {
+    let flag: Bool = byte_at(epoch,0) == 122;
+    term contract_guard_int(flag,10) == 10 && contract_guard_int(!flag,10) == 20 &&
+        contract_guard_string(flag,"old") == 3 && contract_guard_string(!flag,"old") == 5;
+};
+
+defn contract_round_trip(event: RatingEvent) -> Result<RatingEvent,String> {
+    let encoded: Result<String,String> = protocol_encode_event(event);
+    when is_err(encoded) { term Err(unwrap_err(encoded)); };
+    term protocol_decode_event(unwrap(encoded));
+};
+defn contract_event_checks(epoch: String) -> Bool {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 17, revision: "9007199254740993" };
+    let operation: String = unwrap(protocol_operation_id(epoch,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    let original: RatingSaved = RatingSaved { profile: profile, operation_id: operation };
+    let saved: Result<RatingEvent,String> = contract_round_trip(SavedRating(original));
+    when is_err(saved) { term false; };
+    let saved_ok: Bool = match unwrap(saved) { SavedRating(value) => protocol_saved_matches(value,original), _ => false, };
+    when !saved_ok || protocol_event_replaces_recommendations(unwrap(saved)) { term false; };
+    let accepted: Result<RatingEvent,String> = contract_round_trip(AcceptedRating(RatingAccepted {
+        profile: profile, operation_id: operation, delta: ProfileRating { item_id: 1681, rating: 5 } }));
+    when is_err(accepted) { term false; };
+    let accepted_ok: Bool = match unwrap(accepted) { AcceptedRating(value) => value.delta.item_id == 1681 && value.delta.rating == 5 && value.profile.revision == profile.revision, _ => false, };
+    when !accepted_ok || protocol_event_replaces_recommendations(unwrap(accepted)) { term false; };
+    let failure: RatingSaveFailed = RatingSaveFailed { profile: profile, operation_id: operation,
+        error: "database", message: "Cannot save \"雪\". Retry after the database is available.", retryable: true };
+    let failed: Result<RatingEvent,String> = contract_round_trip(FailedRating(failure));
+    when is_err(failed) { term false; };
+    let failure_ok: Bool = match unwrap(failed) { FailedRating(value) => value.message == failure.message && value.retryable && value.profile.revision == profile.revision, _ => false, };
+    when !failure_ok || protocol_event_replaces_recommendations(unwrap(failed)) { term false; };
+    let tag: PredictionTag = PredictionTag { profile: profile, model_generation: "9223372036854775807", job_id: "42", attempt: 1 };
+    let movies: List<RankedMovie> = [RankedMovie { item_id: 1, score: 4.25 },RankedMovie { item_id: 2, score: 4.25 }];
+    let prediction: Result<RatingEvent,String> = contract_round_trip(PredictedRatings(RecommendationResult { tag: tag, cold_start: false, items: movies }));
+    when is_err(prediction) { term false; };
+    let prediction_ok: Bool = match unwrap(prediction) { PredictedRatings(value) => protocol_result_current(value.tag,profile,tag) && value.items .^Length == 2 && value.items[0].score == 4.25 && value.items[1].item_id == 2, _ => false, };
+    when !prediction_ok || !protocol_event_replaces_recommendations(unwrap(prediction)) { term false; };
+    let rows: List<ProfileRating> = [ProfileRating { item_id: 3, rating: 2 }];
+    let discarded: Result<RatingEvent,String> = contract_round_trip(DiscardedRating(RatingDiscarded {
+        original: original, profile_revision: "9007199254740994", ratings: rows }));
+    when is_err(discarded) { term false; };
+    let discard_ok: Bool = match unwrap(discarded) { DiscardedRating(value) => value.profile_revision == "9007199254740994" && value.ratings .^Length == 1 && value.ratings[0].item_id == 3, _ => false, };
+    when !discard_ok || protocol_event_replaces_recommendations(unwrap(discarded)) { term false; };
+    term contract_result_rejection_checks(tag,movies) && is_err(protocol_decode_event("{\"v\":2}"));
+};
+defn contract_result_rejection_checks(tag: PredictionTag, movies: List<RankedMovie>) -> Bool {
+    let foreign: ProfileVersion = ProfileVersion { server_epoch: tag.profile.server_epoch, account_id: 18, revision: tag.profile.revision };
+    let stale: ProfileVersion = ProfileVersion { server_epoch: tag.profile.server_epoch, account_id: 17, revision: "1" };
+    let retry: PredictionTag = PredictionTag { profile: tag.profile, model_generation: tag.model_generation, job_id: tag.job_id, attempt: 2 };
+    when protocol_result_current(tag,foreign,tag) || protocol_result_current(tag,stale,tag) || protocol_result_current(tag,tag.profile,retry) { term false; };
+    let wrong_order: List<RankedMovie> = [movies[1],movies[0]];
+    when is_ok(protocol_encode_result(RecommendationResult { tag: tag, cold_start: false, items: wrong_order })) { term false; };
+    when is_ok(protocol_encode_result(RecommendationResult { tag: tag, cold_start: true, items: movies })) { term false; };
+    let empty: List<RankedMovie> = [];
+    term is_ok(protocol_encode_result(RecommendationResult { tag: tag, cold_start: true, items: empty }));
+};
+defn contract_phase_is(phase: PersistencePhase, signal: PersistenceSignal, expected: Int) -> Bool {
+    let next: Result<PersistencePhase,String> = protocol_persistence_next(phase,signal);
+    when is_err(next) { term expected == -1; };
+    term contract_phase_code(unwrap(next)) == expected;
+};
+defn contract_phase_code(phase: PersistencePhase) -> Int {
+    match phase { PersistQueued() => 0, PersistRunning() => 1, PersistRetryWait() => 2,
+        PersistFailed() => 3, PersistUncertain() => 4, PersistSaved() => 5,
+        PersistDiscardQueued() => 6, PersistDiscardRunning() => 7, PersistDiscardFailed() => 8,
+        PersistDiscardUncertain() => 9, PersistDiscarded() => 10, }
+};
+defn contract_policy_checks() -> Bool {
+    when !contract_phase_is(PersistQueued(),DispatchPersist(),1) || !contract_phase_is(PersistQueued(),CommitPersist(),-1) { term false; };
+    when !contract_phase_is(PersistRunning(),LosePersist(),4) || !contract_phase_is(PersistRunning(),RollbackPersist(),2) { term false; };
+    when !contract_phase_is(PersistRunning(),FailPersist(),3) || !contract_phase_is(PersistRunning(),CommitPersist(),5) { term false; };
+    when !contract_phase_is(PersistRetryWait(),ExhaustPersist(),3) || !contract_phase_is(PersistRetryWait(),RetryPersist(),0) { term false; };
+    when !contract_phase_is(PersistRetryWait(),RequestDiscard(),6) || !contract_phase_is(PersistFailed(),RequestDiscard(),6) { term false; };
+    when !contract_phase_is(PersistFailed(),RetryPersist(),0) || !contract_phase_is(PersistUncertain(),RequestDiscard(),-1) { term false; };
+    when !contract_phase_is(PersistUncertain(),RollbackPersist(),2) || !contract_phase_is(PersistUncertain(),CommitPersist(),5) { term false; };
+    when !contract_phase_is(PersistUncertain(),LosePersist(),4) || !contract_phase_is(PersistDiscardQueued(),DispatchPersist(),7) { term false; };
+    when !contract_phase_is(PersistDiscardRunning(),LosePersist(),9) || !contract_phase_is(PersistDiscardRunning(),RollbackPersist(),8) { term false; };
+    when !contract_phase_is(PersistDiscardRunning(),FailPersist(),8) || !contract_phase_is(PersistDiscardRunning(),CommitDiscard(),10) { term false; };
+    when !contract_phase_is(PersistDiscardFailed(),RetryPersist(),6) || !contract_phase_is(PersistDiscardFailed(),RequestDiscard(),-1) { term false; };
+    when !contract_phase_is(PersistDiscardUncertain(),RollbackPersist(),6) || !contract_phase_is(PersistDiscardUncertain(),CommitDiscard(),10) { term false; };
+    when !contract_phase_is(PersistDiscardUncertain(),CommitPersist(),5) || !contract_phase_is(PersistDiscardUncertain(),LosePersist(),9) { term false; };
+    when !contract_phase_is(PersistSaved(),RetryPersist(),-1) || !contract_phase_is(PersistDiscarded(),RetryPersist(),-1) { term false; };
+    term protocol_head_released(PersistSaved()) && protocol_head_released(PersistDiscarded()) &&
+        !protocol_head_released(PersistUncertain()) && !protocol_head_released(PersistDiscardUncertain()) &&
+        !protocol_head_released(PersistDiscardFailed());
+};

@@ -1,0 +1,43 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/sessions.bv";
+defn token_fixture(address: Int, values: List<Int>, idx: Int) -> Bool {
+    when idx >= values .^Length { term true; };
+    Store#(address + idx,values[idx],1);
+    term token_fixture(address,values,idx + 1);
+};
+defn token_is_hex(token: String, idx: Int) -> Bool {
+    when idx >= token .^Length { term token .^Length == 32; };
+    let byte: Int = byte_at(token,idx);
+    when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { term false; };
+    term token_is_hex(token,idx + 1);
+};
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let original: SessionStore = sessions_new();
+    let first: SessionIssue = session_issue(original,11,0);
+    let second: SessionIssue = session_issue(first.sessions,22,0);
+    let valid: Bool = first.ok && second.ok && token_is_hex(first.token,0) && token_is_hex(second.token,0) && first.token != second.token;
+    let bindings: Bool = session_account(second.sessions,first.token) == 11 && session_account(second.sessions,second.token) == 22 &&
+        session_account(second.sessions,"") == 0 && session_account(second.sessions,"forged") == 0;
+    let ownership: Bool = original.entries .^Length == 0 && first.sessions.entries .^Length == 1 && second.sessions.entries .^Length == 2;
+    let refused: SessionIssue = session_issue(second.sessions,11,8);
+    let unchanged: Bool = !refused.ok && refused.token .^Length == 0 && refused.sessions.entries .^Length == 2 && session_account(refused.sessions,second.token) == 22;
+    let remote_token: String = "00112233445566778899aabbccddeeff";
+    let adopted: SessionIssue = session_adopt(second.sessions,33,remote_token);
+    let duplicate_adopt: SessionIssue = session_adopt(adopted.sessions,44,remote_token);
+    let invalid_adopt: SessionIssue = session_adopt(adopted.sessions,44,"not-a-token");
+    let adoption: Bool = adopted.ok && session_account(adopted.sessions,remote_token) == 33 &&
+        !duplicate_adopt.ok && !invalid_adopt.ok && adopted.sessions.entries .^Length == 3;
+    let address: Int = Malloc#(16) as Int;
+    let values: List<Int> = [0,1,15,16,31,32,63,64,127,128,129,160,192,224,254,255];
+    let filled: Bool = token_fixture(address,values,0);
+    let hex: Bool = filled && session_hex(address,0,"") == "00010f101f203f407f8081a0c0e0feff";
+    let failed_read: Bool = session_read_random(-1,address,0) == false;
+    Free#(address as Ptr);
+    println!("random_tokens={} token_owner_lookup={} explicit_store={} failed_issue_unchanged={} adopted_worker_token={} failed_read={} hex_endpoints={}",valid,bindings,ownership,unchanged,adoption,failed_read,hex);
+    when !valid || !bindings || !ownership || !unchanged || !adoption || !failed_read || !hex { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

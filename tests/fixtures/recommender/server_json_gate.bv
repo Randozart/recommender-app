@@ -1,0 +1,24 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_api.bv";
+import { json_parse } from "std/json.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let plain: ApiInput = api_input("{\"username\":\"alice\",\"password\":\"secret\"}");
+    let escaped: ApiInput = api_input("{\"username\":\"a\\\"b\\n\\u0041\",\"password\":\"secret\"}");
+    let escaped_ok: Bool = escaped.ok && escaped.username == "a\"b\nA";
+    let separators: Bool = !api_input("{\"rating\":3 \"item_id\":0}").ok && !api_input("{\"rating\":3,}").ok;
+    let malformed: Bool = !api_input("{\"rating\":01}").ok && !api_input("{\"rating\":nulX}").ok && !api_input("{\"username\":\"unterminated}").ok;
+    let unicode: ApiInput = api_input("{\"username\":\"héllo 🌍\",\"password\":\"\\uD83C\\uDF0D\"}");
+    let unicode_ok: Bool = unicode.ok && unicode.username == "héllo 🌍" && unicode.password == "🌍";
+    let endpoints: Bool = is_ok(json_parse("-9223372036854775808")) && is_ok(json_parse("9223372036854775807")) &&
+        is_err(json_parse("9223372036854775808")) && is_err(json_parse("-9223372036854775809")) && is_err(json_parse("1e9999"));
+    when !endpoints { println!("min={} max={} over={} under={} huge={}",is_ok(json_parse("-9223372036854775808")),is_ok(json_parse("9223372036854775807")),is_err(json_parse("9223372036854775808")),is_err(json_parse("-9223372036854775809")),is_err(json_parse("1e9999"))); };
+    let nested: Bool = is_ok(json_parse("[1,{\"a\":true},null,-1.25e-2]")) && is_err(json_parse("[1 2]")) && is_err(json_parse("[1,]"));
+    let invalid_escape: Bool = is_err(json_parse("\"\\uD800\"")) && is_err(json_parse("\"\\q\"")) && is_err(json_parse("\"raw\nline\""));
+    println!("json_plain={} escapes={} separators={} malformed={} unicode={} integer_endpoints={} nested={} invalid_escape={}",plain.ok,escaped_ok,separators,malformed,unicode_ok,endpoints,nested,invalid_escape);
+    when !plain.ok || !escaped_ok || !separators || !malformed || !unicode_ok || !endpoints || !nested || !invalid_escape { endprogram 1; };
+    tick = 1; endprogram;
+};

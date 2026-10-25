@@ -1,0 +1,22 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/worker_pool.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let result: Result<WorkerModelState,String> = worker_model_empty();
+    when is_err(result) { endprogram 1; };
+    let state: WorkerModelState = unwrap(result);
+    let pop: RatingPopulation = state.model.population;
+    let valid: Bool = pop.user_off.len == 2 && pop.item_off.len == 2 &&
+        ivec_get(pop.user_off,0) == 0 && ivec_get(pop.user_off,1) == 0 &&
+        ivec_get(pop.item_off,0) == 0 && ivec_get(pop.item_off,1) == 0 &&
+        base_sim_user(pop,state.model.means,0,0) == 0.0;
+    active_engine_free(state.engine);
+    model_free(state.model);
+    println!("empty_worker_model={}",valid);
+    when !valid { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

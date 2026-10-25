@@ -1,0 +1,32 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import { knn_aggregate, knn_aggregate_reuse } from "../../../examples/recommender/cf_engine.bv";
+import "std/matrix.bv";
+
+defn check_case(candidates: IntVec, scores: Vector, deviations: Vector, used: IntVec, n: Int) -> Bool {
+    let (fresh_num,fresh_eta): (Float,Float) = knn_aggregate(candidates,scores,deviations,n,30);
+    let (reuse_num,reuse_eta): (Float,Float) = knn_aggregate_reuse(scores,deviations,used,n,30);
+    term Abs#(fresh_num-reuse_num) <= 0.000001 && Abs#(fresh_eta-reuse_eta) <= 0.000001;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let candidates: IntVec = ivec_new(40);
+    let scores: Vector = vec_new(40);
+    let deviations: Vector = vec_new(40);
+    let used: IntVec = ivec_new(40);
+    foreach idx in 0..40 {
+        ivec_set(candidates,idx,idx);
+        vec_set(scores,idx,(idx % 7) as Float / 7.0);
+        vec_set(deviations,idx,(idx % 9) as Float - 4.0);
+    };
+    let empty: Bool = check_case(candidates,scores,deviations,used,0);
+    let short: Bool = check_case(candidates,scores,deviations,used,4);
+    let truncated: Bool = check_case(candidates,scores,deviations,used,40);
+    vec_free(scores); vec_free(deviations); ivec_free(used); ivec_free(candidates);
+    println!("active_scratch empty={} short={} truncated={}",empty,short,truncated);
+    when !empty || !short || !truncated { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

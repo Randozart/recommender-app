@@ -1,0 +1,76 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/browser_profile.bv";
+import "std/env.bv";
+
+defn browser_pending_accepted(operations: List<BrowserOperation>, id: String) -> List<BrowserOperation> {
+    term browser_operation_advance(operations,BrowserOperation { operation_id: id,
+        item_id: 5, rating: 4, revision: "6", status: "accepted", retryable: false, message: "" });
+};
+
+defn browser_pending_saved(operations: List<BrowserOperation>, id: String) -> List<BrowserOperation> {
+    term browser_operation_advance(operations,BrowserOperation { operation_id: id,
+        item_id: 5, rating: 4, revision: "6", status: "saved", retryable: false, message: "" });
+};
+
+defn browser_pending_failed(operations: List<BrowserOperation>, id: String) -> List<BrowserOperation> {
+    term browser_operation_advance(operations,BrowserOperation { operation_id: id,
+        item_id: 5, rating: 4, revision: "6", status: "failed", retryable: true, message: "database unavailable" });
+};
+
+defn browser_pending_discarded(operations: List<BrowserOperation>, id: String) -> List<BrowserOperation> {
+    term browser_operation_advance(operations,BrowserOperation { operation_id: id,
+        item_id: 5, rating: 4, revision: "6", status: "discarded", retryable: false, message: "" });
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+let operation_id: String = "0123456789abcdef0123456789abcdefaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+let profile: List<ProfileRating> = [ProfileRating { item_id: 0, rating: 3 },
+    ProfileRating { item_id: 1, rating: 2 }, ProfileRating { item_id: 2, rating: 4 },
+    ProfileRating { item_id: 3, rating: 3 }, ProfileRating { item_id: 4, rating: 5 }];
+let local: List<BrowserOperation> = browser_operation_advance([],BrowserOperation {
+    operation_id: operation_id, item_id: 5, rating: 4, revision: "0", status: "local",
+    retryable: true, message: "" });
+let optimistic: List<ProfileRating> = browser_profile_overlay(profile,local);
+let rendered: String = browser_profile_render(profile,local);
+when optimistic .^Length != 6 || optimistic[5].item_id != 5 || optimistic[5].rating != 4 ||
+    browser_operation_unresolved(local) != 1 || rendered != "Movie 1: 3 / 5. Movie 2: 2 / 5. Movie 3: 4 / 5. Movie 4: 3 / 5. Movie 5: 5 / 5. Movie 6: 4 / 5 (pending save). " {
+    println!("optimistic overlay or pending label failed"); endprogram 1;
+};
+
+// The terminal database event is intentionally permuted around prediction work.
+let saved_first: List<BrowserOperation> = browser_pending_saved(browser_pending_accepted(local,operation_id),operation_id);
+let saved_duplicate: List<BrowserOperation> = browser_pending_saved(saved_first,operation_id);
+let late_failure: List<BrowserOperation> = browser_pending_failed(saved_duplicate,operation_id);
+when browser_operation_unresolved(saved_first) != 0 || browser_operation_unresolved(saved_duplicate) != 0 ||
+    browser_operation_unresolved(late_failure) != 0 || late_failure[0].status != "saved" {
+    println!("saved-first duplicate or late failure regressed terminal state"); endprogram 1;
+};
+
+let failed: List<BrowserOperation> = browser_pending_failed(local,operation_id);
+let retry: List<BrowserOperation> = browser_operation_advance(failed,BrowserOperation {
+    operation_id: operation_id, item_id: 5, rating: 4, revision: "6", status: "retrying",
+    retryable: true, message: "" });
+let saved_after_retry: List<BrowserOperation> = browser_pending_saved(retry,operation_id);
+when failed[0].status != "failed" || !failed[0].retryable || browser_operation_unresolved(failed) != 1 ||
+    saved_after_retry[0].status != "saved" || saved_after_retry[0].operation_id != operation_id ||
+    browser_operation_index(saved_after_retry,operation_id) != 0 || browser_operation_unresolved(saved_after_retry) != 0 {
+    println!("failed, retry and saved transitions failed"); endprogram 1;
+};
+
+let discard_pending: List<BrowserOperation> = browser_operation_advance(failed,BrowserOperation {
+    operation_id: operation_id, item_id: 5, rating: 4, revision: "6", status: "discarding",
+    retryable: false, message: "" });
+let discarded: List<BrowserOperation> = browser_pending_discarded(discard_pending,operation_id);
+let late_saved: List<BrowserOperation> = browser_pending_saved(discarded,operation_id);
+when discarded[0].status != "discarded" || browser_operation_unresolved(discarded) != 0 ||
+    late_saved[0].status != "discarded" {
+    println!("discarded operation did not remain terminal"); endprogram 1;
+};
+
+println!("browser pending state: optimistic overlay, saved-first, duplicate, late failure and retry pass");
+tick = 1;
+endprogram;
+};

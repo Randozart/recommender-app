@@ -1,0 +1,49 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_events.bv";
+
+defn protocol_encode_accepted(accepted: RatingAccepted) -> Result<String,String> {
+    when !protocol_operation_version_valid(accepted.profile,accepted.operation_id) || !protocol_rating_valid(accepted.delta) { term Err("Supply a valid accepted operation and authoritative rating delta."); };
+    let original: RatingSaved = RatingSaved { profile: accepted.profile, operation_id: accepted.operation_id };
+    let delta: List<(String,JsonValue)> = [("item_id",IntVal(accepted.delta.item_id)),("rating",IntVal(accepted.delta.rating))];
+    term protocol_encode_object(protocol_operation_fields(original,"accepted")+delta);
+};
+defn protocol_encode_saved(saved: RatingSaved) -> Result<String,String> {
+    when !protocol_saved_valid(saved) { term Err("Supply the committed operation's original version."); };
+    term protocol_encode_object(protocol_operation_fields(saved,"saved"));
+};
+defn protocol_encode_failure(failure: RatingSaveFailed) -> Result<String,String> {
+    when !protocol_failure_valid(failure) { term Err("Supply a valid failed operation, error code and actionable message."); };
+    let original: RatingSaved = RatingSaved { profile: failure.profile, operation_id: failure.operation_id };
+    let fields: List<(String,JsonValue)> = [("error",StrVal(failure.error)),("message",StrVal(failure.message)),("retryable",BoolVal(failure.retryable))];
+    term protocol_encode_object(protocol_operation_fields(original,"save-failed")+fields);
+};
+defn protocol_encode_result(result: RecommendationResult) -> Result<String,String> {
+    let tag: PredictionTag = result.tag;
+    when !protocol_version_valid(tag.profile) || !protocol_positive(tag.model_generation) || !protocol_positive(tag.job_id) || tag.attempt < 1 || tag.attempt > 65535 {
+        term Err("Supply a valid profile, positive model/job strings and bounded attempt.");
+    };
+    let movies: Result<JsonValue,String> = protocol_movies_value(result.items);
+    when is_err(movies) { term Err(unwrap_err(movies)); };
+    when result.cold_start && result.items .^Length != 0 { term Err("Cold-start results cannot contain recommendations."); };
+    let fields: List<(String,JsonValue)> = [("model_generation",StrVal(tag.model_generation)),("job_id",StrVal(tag.job_id)),
+        ("attempt",IntVal(tag.attempt)),("cold_start",BoolVal(result.cold_start)),("recommendations",unwrap(movies))];
+    term protocol_encode_object(protocol_fields(tag.profile,"recommendations")+fields);
+};
+defn protocol_encode_discard(discard: RatingDiscarded) -> Result<String,String> {
+    when !protocol_saved_valid(discard.original) || !protocol_counter_at_least(discard.profile_revision,discard.original.profile.revision) { term Err("Supply a discarded operation and a profile revision at least as new."); };
+    let ratings: Result<JsonValue,String> = protocol_ratings_value(discard.ratings);
+    when is_err(ratings) { term Err(unwrap_err(ratings)); };
+    let fields: List<(String,JsonValue)> = [("profile_revision",StrVal(discard.profile_revision)),("ratings",unwrap(ratings))];
+    term protocol_encode_object(protocol_operation_fields(discard.original,"discarded")+fields);
+};
+defn protocol_encode_event(event: RatingEvent) -> Result<String,String> {
+    match event {
+        AcceptedRating(value) => protocol_encode_accepted(value),
+        SavedRating(value) => protocol_encode_saved(value),
+        FailedRating(value) => protocol_encode_failure(value),
+        PredictedRatings(value) => protocol_encode_result(value),
+        DiscardedRating(value) => protocol_encode_discard(value),
+    }
+};

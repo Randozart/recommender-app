@@ -1,0 +1,3 @@
+import "./empty_import.bv";
+let value: EmptyImport = EmptyImport { value: 1 };
+<view><p b-text="value.value">1</p></view>

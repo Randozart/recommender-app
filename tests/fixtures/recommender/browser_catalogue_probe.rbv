@@ -1,0 +1,4 @@
+import "../../../examples/recommender/browser_catalogue.bv";
+let movies: List<BrowserMovie> = [];
+let page: BrowserMoviePage = browser_catalogue_page(movies,"",0,12);
+<view><p b-text="page.total">0</p></view>

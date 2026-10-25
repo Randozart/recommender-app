@@ -1,0 +1,70 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_test_support.bv";
+
+defn protocol_exchange(state: ServerState, wire: String) -> TestExchange {
+    let socket: Socket = sock_tcp();
+    let connected: Int = sock_connect(socket,LOOPBACK,test_port(state.reactor.listener));
+    let sent: Bool = test_send(socket,wire);
+    let nonblocking: Int = sock_set_nonblocking(socket);
+    let updated: ServerState = test_pump(state);
+    let response: String = test_read(socket);
+    let closed: Int = sock_close(socket);
+    term TestExchange { server: updated, response: response };
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let state: ServerState = test_server();
+    let cases: List<String> = [
+        "POST /rating HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n",
+        "POST /rating HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n{}",
+        "POST /rating HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /movies garbage\r\nHost: localhost\r\n\r\n",
+        "GET /movies HTTP/1.1\r\nHost: localhost\r\nBrokenHeader\r\n\r\n",
+        "GET /movies HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n"];
+    let framing: Bool = true;
+    foreach idx in 0..cases .^Length {
+        let exchange: TestExchange = protocol_exchange(state,cases[idx]);
+        state = exchange.server;
+        when str_find(exchange.response," 400 ") < 0 { framing = false; };
+    };
+    let oversized: TestExchange = protocol_exchange(state,"POST /rating HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9999999\r\n\r\n");
+    state = oversized.server;
+    let cap: Bool = str_find(oversized.response," 413 ") >= 0;
+    let missing: TestExchange = test_http(state,"GET","/state?token=forged","");
+    state = missing.server;
+    let unauthorized: Bool = str_find(missing.response," 401 ") >= 0;
+    let movies: TestExchange = test_http(state,"GET","/movies","");
+    state = movies.server;
+    let listed: Bool = str_find(movies.response,"\"item_id\":7") >= 0;
+    let options: TestExchange = test_http(state,"OPTIONS","/rating","");
+    state = options.server;
+    let cors: Bool = str_find(options.response,"Access-Control-Allow-Origin: *") >= 0;
+    let whitespace: TestExchange = protocol_exchange(state,"GET /movies HTTP/1.1\r\nHost:\tlocalhost \t\r\nContent-Length:\t 0 \t\r\n\r\n");
+    state = whitespace.server;
+    let optional_whitespace: Bool = str_find(whitespace.response," 200 ") >= 0;
+    let socket: Socket = sock_tcp();
+    let connected: Int = sock_connect(socket,LOOPBACK,test_port(state.reactor.listener));
+    let first: Bool = test_send(socket,"GET /movies HTTP/1.1\r\nHost: local");
+    let nb: Int = sock_set_nonblocking(socket);
+    state = test_pump(state);
+    let premature: String = test_read(socket);
+    let second: Bool = test_send(socket,"host\r\n\r\n");
+    let shutdown: Int = syscall(48,socket.fd,1);
+    state = test_pump(state);
+    let response: String = test_read(socket);
+    let closed: Int = sock_close(socket);
+    let incremental: Bool = premature .^Length == 0 && str_find(response," 200 ") >= 0;
+    let refresh_before: Int = state.model.population.nnz;
+    let broken: PgResult = pg_simple_query(state.conn,"ALTER TABLE baseline_ratings RENAME TO hidden_baseline_ratings");
+    let failed_refresh: ServerState = test_refresh_complete(server_refresh(state));
+    let restored: PgResult = pg_simple_query(state.conn,"ALTER TABLE hidden_baseline_ratings RENAME TO baseline_ratings");
+    state = failed_refresh;
+    let snapshot: Bool = broken.ok && restored.ok && state.model.population.nnz == refresh_before;
+    println!("framing={} input_cap={} unauthorized={} movies={} cors={} optional_whitespace={} split_and_half_close={} failed_refresh_keeps_snapshot={}",framing,cap,unauthorized,listed,cors,optional_whitespace,incremental,snapshot);
+    model_free(state.model); reactor_close(state.reactor); pg_close(state.conn);
+    when !framing || !cap || !unauthorized || !listed || !cors || !optional_whitespace || !incremental || !snapshot { endprogram 1; };
+    tick = 1; endprogram;
+};

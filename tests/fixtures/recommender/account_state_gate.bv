@@ -1,0 +1,115 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/account_state.bv";
+import "std/env.bv";
+
+defn state_matches(state: AccountState, owner: Int, first: Int, second: Int, timestamp: Int) -> Bool {
+    when !state.result.ok || state.result.account.id != owner || state.ratings .^Length != 2 { term false; };
+    let a: AccountRating = state.ratings[0];
+    let b: AccountRating = state.ratings[1];
+    term a.item_id == 0 && a.rating == first && a.timestamp == timestamp &&
+        b.item_id == 1681 && b.rating == second && b.timestamp == timestamp + 1;
+};
+
+defn state_isolation_cases(conn: PgConn, first: LoginResult, second: LoginResult, idx: Int) -> Bool {
+    when idx >= 120 { term true; };
+    let a0: Int = idx % 5 + 1;
+    let a1: Int = (idx + 1) % 5 + 1;
+    let b0: Int = (idx + 2) % 5 + 1;
+    let b1: Int = (idx + 3) % 5 + 1;
+    let a: String = first.result.account.id as String;
+    let b: String = second.result.account.id as String;
+    let params: List<String> = [a,"0",a0 as String,idx as String,
+        a,"1681",a1 as String,(idx + 1) as String,
+        b,"0",b0 as String,(idx + 1000) as String,
+        b,"1681",b1 as String,(idx + 1001) as String];
+    let seeded: PgResult = pg_exec(conn,
+        "INSERT INTO ratings(account_id,item_id,rating,ts) VALUES " +
+        "($1::integer,$2::integer,$3::smallint,$4::bigint)," +
+        "($5::integer,$6::integer,$7::smallint,$8::bigint)," +
+        "($9::integer,$10::integer,$11::smallint,$12::bigint)," +
+        "($13::integer,$14::integer,$15::smallint,$16::bigint) " +
+        "ON CONFLICT(account_id,item_id) DO UPDATE SET rating=EXCLUDED.rating,ts=EXCLUDED.ts",params);
+    when !seeded.ok { println!("state_fixture_failed={} code={}",idx,seeded.err_code); term false; };
+    let state_a: AccountState = account_state(conn,second.sessions,first.token);
+    let state_b: AccountState = account_state(conn,second.sessions,second.token);
+    when !state_matches(state_a,first.result.account.id,a0,a1,idx) || !state_matches(state_b,second.result.account.id,b0,b1,idx + 1000) {
+        println!("isolation_case_failed={} a_error={} b_error={}",idx,state_a.result.error,state_b.result.error);
+        term false;
+    };
+    term state_isolation_cases(conn,first,second,idx + 1);
+};
+
+defn state_error_gate(conn: PgConn, authenticated: LoginResult) -> Bool {
+    let hidden: PgResult = pg_simple_query(conn,"SET search_path TO pg_catalog");
+    let failed_state: AccountState = account_state(conn,authenticated.sessions,authenticated.token);
+    let failed_login: LoginResult = login(conn,authenticated.sessions,"first","password");
+    let failed_register: AccountResult = register(conn,"new-user","password");
+    let restored: PgResult = pg_simple_query(conn,"SET search_path TO briev_account_state_gate");
+    let recovered: AccountState = account_state(conn,authenticated.sessions,authenticated.token);
+    term hidden.ok && !failed_state.result.ok && failed_state.result.error == "database" && failed_state.result.detail.err_code == "42P01" &&
+        !failed_login.result.ok && failed_login.result.error == "database" && failed_login.result.detail.err_code == "42P01" &&
+        failed_login.sessions.entries .^Length == authenticated.sessions.entries .^Length &&
+        !failed_register.ok && failed_register.error == "database" && failed_register.detail.err_code == "42P01" && restored.ok && recovered.result.ok;
+};
+
+defn state_gate(conn: PgConn) -> Bool {
+    let scope: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_account_state_gate; SET search_path TO briev_account_state_gate");
+    when !scope.ok { term false; };
+    let schema: PgResult = store_create_schema(conn);
+    let cleared: PgResult = pg_simple_query(conn,"TRUNCATE ratings,accounts RESTART IDENTITY");
+    when !schema.ok || !cleared.ok { term false; };
+    let a: AccountResult = register(conn,"first","password");
+    let b: AccountResult = register(conn,"second","password");
+    let c: AccountResult = register(conn,"cold","password");
+    when !a.ok || !b.ok || !c.ok { term false; };
+    let first: LoginResult = login(conn,sessions_new(),"first","password");
+    let second: LoginResult = login(conn,first.sessions,"second","password");
+    let cold: LoginResult = login(conn,second.sessions,"cold","password");
+    when !first.result.ok || !second.result.ok || !cold.result.ok { term false; };
+    let empty: AccountState = account_state(conn,cold.sessions,cold.token);
+    let empty_ok: Bool = empty.result.ok && empty.result.account.id == c.account.id && empty.result.account.username == "cold" && empty.ratings .^Length == 0;
+    let forged: AccountState = account_state(conn,cold.sessions,"forged");
+    let claimed_id: AccountState = account_state(conn,cold.sessions,a.account.id as String);
+    let blank: AccountState = account_state(conn,cold.sessions,"");
+    let restarted: AccountState = account_state(conn,sessions_new(),first.token);
+    let denied: Bool = !forged.result.ok && forged.result.error == "auth-failed" && forged.ratings .^Length == 0 &&
+        !blank.result.ok && blank.result.error == "auth-failed" && !restarted.result.ok && restarted.result.error == "auth-failed" &&
+        !claimed_id.result.ok && claimed_id.result.error == "auth-failed";
+    println!("empty_account_state={} invalid_and_restart_sessions_denied={}",empty_ok,denied);
+    let isolated: Bool = state_isolation_cases(conn,first,second,0);
+    println!("account_isolation_120_cases={}",isolated);
+    let params: List<String> = [c.account.id as String];
+    let removed: PgResult = pg_exec(conn,"DELETE FROM accounts WHERE id=$1::integer",params);
+    let stale: AccountState = account_state(conn,cold.sessions,cold.token);
+    let deleted: Bool = removed.ok && !stale.result.ok && stale.result.error == "auth-failed" && stale.ratings .^Length == 0;
+    let errors: Bool = state_error_gate(conn,second);
+    println!("deleted_account_session_denied={} database_errors_and_recovery={}",deleted,errors);
+    term empty_ok && denied && isolated && deleted && errors;
+};
+
+let tick: Int = 0;
+defn state_persistence_gate() -> Bool {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { term false; };
+    let selected: PgResult = pg_simple_query(conn,"SET search_path TO briev_account_state_gate");
+    let authenticated: LoginResult = login(conn,sessions_new(),"first","password");
+    let state: AccountState = account_state(conn,authenticated.sessions,authenticated.token);
+    let persisted: Bool = selected.ok && authenticated.result.ok && authenticated.result.account.username == "first" &&
+        state_matches(state,authenticated.result.account.id,5,1,119);
+    pg_close(conn);
+    term persisted;
+};
+
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let passed: Bool = state_gate(conn);
+    pg_close(conn);
+    let persisted: Bool = passed && state_persistence_gate();
+    println!("fresh_connection_login_and_state={}",persisted);
+    when !passed || !persisted { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

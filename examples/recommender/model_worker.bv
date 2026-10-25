@@ -1,0 +1,72 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_model.bv";
+import "./reactor.bv";
+import "./worker_lifecycle.bv";
+import { mktemp_file } from "std/os/temp.bv";
+
+obj RefreshWorker { pid: Int; path: String; owners: List<Int>; };
+obj RefreshConfig { user: String; database: String; schema: String; path: String; baseline: Int; items: Int; parent: Int; };
+
+defn worker_idle() -> RefreshWorker {
+    let owners: List<Int> = [];
+    term RefreshWorker { pid: 0, path: "", owners: owners };
+};
+
+defn worker_exit(code: Int) -> Bool { syscall(60,code); term false; };
+
+// 2026-10-22: use the shared worker child guard/descriptor close path. Fork
+// shares socket descriptions, so inherited PostgreSQL sockets are raw-closed;
+// pg_close would send Terminate on the PARENT session. Recheck after PDEATHSIG
+// setup closes the pre-prctl parent-death race.
+defn worker_child(config: RefreshConfig, reactor: Reactor, inherited: PgConn) -> Bool {
+    when !worker_child_parent_guard(config.parent) { term worker_exit(1); };
+    let inherited_fds: List<Int> = [inherited.sock.fd,reactor.listener];
+    foreach slot in 0..reactor.capacity {
+        let fd: Int = Load#(reactor_row(reactor,slot),8);
+        when fd >= 0 { inherited_fds <- fd; };
+    };
+    when !worker_child_close_inherited(inherited_fds) { term worker_exit(1); };
+    let conn: PgConn = pg_connect(2130706433,5432,config.user,config.database,"");
+    when conn.pid < 0 || conn.sock.fd < 0 { term worker_exit(1); };
+    let params: List<String> = [config.schema];
+    let selected: PgResult = pg_exec(conn,"SELECT set_config('search_path',quote_ident($1),false)",params);
+    when !selected.ok { pg_close(conn); term worker_exit(1); };
+    let loaded: Result<ServerModel,PgResult> = model_load(conn,config.baseline,config.items);
+    pg_close(conn);
+    when is_err(loaded) { term worker_exit(1); };
+    let written: Bool = model_save(unwrap(loaded),config.path);
+    model_free(unwrap(loaded));
+    when !written { term worker_exit(1); };
+    term worker_exit(0);
+};
+
+defn worker_start(conn: PgConn, reactor: Reactor, baseline: Int, items: Int) -> RefreshWorker {
+    let identity: PgResult = pg_simple_query(conn,"SELECT current_user,current_database(),current_schema()");
+    when !identity.ok || identity.nrows != 1 { term worker_idle(); };
+    let parent: Int = syscall(39);
+    let reserved: Result<String,Int> = mktemp_file(model_cache_path()+".worker."+parent as String);
+    when is_err(reserved) { term worker_idle(); };
+    let path: String = unwrap(reserved);
+    let config: RefreshConfig = RefreshConfig { user: pg_row_text(identity,0,0), database: pg_row_text(identity,0,1),
+        schema: pg_row_text(identity,0,2), path: path, baseline: baseline, items: items, parent: parent };
+    let pid: Int = syscall(57);
+    when pid == 0 { worker_child(config,reactor,conn); term worker_idle(); };
+    when pid < 0 { remove_file(path); term worker_idle(); };
+    let owners: List<Int> = [];
+    term RefreshWorker { pid: pid, path: path, owners: owners };
+};
+
+// 0 = running/interrupted; 1 = successful exit, -1 = failed/reaped elsewhere.
+// wait4(WNOHANG) never waits for computation and reaps each completed child.
+defn worker_poll(worker: RefreshWorker) -> Int {
+    when worker.pid <= 0 { term -1; };
+    let status: Int = Malloc#(8) as Int;
+    Store#(status,0,8);
+    let result: Int = syscall(61,worker.pid,status,1,0);
+    let code: Int = Load#(status,4); Free#(status as Ptr);
+    when result == 0 || result == -4 { term 0; };
+    when result == worker.pid && code == 0 { term 1; };
+    term -1;
+};

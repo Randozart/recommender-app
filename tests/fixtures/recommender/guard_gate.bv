@@ -1,0 +1,70 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/store.bv";
+import "std/env.bv";
+
+// Task 10.4's first increment: exercise the production marker lock and error
+// recovery without marking an empty baseline done or altering existing data.
+defn guard_marker_state(conn: PgConn) -> String {
+    let result: PgResult = pg_simple_query(conn,
+        "SELECT COALESCE((SELECT done::text FROM load_state WHERE key = 'baseline'), 'absent')");
+    when result.ok == false || result.nrows != 1 || result.ncols != 1 { term ""; };
+    term pg_row_text(result, 0, 0);
+};
+
+defn guard_lock_ok(result: PgResult) -> Bool {
+    when result.ok == false || result.nrows != 1 || result.ncols != 1 { term false; };
+    let done: String = pg_row_text(result, 0, 0);
+    term done == "t" || done == "f";
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let role: String = get_env("PGUSER");
+    let database: String = get_env("PGDATABASE");
+    when role .^Length == 0 || database .^Length == 0 {
+        println!("Set PGUSER and PGDATABASE to the dedicated test database.");
+        endprogram 1;
+    };
+    let conn: PgConn = pg_connect(2130706433, 5432, role, database, "");
+    when conn.sock.fd < 0 || conn.pid < 0 {
+        println!("connect=false fd={} pid={}", conn.sock.fd, conn.pid);
+        when conn.sock.fd >= 0 { sock_close(conn.sock); };
+        endprogram 1;
+    };
+    let selected: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_guard_gate; SET search_path TO briev_guard_gate");
+    let schema: PgResult = store_create_schema(conn);
+    when !selected.ok || !schema.ok { pg_close(conn); endprogram 1; };
+    let before: String = guard_marker_state(conn);
+    let first: PgResult = store_baseline_begin(conn);
+    let locked_ok: Bool = guard_lock_ok(first);
+    println!("marker_locked={} code={} message={}", locked_ok, first.err_code, first.err_msg);
+    when locked_ok == false { pg_close(conn); endprogram 1; };
+    let rolled: PgResult = pg_simple_query(conn, "ROLLBACK");
+    let after: String = guard_marker_state(conn);
+    let preserved: Bool = before != "" && before == after && rolled.ok;
+    println!("rollback_preserves_marker={}", preserved);
+    let second: PgResult = store_baseline_begin(conn);
+    let relocked: Bool = guard_lock_ok(second);
+    println!("marker_relocked={}", relocked);
+    when relocked == false { pg_close(conn); endprogram 1; };
+    let failed: PgResult = pg_simple_query(conn, "SELECT 1 / 0");
+    println!("query_error: ok={} code={} message={}", failed.ok, failed.err_code, failed.err_msg);
+    let recovered: PgResult = store_abort(conn, failed);
+    println!("after_rollback: ok={} code={} message={}", recovered.ok, recovered.err_code, recovered.err_msg);
+    let error_kept: Bool = recovered.ok == false && recovered.err_code == "22012" && recovered.err_msg == "division by zero";
+    println!("original_error_preserved={}", error_kept);
+    let ready: PgResult = pg_simple_query(conn, "SELECT 1");
+    let usable: Bool = ready.ok && ready.nrows == 1 && ready.ncols == 1;
+    println!("connection_recovers={}", usable);
+    let final_state: String = guard_marker_state(conn);
+    let final_preserved: Bool = final_state == before;
+    println!("failure_preserves_marker={}", final_preserved);
+    pg_close(conn);
+    when preserved == false || error_kept == false || usable == false || final_preserved == false {
+        endprogram 1;
+    };
+    tick = 1;
+    endprogram;
+};

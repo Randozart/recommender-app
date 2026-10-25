@@ -1,0 +1,71 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+obj BrowserMovie { item_id: Int; title: String; };
+obj BrowserMoviePage { total: Int; movies: List<BrowserMovie>; };
+
+defn browser_catalogue_ascii_lower(byte: Int) -> Int {
+    when byte >= 65 && byte <= 90 { term byte+32; };
+    term byte;
+};
+
+defn browser_catalogue_latin1_lower(byte: Int) -> Int {
+    when (byte >= 128 && byte <= 150) || (byte >= 152 && byte <= 158) {
+        term byte+32;
+    };
+    term byte;
+};
+
+// Compares UTF-8 bytes without rewriting or corrupting title strings. ASCII
+// letters and two-byte Latin-1 letters compare without case; other UTF-8 bytes
+// compare exactly. This covers MovieLens-100k titles and keeps accents intact.
+defn browser_catalogue_match_bytes(title: String, query: String, title_idx: Int,
+    query_idx: Int) -> Bool {
+    when query_idx >= query .^Length { term true; };
+    let title_byte: Int = title[title_idx];
+    let query_byte: Int = query[query_idx];
+    when title_byte == 195 && query_byte == 195 && query_idx+1 < query .^Length &&
+        title_idx+1 < title .^Length {
+        let title_tail: Int = browser_catalogue_latin1_lower(title[title_idx+1]);
+        let query_tail: Int = browser_catalogue_latin1_lower(query[query_idx+1]);
+        when title_tail != query_tail { term false; };
+        term browser_catalogue_match_bytes(title,query,title_idx+2,query_idx+2);
+    };
+    when browser_catalogue_ascii_lower(title_byte) != browser_catalogue_ascii_lower(query_byte) {
+        term false;
+    };
+    term browser_catalogue_match_bytes(title,query,title_idx+1,query_idx+1);
+};
+
+defn browser_catalogue_match_offsets(title: String, query: String, offset: Int,
+    last_offset: Int) -> Bool {
+    when offset > last_offset { term false; };
+    when browser_catalogue_match_bytes(title,query,offset,0) { term true; };
+    term browser_catalogue_match_offsets(title,query,offset+1,last_offset);
+};
+
+defn browser_catalogue_matches(title: String, query: String) -> Bool {
+    when query .^Length == 0 { term true; };
+    when query .^Length > title .^Length { term false; };
+    term browser_catalogue_match_offsets(title,query,0,title .^Length-query .^Length);
+};
+
+defn browser_catalogue_scan(movies: List<BrowserMovie>, query: String, offset: Int,
+    limit: Int, idx: Int, total: Int, page: List<BrowserMovie>) -> BrowserMoviePage {
+    when idx >= movies .^Length { term BrowserMoviePage { total: total, movies: page }; };
+    let movie: BrowserMovie = movies[idx];
+    when browser_catalogue_matches(movie.title,query) {
+        when total >= offset && total < offset+limit {
+            page <- movie;
+        };
+        term browser_catalogue_scan(movies,query,offset,limit,idx+1,total+1,page);
+    };
+    term browser_catalogue_scan(movies,query,offset,limit,idx+1,total,page);
+};
+
+defn browser_catalogue_page(movies: List<BrowserMovie>, query: String,
+    offset: Int, limit: Int) -> BrowserMoviePage {
+    let empty: List<BrowserMovie> = [];
+    when offset < 0 || limit <= 0 { term BrowserMoviePage { total: 0, movies: empty }; };
+    term browser_catalogue_scan(movies,query,offset,limit,0,0,empty);
+};

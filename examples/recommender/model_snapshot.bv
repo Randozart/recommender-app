@@ -1,0 +1,194 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./model_types.bv";
+import "./store.bv";
+import "std/os/fs.bv";
+import "std/env.bv";
+import "std/string_c.bv";
+
+const MODEL_MAGIC: Int = 2026102102;
+const MODEL_HEADER: Int = 80;
+obj ModelBlock { ptr: Int; bytes: Int; floating: Bool; };
+
+defn model_revision(conn: PgConn) -> Result<String,PgResult> {
+    let result: PgResult = pg_simple_query(conn,
+        "SELECT current_database(),current_schema(),epoch,revision FROM model_revision WHERE id");
+    when !result.ok { term Err(result); };
+    when result.nrows != 1 { term Err(store_error("Missing population revision; recreate the schema before loading recommendations.")); };
+    let key: String = "";
+    foreach col in 0..4 {
+        let value: String = pg_row_text(result,0,col);
+        key = key + value .^Length as String + ":" + value;
+    };
+    term Ok(key);
+};
+
+defn model_cache_path() -> String {
+    let configured: String = get_env("CACHE_PATH");
+    when configured .^Length > 0 { term configured; };
+    term "recommender.snapshot.bin";
+};
+
+defn model_blocks(model: ServerModel) -> List<ModelBlock> {
+    let pop: RatingPopulation = model.population;
+    term [ModelBlock { ptr: model.cache.user_sim.ptr, bytes: pop.nusers*pop.nusers*8, floating: true },
+        ModelBlock { ptr: model.cache.item_sim.ptr, bytes: pop.nitems*pop.nitems*8, floating: true },
+        ModelBlock { ptr: model.means.user_mean.ptr, bytes: pop.nusers*8, floating: true },
+        ModelBlock { ptr: model.means.item_mean.ptr, bytes: pop.nitems*8, floating: true },
+        ModelBlock { ptr: model.means.user_has.ptr, bytes: pop.nusers*8, floating: false },
+        ModelBlock { ptr: model.means.item_has.ptr, bytes: pop.nitems*8, floating: false },
+        ModelBlock { ptr: pop.user_off.ptr, bytes: (pop.nusers+1)*8, floating: false },
+        ModelBlock { ptr: pop.user_item.ptr, bytes: pop.nnz*8, floating: false },
+        ModelBlock { ptr: pop.user_val.ptr, bytes: pop.nnz*8, floating: true },
+        ModelBlock { ptr: pop.item_off.ptr, bytes: (pop.nitems+1)*8, floating: false },
+        ModelBlock { ptr: pop.item_user.ptr, bytes: pop.nnz*8, floating: false },
+        ModelBlock { ptr: pop.item_val.ptr, bytes: pop.nnz*8, floating: true }];
+};
+
+// 2026-10-21: matrix allocations reserve eight bytes per element, while typed
+// indexing packs Float at its declared physical width. Copy the live prefix
+// and zero spare capacity instead of persisting uninitialized heap bytes.
+// Reads retain the original declared Float ABI; no arithmetic is converted.
+defn model_copy_block(destination: Int, block: ModelBlock) -> Bool {
+    when !block.floating { Copy#(destination,block.ptr,block.bytes); term true; };
+    let zero: Float = 0.0;
+    let width: Int = zero .^^Bytes;
+    let live: Int = (block.bytes/8)*width;
+    Copy#(destination,block.ptr,live);
+    foreach idx in live..block.bytes { Store#(destination+idx,0,1); };
+    term true;
+};
+
+// 2026-10-21: checksum includes metadata and payload, excluding its own word.
+// Detect accidental corruption; this local artifact is not an authenticated
+// interchange format. Version magic pins the equations, layout and native ABI.
+defn model_checksum(data: Int, size: Int) -> Int {
+    let hash: Int = 2166136261;
+    foreach idx in 0..size {
+        when idx < 64 || idx >= 72 { hash = ((hash ^ Load#(data+idx,1))*16777619) & 4294967295; };
+    };
+    term hash;
+};
+
+defn model_image(model: ServerModel) -> String {
+    let blocks: List<ModelBlock> = model_blocks(model);
+    let size: Int = MODEL_HEADER + model.revision .^Length + model.accounts .^Length*8;
+    foreach idx in 0..blocks .^Length { size = size+blocks[idx].bytes; };
+    let buffer: Int = Malloc#(8+size) as Int;
+    Store#(buffer,size,8);
+    let data: Int = buffer+8;
+    foreach word in 0..(MODEL_HEADER/8) { Store#(data+word*8,0,8); };
+    Store#(data,MODEL_MAGIC,8); Store#(data+8,model.population.nusers,8);
+    Store#(data+16,model.population.nitems,8); Store#(data+24,model.population.nnz,8);
+    Store#(data+32,model.baseline_users,8); Store#(data+40,model.accounts .^Length,8);
+    Store#(data+48,model.revision .^Length,8); Store#(data+56,size,8);
+    let global: Ptr<Float> = (data+72) as Ptr<Float>; global[0] = model.means.global;
+    Copy#(data+MODEL_HEADER,((model.revision as Data) as Int)+8,model.revision .^Length);
+    let offset: Int = MODEL_HEADER+model.revision .^Length;
+    foreach idx in 0..blocks .^Length {
+        model_copy_block(data+offset,blocks[idx]); offset = offset+blocks[idx].bytes;
+    };
+    foreach idx in 0..model.accounts .^Length { Store#(data+offset+idx*8,model.accounts[idx],8); };
+    Store#(data+64,model_checksum(data,size),8);
+    term (buffer as Data) as String;
+};
+
+defn model_image_valid(image: String, revision: String, baseline: Int, items: Int) -> Bool {
+    let size: Int = image .^Length;
+    when size < MODEL_HEADER { term false; };
+    let data: Int = ((image as Data) as Int)+8;
+    when Load#(data,8) != MODEL_MAGIC || Load#(data+56,8) != size { term false; };
+    let users: Int = Load#(data+8,8); let nnz: Int = Load#(data+24,8);
+    let accounts: Int = Load#(data+40,8); let key: Int = Load#(data+48,8);
+    when baseline < 1 || items < 1 || items > 65535 || users < baseline || users > 65535 || nnz < 0 || nnz > 10000000 { term false; };
+    when Load#(data+16,8) != items || Load#(data+32,8) != baseline || accounts != users-baseline || key < 1 || key > 4096 { term false; };
+    let expected: Int = MODEL_HEADER+key+8*(users*users+items*items+3*users+3*items+2+4*nnz+accounts);
+    when size != expected || Load#(data+64,8) != model_checksum(data,size) { term false; };
+    // Empty expected revision is reserved for a completed worker's captured
+    // snapshot: later database writes must not mutate that snapshot's identity.
+    when revision .^Length > 0 && image[MODEL_HEADER:MODEL_HEADER+key] != revision { term false; };
+    term true;
+};
+
+defn model_decode(image: String) -> ServerModel {
+    let data: Int = ((image as Data) as Int)+8;
+    let nu: Int = Load#(data+8,8); let ni: Int = Load#(data+16,8); let nnz: Int = Load#(data+24,8);
+    let key: Int = Load#(data+48,8); let count: Int = Load#(data+40,8);
+    let capacity: Int = nnz+1;
+    let pop: RatingPopulation = RatingPopulation { user_off: ivec_new(nu+1), user_item: ivec_new(capacity),
+        user_val: vec_new(capacity), item_off: ivec_new(ni+1), item_user: ivec_new(capacity),
+        item_val: vec_new(capacity), nusers: nu, nitems: ni, nnz: nnz };
+    let global: Ptr<Float> = (data+72) as Ptr<Float>;
+    let means: Means = Means { user_mean: vec_new(nu), item_mean: vec_new(ni), user_has: ivec_new(nu), item_has: ivec_new(ni), global: global[0] };
+    let cache: SimCache = SimCache { user_sim: mat_new(nu,nu), item_sim: mat_new(ni,ni), user_mean: means.user_mean,
+        item_mean: means.item_mean, nusers: nu, nitems: ni, sig: PopSignature { nnz: nnz, mtime: 0 } };
+    let accounts: List<Int> = [];
+    let model: ServerModel = ServerModel { population: pop, means: means, cache: cache, accounts: accounts,
+        baseline_users: Load#(data+32,8), revision: image[MODEL_HEADER:MODEL_HEADER+key] };
+    let blocks: List<ModelBlock> = model_blocks(model);
+    let offset: Int = MODEL_HEADER+key;
+    foreach idx in 0..blocks .^Length {
+        Copy#(blocks[idx].ptr,data+offset,blocks[idx].bytes); offset = offset+blocks[idx].bytes;
+    };
+    foreach idx in 0..count { let entry: List<Int> = [Load#(data+offset+idx*8,8)]; accounts = accounts+entry; };
+    model.accounts = accounts;
+    term model;
+};
+
+defn model_restore(path: String, revision: String, baseline: Int, items: Int) -> Result<ServerModel,PgResult> {
+    let read: Result<String,Int> = read_file(path);
+    when is_err(read) { term Err(store_error("No readable recommendation snapshot; rebuild it from the database.")); };
+    let image: String = unwrap(read);
+    let restored: Result<ServerModel,PgResult> = model_restore_image(image,revision,baseline,items);
+    Free#(((image as Data) as Int) as Ptr);
+    term restored;
+};
+
+// 2026-10-22: worker installation already owns a bounded immutable image read;
+// validate/decode those exact bytes instead of reopening a mutable path and
+// duplicating up to 512 MiB. Keep path-based restore as a compatibility wrapper.
+// Remove this image entry point only if every caller has equally bounded bytes.
+defn model_restore_image(image: String, revision: String, baseline: Int, items: Int) -> Result<ServerModel,PgResult> {
+    when !model_image_valid(image,revision,baseline,items) {
+        term Err(store_error("Recommendation snapshot is stale, incompatible or damaged; rebuild it from the database."));
+    };
+    term Ok(model_decode(image));
+};
+
+defn model_rename(source: String, target: String) -> Int {
+    let old: Int = to_c_string(source); let next: Int = to_c_string(target);
+    let result: Int = syscall(82,old,next);
+    Free#(old as Ptr); Free#(next as Ptr);
+    term result;
+};
+
+defn model_sync(path: String, flags: Int) -> Int {
+    let name: Int = to_c_string(path);
+    let fd: Int = fs_open(name,flags,0); Free#(name as Ptr);
+    when fd < 0 { term fd; };
+    let result: Int = syscall(74,fd); fs_close(fd); term result;
+};
+
+defn model_parent(path: String) -> String {
+    let last: Int = -1;
+    foreach idx in 0..path .^Length { when byte_at(path,idx) == 47 { last = idx; }; };
+    when last < 0 { term "."; }; when last == 0 { term "/"; };
+    term path[0:last];
+};
+
+// 2026-10-21: publish only a fully written, fsynced image by atomic rename.
+// PID-scoped scratch avoids concurrent writers sharing a partially written file.
+// A failed write never replaces the prior snapshot; directory sync pins rename.
+defn model_save(model: ServerModel, path: String) -> Bool {
+    let temporary: String = path+".tmp."+syscall(39) as String;
+    let image: String = model_image(model);
+    let written: Result<Int,Int> = write_file(temporary,image);
+    let complete: Bool = false;
+    when is_ok(written) { complete = unwrap(written) == image .^Length; };
+    Free#(((image as Data) as Int) as Ptr);
+    when !complete { remove_file(temporary); term false; };
+    when model_sync(temporary,2) < 0 { remove_file(temporary); term false; };
+    when model_rename(temporary,path) < 0 { remove_file(temporary); term false; };
+    term model_sync(model_parent(path),65536) >= 0;
+};

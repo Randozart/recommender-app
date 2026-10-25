@@ -1,0 +1,87 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/worker_messages.bv";
+
+defn contract_worker_roundtrip(message: WorkerMessage) -> Bool {
+    let encoded: Result<String,String> = protocol_encode_worker(message);
+    when is_err(encoded) { term false; };
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(unwrap(encoded));
+    when is_err(decoded) { term false; };
+    term unwrap(decoded).kind == message.kind && worker_same_tag(unwrap(decoded).tag,message.tag);
+};
+defn contract_worker_payload(text: String) -> JsonValue { term unwrap(json_parse(text)); };
+defn contract_worker_checks(epoch: String) -> Bool {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 17, revision: "9007199254740993" };
+    let empty_owner: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let io: WorkerTag = WorkerTag { profile: profile, job_id: "41", attempt: 1, model_generation: "0" };
+    let prediction: WorkerTag = WorkerTag { profile: profile, job_id: "42", attempt: 1, model_generation: "2" };
+    let control: WorkerTag = WorkerTag { profile: empty_owner, job_id: "43", attempt: 1, model_generation: "0" };
+    let model: WorkerTag = WorkerTag { profile: empty_owner, job_id: "44", attempt: 1, model_generation: "2" };
+    let operation: String = unwrap(protocol_operation_id(epoch,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    let command: RatingCommand = RatingCommand { server_epoch: epoch, operation_id: operation, item_id: 0, rating: 5 };
+    let messages: List<WorkerMessage> = [];
+    let ratings: JsonValue = contract_worker_payload("{\"ratings\":[{\"item_id\":0,\"rating\":5}],\"lambda_milli\":500}");
+    messages <- WorkerMessage { kind: "predict", tag: prediction, payload: ratings };
+    let persistence: List<(String,JsonValue)> = [("operation",Object(protocol_command_fields(command))),
+        ("timestamp",StrVal("1792650000")),("database_identity",StrVal("fixture-db-epoch"))];
+    messages <- WorkerMessage { kind: "persist", tag: io, payload: Object(persistence) };
+    let identity: JsonValue = contract_worker_payload("{\"database_identity\":\"fixture-db-epoch\"}");
+    messages <- WorkerMessage { kind: "hydrate", tag: io, payload: identity };
+    let ids: List<JsonValue> = [StrVal(operation)];
+    let query: List<(String,JsonValue)> = [("operation_ids",Array(ids)),("database_identity",StrVal("fixture-db-epoch"))];
+    messages <- WorkerMessage { kind: "receipt", tag: io, payload: Object(query) };
+    let discard: List<(String,JsonValue)> = [("operation",Object(protocol_command_fields(command))),
+        ("operation_id",StrVal(operation)),("timestamp",StrVal("1792650000")),("database_identity",StrVal("fixture-db-epoch"))];
+    messages <- WorkerMessage { kind: "discard", tag: io, payload: Object(discard) };
+    let legacy_discard: List<(String,JsonValue)> = [("operation_id",StrVal(operation)),("database_identity",StrVal("fixture-db-epoch"))];
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "discard", tag: io, payload: Object(legacy_discard) })) { term false; };
+    messages <- WorkerMessage { kind: "install", tag: model, payload: contract_worker_payload("{\"generation\":\"2\",\"path\":\"/tmp/model-v1.snapshot\",\"identity\":\"fixture\",\"bytes\":33010153}") };
+    messages <- WorkerMessage { kind: "shutdown", tag: control, payload: contract_worker_payload("{\"deadline_ms\":\"12345\"}") };
+    let credentials: JsonValue = contract_worker_payload("{\"username\":\"雪\",\"password\":\"demo\"}");
+    messages <- WorkerMessage { kind: "login", tag: control, payload: credentials };
+    messages <- WorkerMessage { kind: "register", tag: control, payload: credentials };
+    let tag: PredictionTag = PredictionTag { profile: profile, model_generation: prediction.model_generation, job_id: prediction.job_id, attempt: 1 };
+    let movies: List<RankedMovie> = [RankedMovie { item_id: 1, score: 4.25 }];
+    let result: JsonValue = contract_worker_payload(unwrap(protocol_encode_result(RecommendationResult { tag: tag, cold_start: false, items: movies })));
+    messages <- WorkerMessage { kind: "result", tag: prediction, payload: result };
+    let saved: RatingSaved = RatingSaved { profile: profile, operation_id: operation };
+    messages <- WorkerMessage { kind: "saved", tag: io, payload: contract_worker_payload(unwrap(protocol_encode_saved(saved))) };
+    let failed: RatingSaveFailed = RatingSaveFailed { profile: profile, operation_id: operation, error: "database", message: "Retry after the database is available.", retryable: true };
+    messages <- WorkerMessage { kind: "save-failed", tag: io, payload: contract_worker_payload(unwrap(protocol_encode_failure(failed))) };
+    let hydrated: JsonValue = contract_worker_payload("{\"username\":\"雪\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
+    messages <- WorkerMessage { kind: "hydrated", tag: io, payload: hydrated };
+    let receipt_fields: List<(String,JsonValue)> = [("status",StrVal("saved")),("item_id",IntVal(0)),("rating",IntVal(5))];
+    let receipts: List<JsonValue> = [Object(protocol_operation_fields(saved,"saved")+receipt_fields)];
+    let receipts_payload: List<(String,JsonValue)> = [("current_server_epoch",StrVal(epoch)),("operations",Array(receipts))];
+    messages <- WorkerMessage { kind: "receipts", tag: io, payload: Object(receipts_payload) };
+    messages <- WorkerMessage { kind: "ready", tag: model, payload: contract_worker_payload("{\"generation\":\"2\",\"identity\":\"fixture\"}") };
+    messages <- WorkerMessage { kind: "stopped", tag: control, payload: contract_worker_payload("{\"drained\":true}") };
+    let authenticated: JsonValue = contract_worker_payload("{\"account_id\":17,\"username\":\"雪\",\"token\":\"00112233445566778899aabbccddeeff\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
+    messages <- WorkerMessage { kind: "authenticated", tag: control, payload: authenticated };
+    messages <- WorkerMessage { kind: "registered", tag: control, payload: authenticated };
+    messages <- WorkerMessage { kind: "error", tag: prediction, payload: contract_worker_payload("{\"error\":\"worker-crashed\",\"message\":\"Retry this calculation.\",\"retryable\":true}") };
+    foreach idx in 0..messages .^Length {
+        when !contract_worker_roundtrip(messages[idx]) { term false; };
+    };
+    let tokenless: JsonValue = contract_worker_payload("{\"account_id\":17,\"username\":\"雪\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "authenticated", tag: control, payload: tokenless })) { term false; };
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "predict", tag: io, payload: ratings })) { term false; };
+    let zero_revision: WorkerTag = WorkerTag { profile: ProfileVersion { server_epoch: epoch, account_id: 17, revision: "0" }, job_id: "42", attempt: 1, model_generation: "2" };
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "predict", tag: zero_revision, payload: ratings })) { term false; };
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "unknown-kind", tag: io, payload: ratings })) { term false; };
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "install", tag: prediction, payload: messages[5].payload })) { term false; };
+    let duplicate_ids: List<JsonValue> = [StrVal(operation),StrVal(operation)];
+    when worker_operation_list(Array(duplicate_ids)) { term false; };
+    let nul_path: String = protocol_text(contract_worker_payload("\"/tmp/bad\\u0000snapshot\""));
+    when worker_path_valid("relative.snapshot") || worker_path_valid(nul_path) { term false; };
+    term contract_epoch_checks(command,epoch);
+};
+defn contract_epoch_checks(command: RatingCommand, epoch: String) -> Bool {
+    when is_err(protocol_require_current_epoch(command,epoch)) { term false; };
+    let other: String = "cccccccccccccccccccccccccccccccc";
+    when other == epoch { other = "dddddddddddddddddddddddddddddddd"; };
+    when is_ok(protocol_require_current_epoch(command,other)) { term false; };
+    let changed: RatingCommand = RatingCommand { server_epoch: command.server_epoch, operation_id: command.operation_id, item_id: command.item_id, rating: 1 };
+    term protocol_same_command(command,command) && !protocol_same_command(command,changed);
+};

@@ -1,0 +1,616 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// 2026-10-22: I04 keeps identity, bounds and deduplication in one pure service.
+// The reactor executes returned actions; persistence completion cannot request
+// prediction. I07/I10 serialize queued save intents. Retire only when all callers
+// use the shared HTTP/live adapter boundary.
+import "./profile_state.bv";
+
+defn admission_reservation_valid(state: AdmissionState, context: AdmissionContext, command: RatingCommand) -> Bool {
+    let owner: Int = context.owner;
+    let profile_bytes: Int = admission_required_profile_bytes(state,owner,command.item_id);
+    let operation_bytes: Int = admission_required_operation_bytes(command);
+    match context.reservation {
+        ReservedAdmission(reservation) => reservation.owner == owner && reservation.id .^Length > 0 && reservation.id .^Length <= 64 &&
+            !admission_reservation_used(state,reservation.id) && reservation.profile_bytes >= profile_bytes &&
+            reservation.operation_bytes >= operation_bytes && reservation.prediction_slot && reservation.persistence_slot &&
+            reservation.profile_bytes <= 4096 && reservation.operation_bytes <= 4096,
+        _ => false,
+    }
+};
+
+defn admission_required_operation_bytes(command: RatingCommand) -> Int {
+    term command.operation_id .^Length + 96 + 768;
+};
+
+defn admission_required_profile_bytes(state: AdmissionState, owner: Int, item: Int) -> Int {
+    let profile_idx: Int = profile_at(state,owner);
+    when profile_idx < 0 { term 48; };
+    when profile_rating_at(state.profiles[profile_idx].ratings,item) < 0 { term 16; };
+    term 0;
+};
+
+defn admission_reservation_used(state: AdmissionState, reservation: String) -> Bool {
+    foreach idx in 0..state.operations .^Length {
+        when admission_reservation_matches(state.operations[idx].reservation,reservation) { term true; };
+    };
+    term false;
+};
+
+defn admission_reservation_matches(held: AdmissionReservation, reservation: String) -> Bool {
+    match held { ReservedAdmission(value) => value.id == reservation, _ => false, }
+};
+
+defn admission_same_payload(existing: OperationStatus, command: RatingCommand) -> Bool {
+    let accepted: RatingAccepted = existing.accepted;
+    term accepted.operation_id == command.operation_id && accepted.profile.server_epoch == command.server_epoch &&
+        accepted.delta.item_id == command.item_id && accepted.delta.rating == command.rating;
+};
+
+defn admission_known(state: AdmissionState, idx: Int, command: RatingCommand) -> AdmissionDecision {
+    let entry: OperationStatus = state.operations[idx];
+    when admission_same_payload(entry,command) {
+        term AdmissionDecision { update: ProfileUpdate { state: state, actions: profile_no_actions() }, outcome: KnownAdmission(entry) };
+    };
+    term profile_rejected(state,"operation-conflict","This operation ID was already used with a different rating; use a new ID.",false);
+};
+
+defn admission_new_profile(state: AdmissionState, owner: Int, version: ProfileVersion, timestamp: String) -> ProfileSnapshot {
+    let empty: List<ProfileRating> = [];
+    term ProfileSnapshot { version: version, ratings: empty, committed: empty, model_generation: "0",
+        prediction_running: NoOperationJob(), prediction_pending: false, last_active: timestamp };
+};
+
+defn admission_install_profile(profiles: List<ProfileSnapshot>, profile_idx: Int, profile: ProfileSnapshot) -> List<ProfileSnapshot> {
+    when profile_idx >= 0 { term profile_snapshot_replace(profiles,profile_idx,profile); };
+    let appended: List<ProfileSnapshot> = [profile];
+    term profiles + appended;
+};
+
+defn admission_profile_value(state: AdmissionState, profile_idx: Int, version: ProfileVersion, timestamp: String) -> ProfileSnapshot {
+    when profile_idx >= 0 { term state.profiles[profile_idx]; };
+    term admission_new_profile(state,version.account_id,version,timestamp);
+};
+
+defn admission_valid_command(state: AdmissionState, context: AdmissionContext, command: RatingCommand) -> Bool {
+    term protocol_command_valid(command) && command.server_epoch == state.clock.server_epoch &&
+        context.owner > 0 && context.owner <= 2147483647 && context.session_generation .^Length > 0 &&
+        context.session_generation .^Length <= 64 && protocol_counter(context.timestamp);
+};
+
+defn admission_limits_valid(limits: AdmissionLimits) -> Bool {
+    term limits.profiles >= 1 && limits.profiles <= 100000 && limits.pending_global >= 1 && limits.pending_global <= 131072 &&
+        limits.pending_owner >= 1 && limits.pending_owner <= 1024 && limits.receipt_slots >= 1 && limits.receipt_slots <= 1048576 &&
+        limits.retained_bytes >= 65536 && limits.retained_bytes <= 536870912;
+};
+
+defn admission_capacity_error(state: AdmissionState, context: AdmissionContext, profile_idx: Int) -> AdmissionDecision {
+    when profile_idx < 0 && state.profiles .^Length >= state.limits.profiles {
+        term profile_rejected(state,"profile-capacity","The in-memory profile limit is full; retry after an idle profile is evicted.",true);
+    };
+    when state.operations .^Length >= state.limits.receipt_slots {
+        term profile_rejected(state,"receipt-capacity","The operation receipt limit is full; retry after the server drains or restarts.",true);
+    };
+    when profile_pending_for(state,context.owner) >= state.limits.pending_owner {
+        term profile_rejected(state,"owner-capacity","This account has too many unresolved saves; resolve one before submitting another.",true);
+    };
+    when profile_pending_total(state) >= state.limits.pending_global {
+        term profile_rejected(state,"global-capacity","The server has no admission capacity; retry after queued work drains.",true);
+    };
+    when !admission_reservation_is_held(context.reservation) {
+        term profile_rejected(state,"reservation-required","Admission requires profile, prediction and persistence capacity before acceptance.",true);
+    };
+    when profile_reserved_bytes(state) + admission_reservation_bytes(context.reservation) > state.limits.retained_bytes {
+        term profile_rejected(state,"memory-capacity","The bounded profile and operation memory is full; retry later.",true);
+    };
+    term profile_rejected(state,"capacity-exhausted","The requested profile or operation capacity is unavailable; retry after work drains.",true);
+};
+
+defn profile_admit(state: AdmissionState, context: AdmissionContext, command: RatingCommand) -> AdmissionDecision {
+    when !admission_limits_valid(state.limits) {
+        term profile_rejected(state,"invalid-limits","Use bounded profile, queue, receipt and byte capacities from server configuration.",false);
+    };
+    when !admission_valid_command(state,context,command) {
+        term profile_rejected(state,"invalid-command","Use the current server epoch, authenticated account and a valid item/rating.",false);
+    };
+    let known_idx: Int = profile_operation_at(state,context.owner,command.operation_id);
+    when known_idx >= 0 { term admission_known(state,known_idx,command); };
+    when !admission_reservation_valid(state,context,command) {
+        term profile_rejected(state,"reservation-required","Admission requires capacity reserved for this authenticated account.",true);
+    };
+    let profile_idx: Int = profile_at(state,context.owner);
+    when profile_idx < 0 && profile_owner_has_operations(state,context.owner) {
+        term profile_rejected(state,"profile-hydration-required","Hydrate this account's committed ratings before accepting another edit.",false);
+    };
+    when state.profiles .^Length >= state.limits.profiles && profile_idx < 0 {
+        term admission_capacity_error(state,context,profile_idx);
+    };
+    when state.operations .^Length >= state.limits.receipt_slots || profile_pending_total(state) >= state.limits.pending_global ||
+        profile_pending_for(state,context.owner) >= state.limits.pending_owner ||
+        profile_reserved_bytes(state) + admission_reservation_bytes(context.reservation) > state.limits.retained_bytes {
+        term admission_capacity_error(state,context,profile_idx);
+    };
+    let next_revision: Result<String,String> = protocol_counter_next(state.clock.revision);
+    when is_err(next_revision) { term profile_rejected(state,"revision-exhausted",unwrap_err(next_revision),false); };
+    let version: ProfileVersion = ProfileVersion { server_epoch: state.clock.server_epoch, account_id: context.owner, revision: unwrap(next_revision) };
+    let old_profile: ProfileSnapshot = admission_profile_value(state,profile_idx,version,context.timestamp);
+    let reservation: AdmissionReservation = context.reservation;
+    let delta: ProfileRating = ProfileRating { item_id: command.item_id, rating: command.rating };
+    let ratings: List<ProfileRating> = profile_upsert_rating(old_profile.ratings,delta);
+    let profile: ProfileSnapshot = ProfileSnapshot { version: version, ratings: ratings, committed: old_profile.committed,
+        model_generation: old_profile.model_generation, prediction_running: old_profile.prediction_running,
+        prediction_pending: true, last_active: context.timestamp };
+    let accepted: RatingAccepted = RatingAccepted { profile: version, operation_id: command.operation_id, delta: delta };
+    let operation: OperationStatus = OperationStatus { accepted: accepted, phase: PersistQueued(), timestamp: context.timestamp,
+        job: NoOperationJob(), reservation: reservation, error: "" };
+    let profiles: List<ProfileSnapshot> = admission_install_profile(state.profiles,profile_idx,profile);
+    let appended: List<OperationStatus> = [operation];
+    let operations: List<OperationStatus> = state.operations + appended;
+    let updated: AdmissionState = AdmissionState { clock: RevisionClock { server_epoch: state.clock.server_epoch, revision: unwrap(next_revision) },
+        limits: state.limits, profiles: profiles, operations: operations };
+    let accepted_actions: List<ProfileAction> = [PublishEvent(AcceptedRating(accepted)),ComputeProfile(version)];
+    let actions: List<ProfileAction> = profile_admit_actions(state,context.owner,accepted_actions,
+        RatingSaved { profile: version, operation_id: command.operation_id });
+    let reserved: AdmissionState = AdmissionState { clock: updated.clock, limits: updated.limits, profiles: updated.profiles,
+        operations: profile_record_reservation(operations,reservation) };
+    term AdmissionDecision { update: ProfileUpdate { state: reserved, actions: actions }, outcome: NewAdmission(accepted) };
+};
+
+defn profile_record_reservation(operations: List<OperationStatus>, reservation: AdmissionReservation) -> List<OperationStatus> {
+    let idx: Int = operations .^Length - 1;
+    let entry: OperationStatus = operations[idx];
+    let retained: OperationStatus = OperationStatus { accepted: entry.accepted, phase: entry.phase, timestamp: entry.timestamp,
+        job: entry.job, reservation: reservation, error: entry.error };
+    term profile_operation_replace(operations,idx,retained);
+};
+
+defn profile_admit_actions(previous: AdmissionState, owner: Int, actions: List<ProfileAction>, saved: RatingSaved) -> List<ProfileAction> {
+    when profile_pending_for(previous,owner) > 0 { term actions; };
+    let appended: List<ProfileAction> = [PersistOperation(saved)];
+    term actions + appended;
+};
+
+defn profile_distinct_count(state: AdmissionState, owner: Int) -> Int {
+    let idx: Int = profile_at(state,owner);
+    when idx < 0 { term 0; };
+    term state.profiles[idx].ratings .^Length;
+};
+
+defn profile_cold_start(state: AdmissionState, owner: Int) -> Bool { term profile_distinct_count(state,owner) < 5; };
+
+defn profile_hydrate(state: AdmissionState, hydrated: HydratedProfile) -> Result<ProfileUpdate,AdmissionError> {
+    let source: ProfileVersion = hydrated.tag.profile;
+    when !protocol_version_valid(source) || source.server_epoch != state.clock.server_epoch || source.account_id < 1 ||
+        !protocol_positive(hydrated.tag.job_id) || !protocol_positive(hydrated.tag.model_generation) ||
+        hydrated.tag.attempt < 1 || hydrated.tag.attempt > 65535 || !protocol_ratings_sorted_valid(hydrated.ratings) {
+        term Err(profile_error("invalid-hydration","Hydration must match this server epoch and contain sorted valid ratings.",false));
+    };
+    let version: ProfileVersion = ProfileVersion { server_epoch: state.clock.server_epoch, account_id: source.account_id, revision: state.clock.revision };
+    let existing_idx: Int = profile_at(state,version.account_id);
+    when existing_idx < 0 && state.profiles .^Length >= state.limits.profiles {
+        term Err(profile_error("profile-capacity","The in-memory profile limit is full; evict an idle profile before hydration.",true));
+    };
+    when existing_idx >= 0 && profile_pending_for(state,version.account_id) > 0 {
+        term Err(profile_error("pending-profile","Hydration cannot replace an account profile with unresolved accepted operations.",false));
+    };
+    when existing_idx >= 0 && !protocol_counter_at_least(version.revision,state.profiles[existing_idx].version.revision) {
+        term Err(profile_error("stale-hydration","Hydration cannot move the active account revision backward.",false));
+    };
+    let profile: ProfileSnapshot = ProfileSnapshot { version: version, ratings: hydrated.ratings, committed: hydrated.ratings,
+        model_generation: hydrated.tag.model_generation, prediction_running: NoOperationJob(), prediction_pending: false,
+        last_active: "0" };
+    let profiles: List<ProfileSnapshot> = admission_install_profile(state.profiles,existing_idx,profile);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: state.operations };
+    term Ok(ProfileUpdate { state: updated, actions: profile_no_actions() });
+};
+
+defn protocol_ratings_sorted_valid(ratings: List<ProfileRating>) -> Bool {
+    when ratings .^Length > PROTOCOL_ITEMS { term false; };
+    let previous: Int = -1;
+    foreach idx in 0..ratings .^Length {
+        when !protocol_rating_valid(ratings[idx]) || ratings[idx].item_id <= previous { term false; };
+        previous = ratings[idx].item_id;
+    };
+    term true;
+};
+
+defn profile_prediction_is_current(state: AdmissionState, tag: PredictionTag) -> Bool {
+    let idx: Int = profile_at(state,tag.profile.account_id);
+    when idx < 0 { term false; };
+    let profile: ProfileSnapshot = state.profiles[idx];
+    term protocol_same_profile(profile.version,tag.profile) &&
+        profile.model_generation == tag.model_generation && profile_job_matches(profile.prediction_running,tag);
+};
+
+defn profile_prediction_start(state: AdmissionState, tag: PredictionTag) -> Result<ProfileUpdate,AdmissionError> {
+    let idx: Int = profile_at(state,tag.profile.account_id);
+    when idx < 0 || !protocol_same_profile(state.profiles[idx].version,tag.profile) ||
+        !protocol_positive(tag.model_generation) || !protocol_positive(tag.job_id) || tag.attempt < 1 || tag.attempt > 65535 {
+        term Err(profile_error("stale-prediction","Start prediction only for the current account revision and a valid worker tag.",false));
+    };
+    let prior: ProfileSnapshot = state.profiles[idx];
+    term match prior.prediction_running {
+        OwnedOperationJob(existing) => {
+            let pending: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: prior.committed,
+                model_generation: prior.model_generation, prediction_running: OwnedOperationJob(existing), prediction_pending: true,
+                last_active: prior.last_active };
+            let profiles: List<ProfileSnapshot> = profile_snapshot_replace(state.profiles,idx,pending);
+            Ok(ProfileUpdate { state: AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: state.operations }, actions: profile_no_actions() })
+        },
+        _ => {
+            let worker: WorkerTag = WorkerTag { profile: tag.profile, job_id: tag.job_id, attempt: tag.attempt, model_generation: tag.model_generation };
+            let running: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: prior.committed,
+                model_generation: tag.model_generation, prediction_running: OwnedOperationJob(worker), prediction_pending: false,
+                last_active: prior.last_active };
+            let profiles: List<ProfileSnapshot> = profile_snapshot_replace(state.profiles,idx,running);
+            Ok(ProfileUpdate { state: AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: state.operations }, actions: profile_no_actions() })
+        },
+    };
+};
+
+defn profile_job_matches(job: OperationJob, tag: PredictionTag) -> Bool {
+    match job {
+        OwnedOperationJob(owned) => protocol_same_profile(owned.profile,tag.profile) && owned.job_id == tag.job_id &&
+            owned.attempt == tag.attempt && owned.model_generation == tag.model_generation,
+        _ => false,
+    }
+};
+
+defn profile_prediction_complete(state: AdmissionState, result: RecommendationResult) -> ProfileUpdate {
+    let idx: Int = profile_at(state,result.tag.profile.account_id);
+    when idx < 0 { term ProfileUpdate { state: state, actions: profile_no_actions() }; };
+    let prior: ProfileSnapshot = state.profiles[idx];
+    when !profile_job_matches(prior.prediction_running,result.tag) &&
+        !protocol_same_profile(prior.version,result.tag.profile) { term ProfileUpdate { state: state, actions: profile_no_actions() }; };
+    when !profile_job_matches(prior.prediction_running,result.tag) {
+        when profile_prediction_is_current(state,result.tag) {
+            term ProfileUpdate { state: state, actions: profile_one_action(PublishEvent(PredictedRatings(result))) };
+        };
+        term ProfileUpdate { state: state, actions: profile_no_actions() };
+    };
+    let profile: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: prior.committed,
+        model_generation: prior.model_generation, prediction_running: NoOperationJob(), prediction_pending: false, last_active: prior.last_active };
+    let profiles: List<ProfileSnapshot> = profile_snapshot_replace(state.profiles,idx,profile);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: state.operations };
+    when !profile_prediction_is_current(state,result.tag) {
+        term ProfileUpdate { state: updated, actions: profile_one_action(ComputeProfile(prior.version)) };
+    };
+    term ProfileUpdate { state: updated, actions: profile_one_action(PublishEvent(PredictedRatings(result))) };
+};
+
+defn profile_prediction_abandon(state: AdmissionState, tag: PredictionTag) -> ProfileUpdate {
+    let idx: Int = profile_at(state,tag.profile.account_id);
+    when idx < 0 { term ProfileUpdate { state: state, actions: profile_no_actions() }; };
+    let prior: ProfileSnapshot = state.profiles[idx];
+    when !profile_job_matches(prior.prediction_running,tag) { term ProfileUpdate { state: state, actions: profile_no_actions() }; };
+    let profile: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: prior.committed,
+        model_generation: prior.model_generation, prediction_running: NoOperationJob(), prediction_pending: true,
+        last_active: prior.last_active };
+    let profiles: List<ProfileSnapshot> = profile_snapshot_replace(state.profiles,idx,profile);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: state.operations };
+    term ProfileUpdate { state: updated, actions: profile_one_action(ComputeProfile(prior.version)) };
+};
+
+defn profile_ratings_equal(left: List<ProfileRating>, right: List<ProfileRating>) -> Bool {
+    when left .^Length != right .^Length { term false; };
+    foreach idx in 0..left .^Length {
+        when left[idx].item_id != right[idx].item_id || left[idx].rating != right[idx].rating { term false; };
+    };
+    term true;
+};
+
+defn profile_rebuild_without(state: AdmissionState, owner: Int, excluded: String) -> List<ProfileRating> {
+    let profile_idx: Int = profile_at(state,owner);
+    when profile_idx < 0 {
+        let empty: List<ProfileRating> = [];
+        term empty;
+    };
+    let ratings: List<ProfileRating> = state.profiles[profile_idx].committed;
+    foreach idx in 0..state.operations .^Length {
+        let operation: OperationStatus = state.operations[idx];
+        when operation.accepted.profile.account_id == owner && operation.accepted.operation_id != excluded && !protocol_head_released(operation.phase) {
+            ratings = profile_upsert_rating(ratings,operation.accepted.delta);
+        };
+    };
+    term ratings;
+};
+
+defn profile_discard_is_head(state: AdmissionState, owner: Int, target: String) -> Bool {
+    foreach idx in 0..state.operations .^Length {
+        let entry: OperationStatus = state.operations[idx];
+        when entry.accepted.profile.account_id == owner && !protocol_head_released(entry.phase) {
+            term entry.accepted.operation_id == target;
+        };
+    };
+    term false;
+};
+
+defn profile_discard_actions(saved: RatingSaved) -> List<ProfileAction> {
+    term profile_one_action(PersistOperation(saved));
+};
+
+defn profile_one_action(action: ProfileAction) -> List<ProfileAction> {
+    let actions: List<ProfileAction> = [action];
+    term actions;
+};
+
+defn profile_save_transition(state: AdmissionState, saved: RatingSaved, tag: WorkerTag, signal: PersistenceSignal, error: String) -> Result<ProfileUpdate,AdmissionError> {
+    let idx: Int = profile_operation_at(state,saved.profile.account_id,saved.operation_id);
+    when idx < 0 { term Err(profile_error("unknown-operation","No accepted operation matches this save completion.",false)); };
+    let prior: OperationStatus = state.operations[idx];
+    when !protocol_same_profile(prior.accepted.profile,saved.profile) { term Err(profile_error("stale-operation","Save completion does not match the accepted operation revision.",false)); };
+    when !profile_operation_is_head(state,idx) { term Err(profile_error("persistence-order","Only the earliest unresolved account operation may complete.",false)); };
+    when !profile_phase_running(prior.phase) || !profile_persistence_tag_matches(prior.job,tag) {
+        term Err(profile_error("stale-worker","Save completion does not match the issued persistence worker job.",false));
+    };
+    let next: Result<PersistencePhase,String> = protocol_persistence_next(prior.phase,signal);
+    when is_err(next) { term Err(profile_error("invalid-save-transition",unwrap_err(next),false)); };
+    let operation: OperationStatus = OperationStatus { accepted: prior.accepted, phase: unwrap(next), timestamp: prior.timestamp,
+        job: NoOperationJob(), reservation: profile_terminal_reservation(prior.reservation,signal), error: profile_error_bounded(error) };
+    let operations: List<OperationStatus> = profile_operation_replace(state.operations,idx,operation);
+    let profiles: List<ProfileSnapshot> = profile_save_profiles(state,saved,signal);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: profiles, operations: operations };
+    let actions: List<ProfileAction> = profile_save_actions(updated,signal,saved,error);
+    term Ok(ProfileUpdate { state: updated, actions: actions });
+};
+
+defn profile_persistence_tag_matches(job: OperationJob, tag: WorkerTag) -> Bool {
+    match job {
+        OwnedOperationJob(owned) => protocol_same_profile(owned.profile,tag.profile) && owned.job_id == tag.job_id &&
+            owned.attempt == tag.attempt && owned.model_generation == tag.model_generation,
+        _ => false,
+    }
+};
+
+defn profile_terminal_reservation(reservation: AdmissionReservation, signal: PersistenceSignal) -> AdmissionReservation {
+    match signal {
+        CommitPersist() => NoAdmissionReservation(),
+        CommitDiscard() => NoAdmissionReservation(),
+        _ => reservation,
+    }
+};
+
+defn profile_persistence_signal(state: AdmissionState, saved: RatingSaved, signal: PersistenceSignal, timestamp: String) -> Result<ProfileUpdate,AdmissionError> {
+    when !profile_persistence_signal_supported(signal) {
+        term Err(profile_error("completion-required","Use the worker-completion transition for commit, rollback, failure or uncertain outcomes.",false));
+    };
+    let idx: Int = profile_operation_at(state,saved.profile.account_id,saved.operation_id);
+    when idx < 0 { term Err(profile_error("unknown-operation","No accepted operation matches this persistence transition.",false)); };
+    let prior: OperationStatus = state.operations[idx];
+    when !protocol_same_profile(prior.accepted.profile,saved.profile) { term Err(profile_error("stale-operation","Persistence transition does not match the accepted operation.",false)); };
+    when !profile_persistence_signal_is_dispatch(signal) && profile_phase_is_queued(prior.phase) {
+        term Err(profile_error("persistence-order","A queued operation must be dispatched before its result can change state.",false));
+    };
+    when !profile_operation_can_dispatch(state,idx,prior) || !profile_persistence_signal_can_advance(state,idx,signal) {
+        term Err(profile_error("persistence-order","Only the earliest unresolved account operation can be dispatched.",false));
+    };
+    let next: Result<PersistencePhase,String> = protocol_persistence_next(prior.phase,signal);
+    when is_err(next) { term Err(profile_error("invalid-persistence-transition",unwrap_err(next),false)); };
+    let status: OperationStatus = OperationStatus { accepted: prior.accepted, phase: unwrap(next), timestamp: timestamp,
+        job: prior.job, reservation: prior.reservation, error: prior.error };
+    let operations: List<OperationStatus> = profile_operation_replace(state.operations,idx,status);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: state.profiles, operations: operations };
+    let actions: List<ProfileAction> = profile_persistence_actions(signal,saved,prior.error);
+    term Ok(ProfileUpdate { state: updated, actions: actions });
+};
+
+defn profile_persistence_signal_is_dispatch(signal: PersistenceSignal) -> Bool {
+    match signal { DispatchPersist() => true, RetryPersist() => true, _ => false, }
+};
+
+defn profile_operation_can_dispatch(state: AdmissionState, target: Int, operation: OperationStatus) -> Bool {
+    when !profile_phase_is_queued(operation.phase) { term true; };
+    let head: Int = profile_first_unresolved(state,operation.accepted.profile.account_id);
+    term head == target;
+};
+
+defn profile_first_unresolved(state: AdmissionState, owner: Int) -> Int {
+    foreach idx in 0..state.operations .^Length {
+        when state.operations[idx].accepted.profile.account_id == owner && !protocol_head_released(state.operations[idx].phase) { term idx; };
+    };
+    term -1;
+};
+
+defn profile_operation_is_head(state: AdmissionState, target: Int) -> Bool {
+    let owner: Int = state.operations[target].accepted.profile.account_id;
+    term profile_first_unresolved(state,owner) == target;
+};
+
+defn profile_persistence_signal_supported(signal: PersistenceSignal) -> Bool {
+    match signal { DispatchPersist() => true, RetryPersist() => true, ExhaustPersist() => true, _ => false, }
+};
+
+defn profile_persistence_signal_can_advance(state: AdmissionState, idx: Int, signal: PersistenceSignal) -> Bool {
+    when profile_persistence_signal_is_dispatch(signal) { term true; };
+    term profile_first_unresolved(state,state.operations[idx].accepted.profile.account_id) == idx;
+};
+
+defn profile_persistence_bind_job(state: AdmissionState, saved: RatingSaved, tag: WorkerTag) -> Result<ProfileUpdate,AdmissionError> {
+    let idx: Int = profile_operation_at(state,saved.profile.account_id,saved.operation_id);
+    when idx < 0 { term Err(profile_error("unknown-operation","No accepted operation matches this worker job.",false)); };
+    let prior: OperationStatus = state.operations[idx];
+    when !protocol_same_profile(prior.accepted.profile,saved.profile) || !profile_phase_running(prior.phase) ||
+        !profile_operation_is_head(state,idx) ||
+        !profile_operation_job_unbound(prior.job) || !profile_reservation_has_persist_slot(prior.reservation) ||
+        !protocol_same_profile(tag.profile,saved.profile) || !protocol_positive(tag.job_id) || tag.attempt < 1 ||
+        tag.attempt > 65535 || tag.model_generation != "0" {
+        term Err(profile_error("invalid-worker-tag","Bind only the matching running persistence operation and worker tag.",false));
+    };
+    let status: OperationStatus = OperationStatus { accepted: prior.accepted, phase: prior.phase, timestamp: prior.timestamp,
+        job: OwnedOperationJob(tag), reservation: prior.reservation, error: prior.error };
+    let operations: List<OperationStatus> = profile_operation_replace(state.operations,idx,status);
+    let updated: AdmissionState = AdmissionState { clock: state.clock, limits: state.limits, profiles: state.profiles, operations: operations };
+    term Ok(ProfileUpdate { state: updated, actions: profile_no_actions() });
+};
+
+defn profile_phase_running(phase: PersistencePhase) -> Bool {
+    match phase { PersistRunning() => true, PersistDiscardRunning() => true, _ => false, }
+};
+
+defn profile_operation_job_unbound(job: OperationJob) -> Bool {
+    match job { NoOperationJob() => true, _ => false, }
+};
+
+defn profile_reservation_has_persist_slot(reservation: AdmissionReservation) -> Bool {
+    match reservation { ReservedAdmission(value) => value.persistence_slot, _ => false, }
+};
+
+defn profile_persistence_actions(signal: PersistenceSignal, saved: RatingSaved, error: String) -> List<ProfileAction> {
+    match signal {
+        DispatchPersist() => profile_one_action(PersistOperation(saved)),
+        RetryPersist() => profile_one_action(PersistOperation(saved)),
+        ExhaustPersist() => profile_one_action(PublishEvent(FailedRating(profile_failure_event(saved,error)))),
+        _ => profile_no_actions(),
+    }
+};
+
+defn profile_failure_event(saved: RatingSaved, error: String) -> RatingSaveFailed {
+    term RatingSaveFailed { profile: saved.profile, operation_id: saved.operation_id, error: "persistence-failed",
+        message: profile_error_message(error), retryable: true };
+};
+
+defn profile_save_profiles(state: AdmissionState, saved: RatingSaved, signal: PersistenceSignal) -> List<ProfileSnapshot> {
+    when !profile_signal_commits_persist(signal) { term state.profiles; };
+    let idx: Int = profile_at(state,saved.profile.account_id);
+    when idx < 0 { term state.profiles; };
+    let prior: ProfileSnapshot = state.profiles[idx];
+    let delta_idx: Int = profile_operation_at(state,saved.profile.account_id,saved.operation_id);
+    when delta_idx < 0 { term state.profiles; };
+    let committed: List<ProfileRating> = profile_upsert_rating(prior.committed,state.operations[delta_idx].accepted.delta);
+    let profile: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: committed,
+        model_generation: prior.model_generation, prediction_running: prior.prediction_running, prediction_pending: prior.prediction_pending,
+        last_active: prior.last_active };
+    term profile_snapshot_replace(state.profiles,idx,profile);
+};
+
+defn profile_signal_commits_persist(signal: PersistenceSignal) -> Bool {
+    match signal { CommitPersist() => true, _ => false, }
+};
+
+defn profile_save_actions(state: AdmissionState, signal: PersistenceSignal, saved: RatingSaved, error: String) -> List<ProfileAction> {
+    match signal {
+        CommitPersist() => profile_commit_actions(state,saved),
+        CommitDiscard() => profile_discard_published(state,saved),
+        FailPersist() => profile_one_action(PublishEvent(FailedRating(profile_failure_event(saved,error)))),
+        _ => profile_no_actions(),
+    }
+};
+
+defn profile_commit_actions(state: AdmissionState, saved: RatingSaved) -> List<ProfileAction> {
+    let next: Int = profile_next_queued_operation(state,saved.profile.account_id,saved.operation_id);
+    when next < 0 { term profile_one_action(PublishEvent(SavedRating(saved))); };
+    let entry: OperationStatus = state.operations[next];
+    let request: RatingSaved = RatingSaved { profile: entry.accepted.profile, operation_id: entry.accepted.operation_id };
+    let actions: List<ProfileAction> = [PersistOperation(request),PublishEvent(SavedRating(saved))];
+    term actions;
+};
+
+defn profile_next_queued_operation(state: AdmissionState, owner: Int, completed: String) -> Int {
+    let after: Bool = false;
+    foreach idx in 0..state.operations .^Length {
+        let entry: OperationStatus = state.operations[idx];
+        when entry.accepted.profile.account_id == owner && after && profile_phase_is_queued(entry.phase) { term idx; };
+        when entry.accepted.profile.account_id == owner && entry.accepted.operation_id == completed { after = true; };
+    };
+    term -1;
+};
+
+defn profile_phase_is_queued(phase: PersistencePhase) -> Bool {
+    match phase { PersistQueued() => true, PersistDiscardQueued() => true, _ => false, }
+};
+
+defn profile_discard_published(state: AdmissionState, saved: RatingSaved) -> List<ProfileAction> {
+    let idx: Int = profile_at(state,saved.profile.account_id);
+    when idx < 0 { term profile_no_actions(); };
+    let profile: ProfileSnapshot = state.profiles[idx];
+    let discarded: RatingDiscarded = RatingDiscarded { original: saved, profile_revision: profile.version.revision, ratings: profile.ratings };
+    term profile_one_action(PublishEvent(DiscardedRating(discarded)));
+};
+
+defn profile_error_message(error: String) -> String {
+    when error .^Length == 0 { term "Save failed; retry it or discard this failed operation."; };
+    when error .^Length > 800 { term "Save failed: "+error[0:800]+". Retry it or discard this failed operation."; };
+    term "Save failed: "+error+". Retry it or discard this failed operation.";
+};
+
+defn profile_error_bounded(error: String) -> String {
+    when error .^Length > 768 { term error[0:768]; };
+    term error;
+};
+
+defn profile_discard_failed_head(state: AdmissionState, owner: Int, operation: String) -> Result<ProfileUpdate,AdmissionError> {
+    let idx: Int = profile_operation_at(state,owner,operation);
+    when idx < 0 { term Err(profile_error("unknown-operation","No accepted operation matches this discard request.",false)); };
+    let entry: OperationStatus = state.operations[idx];
+    when !profile_phase_is_discardable(entry.phase) {
+        term Err(profile_error("discard-not-allowed","Only a definitively failed operation can be discarded; reconcile uncertain saves first.",false));
+    };
+    when !profile_discard_is_head(state,owner,operation) {
+        term Err(profile_error("discard-not-head","Resolve the earliest unresolved save for this account first.",false));
+    };
+    when !profile_discard_has_no_running_jobs(state,owner) {
+        term Err(profile_error("discard-jobs-running","Wait for account prediction and save jobs to finish before discarding its failed head.",true));
+    };
+    let next: Result<PersistencePhase,String> = protocol_persistence_next(entry.phase,RequestDiscard());
+    when is_err(next) { term Err(profile_error("invalid-discard-transition",unwrap_err(next),false)); };
+    let next_revision: Result<String,String> = protocol_counter_next(state.clock.revision);
+    when is_err(next_revision) { term Err(profile_error("revision-exhausted",unwrap_err(next_revision),false)); };
+    let profile_idx: Int = profile_at(state,owner);
+    when profile_idx < 0 { term Err(profile_error("unknown-profile","The account profile expired; hydrate it before resolving the save.",false)); };
+    let previous: ProfileSnapshot = state.profiles[profile_idx];
+    let version: ProfileVersion = ProfileVersion { server_epoch: state.clock.server_epoch, account_id: owner, revision: unwrap(next_revision) };
+    let rebuilt: List<ProfileRating> = profile_rebuild_without(state,owner,operation);
+    let changed: Bool = !profile_ratings_equal(previous.ratings,rebuilt);
+    let prediction_pending: Bool = previous.prediction_pending || changed;
+    let profile: ProfileSnapshot = ProfileSnapshot { version: version, ratings: rebuilt, committed: previous.committed,
+        model_generation: previous.model_generation, prediction_running: profile_discard_running(previous.prediction_running,previous.version),
+        prediction_pending: prediction_pending, last_active: previous.last_active };
+    let profiles: List<ProfileSnapshot> = profile_snapshot_replace(state.profiles,profile_idx,profile);
+    let status: OperationStatus = OperationStatus { accepted: entry.accepted, phase: unwrap(next), timestamp: entry.timestamp,
+        job: NoOperationJob(), reservation: entry.reservation, error: entry.error };
+    let operations: List<OperationStatus> = profile_operation_replace(state.operations,idx,status);
+    let updated: AdmissionState = AdmissionState { clock: RevisionClock { server_epoch: state.clock.server_epoch, revision: unwrap(next_revision) },
+        limits: state.limits, profiles: profiles, operations: operations };
+    let original: RatingSaved = RatingSaved { profile: entry.accepted.profile, operation_id: entry.accepted.operation_id };
+    term Ok(ProfileUpdate { state: updated, actions: profile_discard_actions(original) });
+};
+
+defn profile_discard_has_no_running_jobs(state: AdmissionState, owner: Int) -> Bool {
+    let profile_idx: Int = profile_at(state,owner);
+    when profile_idx < 0 || !profile_prediction_job_idle(state.profiles[profile_idx].prediction_running) { term false; };
+    foreach idx in 0..state.operations .^Length {
+        let entry: OperationStatus = state.operations[idx];
+        when entry.accepted.profile.account_id == owner && !profile_operation_job_unbound(entry.job) { term false; };
+    };
+    term true;
+};
+
+defn profile_discard_running(job: OperationJob, previous: ProfileVersion) -> OperationJob {
+    match job {
+        OwnedOperationJob(tag) => profile_discard_owned_running(job,tag,previous),
+        _ => NoOperationJob(),
+    }
+};
+
+defn profile_discard_owned_running(job: OperationJob, tag: WorkerTag, previous: ProfileVersion) -> OperationJob {
+    when protocol_same_profile(tag.profile,previous) { term NoOperationJob(); };
+    term job;
+};
+
+defn profile_phase_is_discardable(phase: PersistencePhase) -> Bool {
+    match phase { PersistFailed() => true, PersistDiscardFailed() => true, _ => false, }
+};
+
+defn profile_evict_idle(state: AdmissionState, owner: Int) -> AdmissionState {
+    let idx: Int = profile_at(state,owner);
+    when idx < 0 || profile_pending_for(state,owner) > 0 || state.profiles[idx].prediction_pending ||
+        !profile_prediction_job_idle(state.profiles[idx].prediction_running) { term state; };
+    let remaining: List<ProfileSnapshot> = [];
+    foreach pos in 0..state.profiles .^Length { when pos != idx { remaining <- state.profiles[pos]; }; };
+    term AdmissionState { clock: state.clock, limits: state.limits, profiles: remaining, operations: state.operations };
+};
+
+defn profile_prediction_job_idle(job: OperationJob) -> Bool {
+    match job { NoOperationJob() => true, _ => false, }
+};

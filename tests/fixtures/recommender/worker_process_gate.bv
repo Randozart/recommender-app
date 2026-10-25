@@ -1,0 +1,296 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/worker_pool.bv";
+import "../../../examples/recommender/model_snapshot.bv";
+import { repeat } from "std/string.bv";
+
+obj WorkerExchange { channel: WorkerChannel; response: WorkerMessage; passed: Bool; partial_write: Bool; };
+obj WorkerPollResult { exit: WorkerExit; finished: Bool; };
+obj WorkerStarted { channel: WorkerChannel; passed: Bool; partial_read: Bool; };
+
+defn worker_channel_flush(channel: WorkerChannel, attempts: Int) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || attempts < 1 { term channel; };
+    when channel.tx_offset >= channel.tx.len { term channel; };
+    let updated: WorkerChannel = worker_channel_write(channel);
+    when updated.tx_offset == channel.tx_offset { worker_test_yield(); };
+    term worker_channel_flush(updated,attempts-1);
+};
+
+defn worker_channel_wait_frame(channel: WorkerChannel, attempts: Int) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || attempts < 1 { term channel; };
+    let view: ByteBuf = ByteBuf { ptr: channel.rx.ptr, len: channel.rx.len, cap: channel.rx.cap };
+    let size: Int = worker_frame_size(view);
+    when size > 0 && channel.rx.len >= size { term channel; };
+    let updated: WorkerChannel = worker_channel_read(channel);
+    when updated.rx.len == channel.rx.len { worker_test_yield(); };
+    term worker_channel_wait_frame(updated,attempts-1);
+};
+
+defn worker_exchange(channel: WorkerChannel, request: WorkerMessage) -> WorkerExchange {
+    let encoded: Result<String,String> = protocol_encode_worker(request);
+    when is_err(encoded) { term WorkerExchange { channel: worker_channel_close(channel), response: request, passed: false, partial_write: false }; };
+    let queued: Result<WorkerChannel,String> = worker_channel_queue(channel,unwrap(encoded));
+    when is_err(queued) { term WorkerExchange { channel: worker_channel_close(channel), response: request, passed: false, partial_write: false }; };
+    let first_write: WorkerChannel = worker_channel_write(unwrap(queued));
+    let partial_write: Bool = first_write.tx_offset > 0 && first_write.tx_offset < first_write.tx.len;
+    let sent: WorkerChannel = worker_channel_flush(first_write,10000);
+    when sent.fd < 0 || sent.tx_offset != sent.tx.len { term WorkerExchange { channel: worker_channel_close(sent), response: request, passed: false, partial_write: partial_write }; };
+    let received: WorkerChannel = worker_channel_wait_frame(sent,100000);
+    when received.fd < 0 || received.terminal != 0 { term WorkerExchange { channel: received, response: request, passed: false, partial_write: partial_write }; };
+    let taken: Result<WorkerReceived,String> = worker_channel_take(received);
+    when is_err(taken) { term WorkerExchange { channel: worker_channel_close(received), response: request, passed: false, partial_write: partial_write }; };
+    let value: WorkerReceived = unwrap(taken);
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(value.frame.text);
+    when is_err(decoded) { term WorkerExchange { channel: worker_channel_close(value.channel), response: request, passed: false, partial_write: partial_write }; };
+    let response: WorkerMessage = unwrap(decoded);
+    term WorkerExchange { channel: value.channel, response: response,
+        passed: worker_same_tag(request.tag,response.tag) && worker_message_valid(response), partial_write: partial_write };
+};
+
+defn worker_wait_started(channel: WorkerChannel, attempts: Int) -> WorkerStarted {
+    let ready_channel: WorkerChannel = worker_channel_wait_frame(channel,attempts);
+    when !ready_channel.ready { term WorkerStarted { channel: ready_channel, passed: false, partial_read: ready_channel.partial_read }; };
+    let taken: Result<WorkerReceived,String> = worker_channel_take(ready_channel);
+    when is_err(taken) { term WorkerStarted { channel: worker_channel_close(ready_channel), passed: false, partial_read: ready_channel.partial_read }; };
+    let value: WorkerReceived = unwrap(taken);
+    let message: Result<WorkerMessage,String> = protocol_decode_worker(value.frame.text);
+    when is_err(message) { term WorkerStarted { channel: worker_channel_close(value.channel), passed: false, partial_read: ready_channel.partial_read }; };
+    let started: WorkerMessage = unwrap(message);
+    term WorkerStarted { channel: value.channel, partial_read: ready_channel.partial_read, passed: started.kind == "started" &&
+        started.tag.profile.server_epoch == channel.epoch &&
+        protocol_text(protocol_member(started.payload,"role")) == channel.role };
+};
+
+defn worker_poll_until_exit(child: WorkerChild, attempts: Int) -> WorkerPollResult {
+    when attempts < 1 { term WorkerPollResult { exit: WorkerExit { child: child, status: -1,
+        signal: 0, signaled: false, reaped: false, restart: false, timed_out: false }, finished: false }; };
+    let observed: WorkerExit = worker_child_poll(child,0);
+    when observed.reaped { term WorkerPollResult { exit: observed, finished: true }; };
+    worker_test_yield();
+    term worker_poll_until_exit(observed.child,attempts-1);
+};
+
+defn worker_supervisor_wait_reap(channel: WorkerChannel, inherited: List<Int>, attempt: Int,
+    restart_limit: Int, deadline_ms: Int, attempts: Int) -> WorkerRestart {
+    let pending: WorkerRestart = worker_supervisor_step(channel,inherited,attempt,restart_limit,
+        deadline_ms,1,100);
+    when pending.exit.reaped || attempts < 1 { term pending; };
+    worker_test_yield();
+    term worker_supervisor_wait_reap(channel,inherited,attempt,restart_limit,deadline_ms,attempts-1);
+};
+
+defn worker_test_yield() -> Void {
+    let delay: Int = Malloc#(16) as Int;
+    Store#(delay,0,8); Store#(delay+8,1000000,8);
+    syscall(SYS_NANOSLEEP,delay,0);
+    Free#(delay as Ptr);
+    term;
+};
+
+defn worker_is_reaped(pid: Int) -> Bool {
+    term syscall(SYS_WAIT4,pid,0,1,0) == -10;
+};
+
+defn worker_test_predict(epoch: String, generation: String, job: String, large: Bool) -> WorkerMessage {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 42, revision: "1" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: job, attempt: 1, model_generation: generation };
+    let ratings: List<JsonValue> = [];
+    foreach item in 0..5 {
+        let rating_fields: List<(String,JsonValue)> = [("item_id",IntVal(item)),("rating",IntVal(5))];
+        ratings <- Object(rating_fields);
+    };
+    let padding: String = "";
+    when large { padding = repeat("x",50000); };
+    let payload_fields: List<(String,JsonValue)> = [("ratings",Array(ratings)),("lambda_milli",IntVal(500)),("padding",StrVal(padding))];
+    term WorkerMessage { kind: "predict", tag: tag, payload: Object(payload_fields) };
+};
+
+defn worker_limit_send_buffer(fd: Int) -> Bool {
+    let size: Int = Malloc#(4) as Int;
+    when size == 0 { term false; };
+    Store#(size,1024,4);
+    let result: Int = syscall(SYS_SETSOCKOPT,fd,1,7,size,4);
+    Free#(size as Ptr);
+    term result == 0;
+};
+
+defn worker_test_shutdown(epoch: String) -> WorkerMessage {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "3", attempt: 1, model_generation: "0" };
+    let fields: List<(String,JsonValue)> = [("deadline_ms",StrVal("10000"))];
+    term WorkerMessage { kind: "shutdown", tag: tag, payload: Object(fields) };
+};
+
+defn worker_test_snapshot() -> Result<ModelDescriptor,String> {
+    let identity: String = "worker-fixture-"+syscall(SYS_GETPID) as String;
+    let path: String = "/tmp/"+identity+".snapshot";
+    let source_users: IntVec = ivec_new(64); let source_items: IntVec = ivec_new(64);
+    let source_values: Vector = vec_new(64);
+    foreach item in 0..64 { ivec_set(source_users,item,item/8); ivec_set(source_items,item,item%8); vec_set(source_values,item,((item%5)+1) as Float); };
+    let population: RatingPopulation = pop_build(source_users,source_items,source_values,64,8,8);
+    let means: Means = means_build(population);
+    let cache: SimCache = simcache_build(population,means,0);
+    let accounts: List<Int> = [42];
+    let model: ServerModel = ServerModel { population: population, means: means, cache: cache,
+        accounts: accounts, baseline_users: 7, revision: identity };
+    let probe_image: String = model_image(model);
+    let probe_valid: Bool = model_image_valid(probe_image,identity,7,8);
+    when !probe_valid { Free#(((probe_image as Data) as Int) as Ptr); term Err("Could not build a valid model snapshot fixture."); };
+    Free#(((probe_image as Data) as Int) as Ptr);
+    let saved: Bool = model_save(model,path);
+    model_free(model); ivec_free(source_users); ivec_free(source_items); vec_free(source_values);
+    when !saved { term Err("Could not create a valid worker model fixture."); };
+    let image: Result<String,Int> = read_file(path);
+    when is_err(image) { remove_file(path); term Err("Could not measure the saved worker model fixture."); };
+    let bytes: Int = unwrap(image) .^Length;
+    Free#(((unwrap(image) as Data) as Int) as Ptr);
+    term Ok(ModelDescriptor { generation: "1", path: path, identity: identity, bytes: bytes });
+};
+
+defn worker_test_install(epoch: String, descriptor: ModelDescriptor, generation: String) -> WorkerMessage {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "4", attempt: 1, model_generation: generation };
+    let fields: List<(String,JsonValue)> = [("generation",StrVal(generation)),
+        ("path",StrVal(descriptor.path)),("identity",StrVal(descriptor.identity)),
+        ("bytes",IntVal(descriptor.bytes))];
+    term WorkerMessage { kind: "install", tag: tag, payload: Object(fields) };
+};
+
+defn worker_process_run() -> Bool {
+    let epoch: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let descriptor: Result<ModelDescriptor,String> = worker_test_snapshot();
+    when is_err(descriptor) { println!("worker_model_fixture_error={}",unwrap_err(descriptor)); term false; };
+
+    let model: ModelDescriptor = unwrap(descriptor);
+    let inherited_pair: Int = Malloc#(8) as Int;
+    when syscall(SYS_SOCKETPAIR,1,1,0,inherited_pair) < 0 { term false; };
+    let inherited_fds: List<Int> = [Load#(inherited_pair+4,4)];
+    let spawned: Result<WorkerChannel,String> = worker_spawn("prediction",epoch,inherited_fds,1,1,20000);
+    when is_err(spawned) { term false; };
+
+    let initial: WorkerChannel = unwrap(spawned);
+    let startup: WorkerStarted = worker_wait_started(initial,100000);
+
+    println!("worker_start_role={} ready={} rx_cap={} partial_read={}",startup.channel.role,startup.passed,startup.channel.rx.cap,startup.partial_read);
+    when !startup.passed { term false; };
+    let channel_bounded: Bool = startup.channel.rx.cap == 65544 && startup.channel.tx.cap <= 65544;
+    let limited_send: Bool = worker_limit_send_buffer(startup.channel.fd);
+    let cold_prediction: WorkerExchange = worker_exchange(startup.channel,worker_test_predict(epoch,"1","2",true));
+
+    let cold_rejected: Bool = cold_prediction.passed && cold_prediction.response.kind == "error" &&
+        protocol_text(protocol_member(cold_prediction.response.payload,"error")) == "model-not-installed";
+    let installed: WorkerExchange = worker_exchange(cold_prediction.channel,worker_test_install(epoch,model,"1"));
+
+    let install_ack: Bool = installed.passed && installed.response.kind == "ready" &&
+        protocol_text(protocol_member(installed.response.payload,"generation")) == model.generation &&
+        protocol_text(protocol_member(installed.response.payload,"identity")) == model.identity;
+    let prediction: WorkerExchange = worker_exchange(installed.channel,worker_test_predict(epoch,"1","5",false));
+
+    println!("worker_predict_reply={} kind={} error={} message={} model_ack={} install_kind={} install_error={} partial_write={} bounded_channel={}",prediction.passed,prediction.response.kind,
+        protocol_text(protocol_member(prediction.response.payload,"error")),
+        protocol_text(protocol_member(prediction.response.payload,"message")),install_ack,installed.response.kind,
+        protocol_text(protocol_member(installed.response.payload,"error")),cold_prediction.partial_write,channel_bounded);
+    let predicted_event: Bool = prediction.response.kind == "result" && worker_message_valid(prediction.response) &&
+        prediction.response.tag.model_generation == model.generation &&
+        protocol_text(protocol_member(prediction.response.payload,"type")) == "recommendations";
+    let reused: WorkerExchange = worker_exchange(prediction.channel,worker_test_predict(epoch,"1","7",false));
+
+    let reused_engine: Bool = reused.passed && reused.response.kind == "result" && worker_message_valid(reused.response);
+    let generation_two: ModelDescriptor = ModelDescriptor { generation: "2", path: model.path, identity: model.identity, bytes: model.bytes };
+    let swapped: WorkerExchange = worker_exchange(reused.channel,worker_test_install(epoch,generation_two,"2"));
+
+    let swap_ack: Bool = swapped.passed && swapped.response.kind == "ready" &&
+        protocol_text(protocol_member(swapped.response.payload,"generation")) == "2";
+    let prediction_two: WorkerExchange = worker_exchange(swapped.channel,worker_test_predict(epoch,"2","6",false));
+
+    let swapped_result: Bool = prediction_two.passed && prediction_two.response.kind == "result" &&
+        worker_message_valid(prediction_two.response) && prediction_two.response.tag.model_generation == "2";
+    println!("worker_engine_reuse={} generation_swap_ready={} generation_two_result={}",reused_engine,swap_ack,swapped_result);
+    when !limited_send || !cold_rejected || !install_ack || !cold_prediction.partial_write || !prediction.passed || !predicted_event || !reused_engine || !swap_ack || !swapped_result {
+        term false;
+    };
+    let stopped: WorkerExchange = worker_exchange(prediction_two.channel,worker_test_shutdown(epoch));
+    let shutdown_ok: Bool = stopped.passed && stopped.response.kind == "stopped" &&
+        protocol_boolean(protocol_member(stopped.response.payload,"drained"));
+    println!("worker_shutdown_reply={} kind={} drained={}",shutdown_ok,stopped.response.kind,protocol_boolean(protocol_member(stopped.response.payload,"drained")));
+    let normal_pid: Int = stopped.channel.pid;
+    let supervised: WorkerPollResult = worker_poll_until_exit(WorkerChild { pid: normal_pid,
+        channel_fd: stopped.channel.fd, deadline_ms: 20000, attempt: 1, restart_limit: 1 },10000);
+    let no_zombie: Bool = worker_is_reaped(normal_pid);
+    let released: WorkerChannel = worker_channel_release_after_child(stopped.channel);
+    println!("worker_reap_finished={} status={} signaled={} restart={} no_zombie={}",supervised.finished,supervised.exit.status,supervised.exit.signaled,supervised.exit.restart,no_zombie);
+    remove_file(model.path);
+    syscall(SYS_CLOSE,Load#(inherited_pair,4)); syscall(SYS_CLOSE,Load#(inherited_pair+4,4)); Free#(inherited_pair as Ptr);
+    when !shutdown_ok || !supervised.finished || supervised.exit.status != 0 || released.fd != -1 || supervised.exit.restart || !channel_bounded || !no_zombie { term false; };
+    term worker_test_recovery(epoch);
+};
+
+defn worker_test_recovery(epoch: String) -> Bool {
+    let inherited: List<Int> = [];
+    let crashed: Result<WorkerChannel,String> = worker_spawn("persistence",epoch,inherited,1,1,20000);
+    when is_err(crashed) { term false; };
+    let first: WorkerStarted = worker_wait_started(unwrap(crashed),100000);
+    when !first.passed { term false; };
+    let killed: Int = syscall(SYS_KILL,first.channel.pid,9);
+    let pending: WorkerRestart = worker_supervisor_wait_reap(first.channel,inherited,1,1,20000,10000);
+    let no_zombie: Bool = worker_is_reaped(first.channel.pid);
+    let held: WorkerRestart = worker_supervisor_restart(pending,inherited,99,100);
+    let restarted: WorkerRestart = worker_supervisor_restart(held,inherited,100,100);
+    println!("worker_crash_finished={} signal={} restart={} kill_rc={} no_zombie={} delayed={}",
+        pending.exit.reaped,pending.exit.signal,pending.exit.restart,killed,no_zombie,!held.restarted);
+    when !pending.exit.reaped || !pending.exit.signaled || pending.exit.signal != 9 || !pending.exit.restart ||
+        pending.channel.fd != -1 || !no_zombie || held.restarted || !restarted.restarted { term false; };
+    let second: WorkerStarted = worker_wait_started(restarted.channel,100000);
+    println!("worker_restart_ready={} fd={} terminal={}",second.passed,second.channel.fd,second.channel.terminal);
+    when !second.passed { term false; };
+    let request: WorkerExchange = worker_exchange(second.channel,worker_test_shutdown(epoch));
+    println!("worker_restart_shutdown={} kind={} error={}",request.passed,request.response.kind,protocol_text(protocol_member(request.response.payload,"error")));
+    when !request.passed || request.response.kind != "stopped" { term false; };
+    let stopped: WorkerPollResult = worker_poll_until_exit(WorkerChild { pid: request.channel.pid,
+        channel_fd: request.channel.fd, deadline_ms: 20000, attempt: 2, restart_limit: 1 },10000);
+    worker_channel_release_after_child(request.channel);
+    when !stopped.finished || stopped.exit.status != 0 || stopped.exit.restart { term false; };
+    term worker_test_timeout(epoch) && worker_test_malformed(epoch);
+};
+
+defn worker_test_timeout(epoch: String) -> Bool {
+    let inherited: List<Int> = [];
+    let spawned: Result<WorkerChannel,String> = worker_spawn("prediction",epoch,inherited,1,1,1);
+    when is_err(spawned) { term false; };
+    let started: WorkerStarted = worker_wait_started(unwrap(spawned),100000);
+    when !started.passed { term false; };
+    let timed: WorkerExit = worker_child_poll(WorkerChild { pid: started.channel.pid,
+        channel_fd: started.channel.fd, deadline_ms: 1, attempt: 1, restart_limit: 1 },2);
+    let no_zombie: Bool = worker_is_reaped(started.channel.pid);
+    worker_channel_release_after_child(started.channel);
+    println!("worker_timeout_reaped={} timed_out={} signal={} restart={} no_zombie={}",timed.reaped,timed.timed_out,timed.signal,timed.restart,no_zombie);
+    term timed.reaped && timed.timed_out && timed.signaled && timed.signal == 9 && timed.restart && no_zombie;
+};
+
+defn worker_test_malformed(epoch: String) -> Bool {
+    let inherited: List<Int> = [];
+    let spawned: Result<WorkerChannel,String> = worker_spawn("prediction",epoch,inherited,1,0,20000);
+    when is_err(spawned) { term false; };
+    let started: WorkerStarted = worker_wait_started(unwrap(spawned),100000);
+    when !started.passed { term false; };
+    let malformed: GrowBuf = grow_new(8).put_u32_be(0).put_u32_be(1);
+    let sent: Int = syscall(SYS_SEND,started.channel.fd,malformed.ptr,malformed.len,16384);
+    grow_free(malformed);
+    let exit: WorkerPollResult = worker_poll_until_exit(WorkerChild { pid: started.channel.pid,
+        channel_fd: started.channel.fd, deadline_ms: 20000, attempt: 1, restart_limit: 0 },10000);
+    let no_zombie: Bool = worker_is_reaped(started.channel.pid);
+    worker_channel_release_after_child(started.channel);
+    println!("worker_malformed_sent={} reaped={} status={} signal={} no_zombie={}",sent,exit.finished,exit.exit.status,exit.exit.signal,no_zombie);
+    term sent == 8 && exit.finished && !exit.exit.signaled && exit.exit.status == 3 && !exit.exit.restart && no_zombie;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let bounded: Bool = is_ok(worker_pool_limits(2,3)) && is_err(worker_pool_limits(0,3)) && is_err(worker_pool_limits(2,17));
+    let persistent: Bool = worker_process_run();
+    println!("independent_pool_bounds={} persistent_ipc={} clean_shutdown_reap={}",bounded,persistent,persistent);
+    when !bounded || !persistent { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

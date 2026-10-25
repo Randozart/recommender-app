@@ -1,0 +1,33 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/udata.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let source: String = "1\t1\t5\t0\n943 1682 1 9223372036854775807\r\n2 3 4 123";
+    let parsed: UDataBatch = udata_parse(source);
+    println!("valid_count={}", parsed.records .^Length == 3 && parsed.discarded == 0);
+    let first: UDataRecord = parsed.records[0];
+    let last: UDataRecord = parsed.records[1];
+    println!("index_bounds={}", first.user_idx == 0 && first.item_idx == 0 && last.user_idx == 942 && last.item_idx == 1681);
+    let printed: String = udata_print(parsed.records, 0, "");
+    let canonical: String = "1\t1\t5\t0\n943\t1682\t1\t9223372036854775807\n2\t3\t4\t123\n";
+    println!("canonical={}", printed == canonical);
+    let again: UDataBatch = udata_parse(printed);
+    println!("roundtrip={}", again.records .^Length == 3 && again.discarded == 0 && udata_print(again.records, 0, "") == canonical);
+    let mixed: String = "0 1 3 1\n944 1 3 1\n1 0 3 1\n1 1683 3 1\n1 1 0 1\n1 1 6 1\n1 1 3 -1\n1 1 3 9223372036854775808\n1x 1 3 1\n1 1 3\n1 1 3 1 extra\n\n2 3 4 123";
+    let filtered: UDataBatch = udata_parse(mixed);
+    println!("filter_and_continue={}", filtered.records .^Length == 1 && filtered.discarded == 12 && udata_print(filtered.records, 0, "") == "2\t3\t4\t123\n");
+    let empty: UDataBatch = udata_parse("");
+    println!("empty={}", empty.records .^Length == 0 && empty.discarded == 0);
+    let passed: Bool = parsed.records .^Length == 3 && parsed.discarded == 0 &&
+        first.user_idx == 0 && first.item_idx == 0 && last.user_idx == 942 && last.item_idx == 1681 &&
+        printed == canonical && again.records .^Length == 3 && again.discarded == 0 &&
+        udata_print(again.records, 0, "") == canonical && filtered.records .^Length == 1 &&
+        filtered.discarded == 12 && udata_print(filtered.records, 0, "") == "2\t3\t4\t123\n" &&
+        empty.records .^Length == 0 && empty.discarded == 0;
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

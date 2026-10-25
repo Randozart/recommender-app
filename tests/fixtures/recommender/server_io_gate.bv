@@ -1,0 +1,64 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_io.bv";
+
+defn io_gate_port(fd: Int) -> Int {
+    let memory: Int = Malloc#(24) as Int;
+    Store#(memory+16,16,4);
+    let result: Int = syscall(51,fd,memory,memory+16);
+    let port: Int = Load#(memory+2,1)*256+Load#(memory+3,1);
+    Free#(memory as Ptr);
+    term port;
+};
+
+defn io_gate_bytes(address: Int, count: Int, offset: Int) -> Bool {
+    foreach idx in 0..count {
+        let expected: Int = 90;
+        when offset+idx >= 524288 { expected = byte_at("TAIL",offset+idx-524288); };
+        when Load#(address+idx,1) != expected { term false; };
+    };
+    term true;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let reactor: Reactor = reactor_open(0,1);
+    when reactor.listener < 0 { endprogram 1; };
+    let client: Socket = sock_tcp();
+    let connected: Int = sock_connect(client,LOOPBACK,io_gate_port(reactor.listener));
+    let ready: Int = reactor_poll(reactor,1000);
+    let row: Int = reactor_row(reactor,0);
+    let option: Int = Malloc#(4) as Int;
+    Store#(option,1024,4);
+    let limited: Int = syscall(54,Load#(row,8),1,7,option,4);
+    Free#(option as Ptr);
+    let nonblocking: Int = sock_set_nonblocking(client);
+    let output: GrowBuf = grow_new(524288);
+    foreach idx in 0..524288 { Store#(output.ptr+idx,90,1); };
+    let queued: Bool = io_queue(reactor,0,GrowBuf { ptr: output.ptr, len: 524288, cap: output.cap });
+    let flushed: Bool = io_flush(reactor,0);
+    let partial: Bool = Load#(row+56,8) > 0 && Load#(row+56,8) < Load#(row+72,8);
+    let appended: Bool = io_queue(reactor,0,put_str(grow_new(4),"TAIL"));
+    let scratch: Int = Malloc#(65536) as Int;
+    let received: Int = 0;
+    let valid: Bool = true;
+    foreach sweep in 0..10000 {
+        when received < 524292 {
+            let readiness: Int = reactor_poll(reactor,1);
+            io_flush(reactor,0);
+            let count: Int = syscall(SYS_RECV,client.fd,scratch,65536,0);
+            when count > 0 {
+                when !io_gate_bytes(scratch,count,received) { valid = false; };
+                received = received+count;
+            };
+        };
+    };
+    let complete: Bool = received == 524292 && Load#(row+48,8) == 0;
+    Free#(scratch as Ptr);
+    let closed: Int = sock_close(client);
+    reactor_close(reactor);
+    println!("partial_write={} append_preserves_suffix={} exact_bytes={} received={} complete={}",partial,appended,valid,received,complete);
+    when !queued || !flushed || !partial || !appended || !valid || !complete || limited != 0 || nonblocking != 0 || connected != 0 { endprogram 1; };
+    tick = 1; endprogram;
+};

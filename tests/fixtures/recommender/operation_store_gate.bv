@@ -1,0 +1,181 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/persistence_worker.bv";
+import "std/env.bv";
+
+const I07_EPOCH: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const I07_SCHEMA: String = "briev_recommender_i07";
+
+defn i07_set_schema(conn: PgConn) -> Bool {
+    let params: List<String> = [I07_SCHEMA];
+    term pg_exec(conn,"SELECT set_config('search_path',quote_ident($1),false)",params).ok;
+};
+
+defn i07_op(nonce: String) -> String { term unwrap(protocol_operation_id(I07_EPOCH,nonce)); };
+defn i07_profile(owner: Int, revision: String) -> ProfileVersion {
+    term ProfileVersion { server_epoch: I07_EPOCH, account_id: owner, revision: revision };
+};
+defn i07_command(nonce: String, item: Int, rating: Int) -> RatingCommand {
+    term RatingCommand { server_epoch: I07_EPOCH, operation_id: i07_op(nonce), item_id: item, rating: rating };
+};
+defn i07_outcome(result: OperationWriteResult, expected: Int) -> Bool {
+    match result.outcome {
+        OperationApplied(_) => expected == 1,
+        OperationReplayed(_) => expected == 2,
+        OperationAlreadyDiscarded(_) => expected == 3,
+        OperationConflict(_) => expected == 4,
+        _ => false,
+    }
+};
+
+defn i07_prepare(conn: PgConn) -> Bool {
+    let created: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_recommender_i07");
+    when !created.ok || !i07_set_schema(conn) { term false; };
+    let base: PgResult = store_create_schema(conn);
+    when !base.ok { term false; };
+    let migration: PgResult = operation_store_create_schema(conn);
+    when !migration.ok { term false; };
+    let accounts: PgResult = pg_simple_query(conn,
+        "INSERT INTO accounts(id,username,password) VALUES (910701,'i07-first','fixture'),(910702,'i07-second','fixture') ON CONFLICT (id) DO NOTHING");
+    term accounts.ok;
+};
+
+defn i07_database_checks(conn: PgConn) -> Bool {
+    let first: RatingCommand = i07_command("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",0,1);
+    let saved: OperationWriteResult = operation_store_save(conn,first,i07_profile(910701,"1"),"100");
+    when !i07_outcome(saved,1) { println!("first_write=false"); term false; };
+    // Simulate a lost acknowledgement: do not inspect `saved`; a fresh
+    // worker connection must resolve the commit before an older retry runs.
+    let reader: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when reader.sock.fd < 0 || reader.pid < 0 || !i07_set_schema(reader) { term false; };
+    let identity: Result<String,String> = operation_store_database_identity(reader,I07_EPOCH);
+    let first_ids: List<String> = [first.operation_id];
+    let resolved: OperationReceiptBatch = operation_store_receipts(reader,910701,I07_EPOCH,first_ids);
+    let lost_ack: Bool = is_ok(identity) && unwrap(identity) == get_env("PGDATABASE")+"/"+I07_SCHEMA+"/"+I07_EPOCH &&
+        resolved.ok && resolved.receipts .^Length == 1 && resolved.receipts[0].status == "saved";
+    pg_close(reader);
+    when !lost_ack { println!("lost_ack_reconciled=false"); term false; };
+    let replay: OperationWriteResult = operation_store_save(conn,first,i07_profile(910701,"1"),"100");
+    let conflict: OperationWriteResult = operation_store_save(conn,i07_command("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",0,2),i07_profile(910701,"1"),"100");
+    let timestamp_conflict: OperationWriteResult = operation_store_save(conn,first,i07_profile(910701,"1"),"101");
+    let replay_gate: Bool = i07_outcome(replay,2) && i07_outcome(conflict,4) && i07_outcome(timestamp_conflict,4);
+    let newer: RatingCommand = i07_command("cccccccccccccccccccccccccccccccc",0,5);
+    let newer_write: OperationWriteResult = operation_store_save(conn,newer,i07_profile(910701,"2"),"200");
+    let older_retry: OperationWriteResult = operation_store_save(conn,first,i07_profile(910701,"1"),"100");
+    let current: PgResult = pg_simple_query(conn,"SELECT rating,ts FROM ratings WHERE account_id=910701 AND item_id=0");
+    let ordered: Bool = i07_outcome(newer_write,1) && i07_outcome(older_retry,2) && current.ok && current.nrows == 1 &&
+        pg_row_int(current,0,0) == 5 && pg_row_int(current,0,1) == 200;
+    let discarded: RatingCommand = i07_command("dddddddddddddddddddddddddddddddd",1,4);
+    let tombstone: OperationWriteResult = operation_store_discard(conn,
+        RatingSaved { profile: i07_profile(910701,"3"), operation_id: discarded.operation_id },1,4,"300");
+    let tombstone_replay: OperationWriteResult = operation_store_discard(conn,
+        RatingSaved { profile: i07_profile(910701,"3"), operation_id: discarded.operation_id },1,4,"300");
+    let tombstone_conflict: OperationWriteResult = operation_store_discard(conn,
+        RatingSaved { profile: i07_profile(910701,"3"), operation_id: discarded.operation_id },1,4,"301");
+    let tombstone_save: OperationWriteResult = operation_store_save(conn,discarded,i07_profile(910701,"3"),"300");
+    let tombstone_gate: Bool = i07_outcome(tombstone,1) && i07_outcome(tombstone_replay,2) &&
+        i07_outcome(tombstone_conflict,4) && i07_outcome(tombstone_save,3);
+    let rollback_command: RatingCommand = i07_command("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",2,3);
+    let rollback: OperationWriteResult = operation_store_save(conn,rollback_command,i07_profile(910702,"3"),"400");
+    let absent: PgResult = pg_simple_query(conn,"SELECT count(*) FROM ratings WHERE account_id=910702 AND item_id=2");
+    let absent_receipt_params: List<String> = ["910702",rollback_command.operation_id];
+    let absent_receipt: PgResult = pg_exec(conn,"SELECT count(*) FROM rating_operation_receipts WHERE account_id=$1::integer AND operation_id=$2",
+        absent_receipt_params);
+    let rollback_gate: Bool = match rollback.outcome { OperationFailed(value) => value.err_code == "23505", _ => false } &&
+        absent.ok && pg_row_int(absent,0,0) == 0 && absent_receipt.ok && pg_row_int(absent_receipt,0,0) == 0;
+    let ids: List<String> = [first.operation_id,newer.operation_id,discarded.operation_id,i07_op("ffffffffffffffffffffffffffffffff")];
+    let batch: OperationReceiptBatch = operation_store_receipts(conn,910701,I07_EPOCH,ids);
+    let batch_gate: Bool = batch.ok && batch.receipts .^Length == 4 && batch.receipts[0].status == "saved" &&
+        batch.receipts[1].status == "saved" && batch.receipts[2].status == "discarded" && batch.receipts[3].status == "unknown";
+    let next_epoch: String = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let historical: OperationReceiptBatch = operation_store_receipts(conn,910701,next_epoch,first_ids);
+    let retained_across_epoch: Bool = historical.ok && historical.receipts .^Length == 1 &&
+        historical.receipts[0].profile.server_epoch == I07_EPOCH && historical.receipts[0].profile.revision == "1";
+    println!("duplicate_conflict={} lost_ack={} older_retry={} discard_tombstone={} rollback={} receipt_retention={}",
+        replay_gate,lost_ack,ordered,tombstone_gate,rollback_gate,batch_gate && retained_across_epoch);
+    term replay_gate && ordered && tombstone_gate && rollback_gate && batch_gate && retained_across_epoch;
+};
+
+defn i07_worker_checks() -> Bool {
+    let config: PersistenceWorkerConfig = PersistenceWorkerConfig { addr: 2130706433, port: 5432,
+        user: get_env("PGUSER"), database: get_env("PGDATABASE"), schema: I07_SCHEMA, password: "", server_epoch: I07_EPOCH };
+    let opened: Result<PersistenceWorker,String> = persistence_worker_open(config);
+    when is_err(opened) { println!("persistence_worker_open=false"); term false; };
+    let worker: PersistenceWorker = unwrap(opened);
+    let command: RatingCommand = i07_command("66666666666666666666666666666666",3,2);
+    let profile: ProfileVersion = i07_profile(910701,"4");
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "101", attempt: 1, model_generation: "0" };
+    let persist_extra: List<(String,JsonValue)> = [("timestamp",StrVal("500")),("database_identity",StrVal(worker.database_identity))];
+    let command_field: List<(String,JsonValue)> = [("operation",Object(protocol_command_fields(command)))];
+    let persist_fields: List<(String,JsonValue)> = command_field+persist_extra;
+    let persist: WorkerMessage = WorkerMessage { kind: "persist", tag: tag, payload: Object(persist_fields) };
+    let saved: PersistenceWorkerStep = persistence_worker_handle(worker,persist);
+    let saved_reply: Bool = saved.reply.kind == "saved" && worker_message_valid(saved.reply) && !saved.reconnect;
+    let discard_command: RatingCommand = i07_command("77777777777777777777777777777777",4,3);
+    let discard_profile: ProfileVersion = i07_profile(910701,"5");
+    let discard_tag: WorkerTag = WorkerTag { profile: discard_profile, job_id: "102", attempt: 1, model_generation: "0" };
+    let discard_extra: List<(String,JsonValue)> = [("operation_id",StrVal(discard_command.operation_id)),
+        ("timestamp",StrVal("600")),("database_identity",StrVal(saved.worker.database_identity))];
+    let discard_command_field: List<(String,JsonValue)> = [("operation",Object(protocol_command_fields(discard_command)))];
+    let discard_fields: List<(String,JsonValue)> = discard_command_field+discard_extra;
+    let discard: WorkerMessage = WorkerMessage { kind: "discard", tag: discard_tag, payload: Object(discard_fields) };
+    let discarded: PersistenceWorkerStep = persistence_worker_handle(saved.worker,discard);
+    let discard_reply: Bool = discarded.reply.kind == "saved" && worker_message_valid(discarded.reply) && !discarded.reconnect;
+    let one_id: List<JsonValue> = [StrVal(command.operation_id)];
+    let receipt_fields: List<(String,JsonValue)> = [("operation_ids",Array(one_id)),
+        ("database_identity",StrVal(discarded.worker.database_identity))];
+    let receipt: WorkerMessage = WorkerMessage { kind: "receipt", tag: tag,
+        payload: Object(receipt_fields) };
+    let receipts: PersistenceWorkerStep = persistence_worker_handle(discarded.worker,receipt);
+    let receipt_reply: Bool = receipts.reply.kind == "receipts" && worker_message_valid(receipts.reply) && !receipts.reconnect;
+    persistence_worker_close(receipts.worker);
+    println!("worker_commit_ack={} discard_tombstone_ack={} receipt_reply={}",saved_reply,discard_reply,receipt_reply);
+    term saved_reply && discard_reply && receipt_reply;
+};
+
+defn i07_schedule_checks() -> Bool {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 10, pending_global: 20, pending_owner: 10, receipt_slots: 20, retained_bytes: 65536 };
+    let empty: AdmissionState = profile_empty(I07_EPOCH,limits);
+    let a: RatingAccepted = RatingAccepted { profile: i07_profile(1,"1"), operation_id: i07_op("11111111111111111111111111111111"), delta: ProfileRating { item_id: 1, rating: 2 } };
+    let b: RatingAccepted = RatingAccepted { profile: i07_profile(2,"2"), operation_id: i07_op("22222222222222222222222222222222"), delta: ProfileRating { item_id: 2, rating: 3 } };
+    let c: RatingAccepted = RatingAccepted { profile: i07_profile(2,"3"), operation_id: i07_op("33333333333333333333333333333333"), delta: ProfileRating { item_id: 3, rating: 4 } };
+    let none: AdmissionReservation = NoAdmissionReservation();
+    let first: List<OperationStatus> = [OperationStatus { accepted: a, phase: PersistFailed(), timestamp: "1", job: NoOperationJob(), reservation: none, error: "failed" }];
+    let a_later: RatingAccepted = RatingAccepted { profile: i07_profile(1,"4"), operation_id: i07_op("44444444444444444444444444444444"), delta: ProfileRating { item_id: 4, rating: 5 } };
+    let a_later_status: List<OperationStatus> = [OperationStatus { accepted: a_later, phase: PersistQueued(), timestamp: "4", job: NoOperationJob(), reservation: none, error: "" }];
+    let second: List<OperationStatus> = [OperationStatus { accepted: b, phase: PersistQueued(), timestamp: "2", job: NoOperationJob(), reservation: none, error: "" },
+        OperationStatus { accepted: c, phase: PersistQueued(), timestamp: "3", job: NoOperationJob(), reservation: none, error: "" }];
+    let both: AdmissionState = AdmissionState { clock: empty.clock, limits: limits, profiles: empty.profiles, operations: first+a_later_status+second };
+    let owners: List<Int> = [1,2];
+    let slots: List<PersistenceRetrySlot> = [];
+    let scheduled: PersistenceSchedule = persistence_schedule(both,owners,slots,0,2,0);
+    let independent: Bool = scheduled.jobs .^Length == 1 && scheduled.jobs[0].saved.profile.account_id == 2 && scheduled.next_owner == 0;
+    let retry_state: List<OperationStatus> = [OperationStatus { accepted: a, phase: PersistRetryWait(), timestamp: "1", job: NoOperationJob(), reservation: none, error: "retry" }];
+    let retry_admission: AdmissionState = AdmissionState { clock: empty.clock, limits: limits, profiles: empty.profiles, operations: retry_state };
+    let retry: List<PersistenceRetrySlot> = [PersistenceRetrySlot { operation_id: a.operation_id, attempt: 2, retry_at_ms: 500 }];
+    let retry_owners: List<Int> = [1];
+    let before: PersistenceSchedule = persistence_schedule(retry_admission,retry_owners,retry,499,1,0);
+    let due: PersistenceSchedule = persistence_schedule(retry_admission,retry_owners,retry,500,1,0);
+    let retries_bounded: Bool = before.jobs .^Length == 0 && due.jobs .^Length == 1 && due.jobs[0].attempt == 2 &&
+        persistence_retry_delay(1) == PERSIST_RETRY_BASE_MS && persistence_retry_delay(8) == PERSIST_RETRY_MAX_MS;
+    let backoff: PersistenceRetryDecision = persistence_retry_decide(2,3,1000);
+    let exhausted: PersistenceRetryDecision = persistence_retry_decide(3,3,1000);
+    term independent && retries_bounded && backoff.allowed && backoff.delay_ms == 400 && exhausted.exhausted && !exhausted.allowed;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let prepared: Bool = i07_prepare(conn);
+    when !prepared { pg_close(conn); endprogram 1; };
+    let database_ok: Bool = i07_database_checks(conn);
+    pg_close(conn);
+    let worker_ok: Bool = i07_worker_checks();
+    let schedule_ok: Bool = i07_schedule_checks();
+    println!("independent_account_fifo_retry_backoff={}",schedule_ok);
+    when !database_ok || !worker_ok || !schedule_ok { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

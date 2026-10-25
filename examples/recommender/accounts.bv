@@ -1,0 +1,74 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./store.bv";
+import "./credentials.bv";
+import "./sessions.bv";
+
+obj Account { id: Int; username: String; };
+obj AccountResult { ok: Bool; error: String; account: Account; detail: PgResult; };
+obj LoginResult { result: AccountResult; token: String; sessions: SessionStore; };
+
+defn account_failure(error: String, detail: PgResult) -> AccountResult {
+    term AccountResult { ok: false, error: error,
+        account: Account { id: 0, username: "" }, detail: detail };
+};
+
+defn account_from_row(rows: PgResult) -> AccountResult {
+    when rows.nrows != 1 || rows.ncols != 2 {
+        term account_failure("database", store_error("Expected one account identity; check the database schema."));
+    };
+    let id: Int = pg_row_int(rows, 0, 0);
+    when id < 1 || id > 2147483647 {
+        term account_failure("database", store_error("Expected a positive account ID; check the database schema."));
+    };
+    term AccountResult { ok: true, error: "",
+        account: Account { id: id, username: pg_row_text(rows, 0, 1) }, detail: pg_result_empty() };
+};
+
+// 2026-10-21: one parameterized INSERT lets the unique constraint arbitrate
+// simultaneous registrations. A separate existence check would race. Public
+// results contain identity only, never the password or stored hash. Keep SQL
+// failures distinct from duplicate usernames; callers own transaction boundaries.
+defn register(conn: PgConn, username: String, password: String) -> AccountResult {
+    when !credentials_valid(username, password) {
+        term account_failure("validation", store_error("Username and password must each contain a non-whitespace character."));
+    };
+    let params: List<String> = [username, credential_hash(password)];
+    let inserted: PgResult = pg_exec(conn,
+        "INSERT INTO accounts (username,password) VALUES ($1,$2) " +
+        "ON CONFLICT (username) DO NOTHING RETURNING id,username", params);
+    when !inserted.ok { term account_failure("database", inserted); };
+    when inserted.nrows == 0 {
+        term account_failure("account-exists", store_error("That username is already registered; choose another username or log in."));
+    };
+    term account_from_row(inserted);
+};
+
+defn login_failure(error: String, detail: PgResult, sessions: SessionStore) -> LoginResult {
+    term LoginResult { result: account_failure(error,detail), token: "", sessions: sessions };
+};
+
+// 2026-10-21: only a persisted credential match may acquire a token. SQL
+// binds the exact username and stored-scheme hash; no password/hash is selected
+// into the public account. The caller captures result.sessions on success.
+// Failed auth, SQL, or entropy leaves its previous session value unchanged.
+defn login(conn: PgConn, sessions: SessionStore, username: String, password: String) -> LoginResult {
+    when !credentials_valid(username,password) {
+        term login_failure("auth-failed",store_error("Username or password does not match."),sessions);
+    };
+    let params: List<String> = [username,credential_hash(password)];
+    let rows: PgResult = pg_exec(conn,
+        "SELECT id,username FROM accounts WHERE username=$1 AND password=$2",params);
+    when !rows.ok { term login_failure("database",rows,sessions); };
+    when rows.nrows == 0 {
+        term login_failure("auth-failed",store_error("Username or password does not match."),sessions);
+    };
+    let account: AccountResult = account_from_row(rows);
+    when !account.ok { term LoginResult { result: account, token: "", sessions: sessions }; };
+    let issued: SessionIssue = session_issue(sessions,account.account.id,0);
+    when !issued.ok {
+        term login_failure("session",store_error("Cannot create a session token; retry login."),sessions);
+    };
+    term LoginResult { result: account, token: issued.token, sessions: issued.sessions };
+};

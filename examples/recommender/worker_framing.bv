@@ -1,0 +1,40 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./worker_messages.bv";
+import "std/net/bytes.bv";
+// Reuse the existing bounded byte-buffer/String door; do not add a third raw
+// String-header assembly implementation for the worker protocol.
+import { buf_slice_string } from "std/net/http.bv";
+
+const WORKER_FRAME_MAGIC: Int = 1112692273;
+const WORKER_FRAME_HEADER: Int = 8;
+
+obj WorkerFrame { text: String; consumed: Int; };
+
+// 2026-10-22: I02 uses BRV1 + big-endian u32 payload length. Inspect the complete
+// header before allocating payload storage. I05 owns partial I/O and retained
+// suffixes; this codec never consumes a partial frame or an adjacent frame.
+// Replace only through a coordinated protocol-version migration.
+defn worker_frame_size(buffer: ByteBuf) -> Int {
+    when buffer.len < 0 || buffer.cap < buffer.len || (buffer.len > 0 && buffer.ptr == 0) { term -1; };
+    when buffer.len < WORKER_FRAME_HEADER { term 0; };
+    when get_u32_be(buffer,0) != WORKER_FRAME_MAGIC { term -1; };
+    let bytes: Int = get_u32_be(buffer,4);
+    when bytes < 1 || bytes > PROTOCOL_JSON_LIMIT { term -1; };
+    term WORKER_FRAME_HEADER+bytes;
+};
+defn worker_frame_encode(text: String) -> Result<GrowBuf,String> {
+    let bytes: Int = text .^Length;
+    when bytes < 1 || bytes > PROTOCOL_JSON_LIMIT { term Err("Worker payload must contain 1..65536 UTF-8 bytes."); };
+    let buffer: GrowBuf = grow_new(WORKER_FRAME_HEADER+bytes);
+    when buffer.ptr == 0 { term Err("Cannot allocate the bounded worker frame; release resources and retry."); };
+    let header: GrowBuf = buffer.put_u32_be(WORKER_FRAME_MAGIC).put_u32_be(bytes);
+    term Ok(header.put_bytes(((text as Data) as Int)+8,bytes));
+};
+defn worker_frame_decode(buffer: ByteBuf) -> Result<WorkerFrame,String> {
+    let size: Int = worker_frame_size(buffer);
+    when size < 0 { term Err("Invalid worker frame magic, length or buffer bounds."); };
+    when size == 0 || buffer.len < size { term Err("Worker frame is incomplete; retain the bytes and continue reading."); };
+    term Ok(WorkerFrame { text: buf_slice_string(buffer,WORKER_FRAME_HEADER,size-WORKER_FRAME_HEADER), consumed: size });
+};

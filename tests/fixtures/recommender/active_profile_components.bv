@@ -1,0 +1,35 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./active_profile_support.bv";
+
+// Controlled decomposition of the existing active_build, retaining its exact
+// copy/CSR/means/PCC sequence. The sums remain observable across the print.
+defn active_gate_components(model: ServerModel, rating_count: Int) -> Bool {
+    let state: AccountState = active_gate_state(2147483000,active_gate_ratings(rating_count,0));
+    let pop: RatingPopulation = model.population;
+    let started: Int = trace_clock();
+    let capacity: Int = pop.nnz+rating_count+1;
+    let users: IntVec = ivec_new(capacity);
+    let items: IntVec = ivec_new(capacity);
+    let values: Vector = vec_new(capacity);
+    let count: Int = 0;
+    foreach user in 0..pop.nusers { count = active_copy_row(pop,user,users,items,values,count); };
+    foreach idx in 0..rating_count {
+        ivec_set(users,count,pop.nusers); ivec_set(items,count,state.ratings[idx].item_id);
+        vec_set(values,count,state.ratings[idx].rating as Float); count = count+1;
+    };
+    let copied: Int = trace_clock();
+    let overlay: RatingPopulation = pop_build(users,items,values,count,pop.nusers+1,pop.nitems);
+    ivec_free(users); ivec_free(items); vec_free(values);
+    let csr: Int = trace_clock();
+    let means: Means = means_build(overlay);
+    let ready: Int = trace_clock();
+    let sum: Float = 0.0;
+    foreach user in 0..pop.nusers { sum = sum+sim_user(overlay,means,pop.nusers,user); };
+    let finished: Int = trace_clock();
+    println!("active_components ratings={} copy_us={} csr_us={} means_us={} similarity_us={} checksum={}",
+        rating_count,copied-started,csr-copied,ready-csr,finished-ready,sum);
+    means_free(means); pop_free(overlay);
+    term json_finite(sum);
+};

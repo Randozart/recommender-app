@@ -1,0 +1,137 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_codec.bv";
+
+defn protocol_saved_valid(saved: RatingSaved) -> Bool {
+    term protocol_operation_version_valid(saved.profile,saved.operation_id);
+};
+defn protocol_operation_version_valid(profile: ProfileVersion, operation: String) -> Bool {
+    term protocol_version_valid(profile) && protocol_positive(profile.revision) &&
+        protocol_operation_matches(profile.server_epoch,operation);
+};
+defn protocol_saved(value: JsonValue, profile: ProfileVersion) -> Result<RatingSaved,String> {
+    let saved: RatingSaved = RatingSaved { profile: profile, operation_id: protocol_text(protocol_member(value,"operation_id")) };
+    when !protocol_saved_valid(saved) { term Err("Supply the operation's original epoch, positive revision and operation ID."); };
+    term Ok(saved);
+};
+defn protocol_saved_matches(saved: RatingSaved, expected: RatingSaved) -> Bool {
+    term protocol_saved_valid(saved) && protocol_same_profile(saved.profile,expected.profile) && saved.operation_id == expected.operation_id;
+};
+defn protocol_operation_fields(saved: RatingSaved, kind: String) -> List<(String,JsonValue)> {
+    let operation: List<(String,JsonValue)> = [("operation_id",StrVal(saved.operation_id))];
+    term protocol_fields(saved.profile,kind)+operation;
+};
+defn protocol_error_code(code: String) -> Bool {
+    when code .^Length < 1 || code .^Length > 64 { term false; };
+    foreach idx in 0..code .^Length {
+        let byte: Int = byte_at(code,idx);
+        when !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45) { term false; };
+    };
+    term true;
+};
+defn protocol_failure_valid(failure: RatingSaveFailed) -> Bool {
+    term protocol_operation_version_valid(failure.profile,failure.operation_id) &&
+        protocol_error_fields_valid(failure.error,failure.message);
+};
+defn protocol_error_fields_valid(error: String, message: String) -> Bool {
+    term protocol_error_code(error) && message .^Length > 0 && message .^Length <= 1024;
+};
+defn protocol_movie_valid(movie: RankedMovie) -> Bool {
+    term movie.item_id >= 0 && movie.item_id < PROTOCOL_ITEMS && json_finite(movie.score) && movie.score >= 1.0 && movie.score <= 5.0;
+};
+defn protocol_movie_after(previous: RankedMovie, current: RankedMovie) -> Bool {
+    term previous.score > current.score || (previous.score == current.score && previous.item_id < current.item_id);
+};
+defn protocol_movie_new(items: List<RankedMovie>, item: Int) -> Bool {
+    foreach idx in 0..items .^Length { when items[idx].item_id == item { term false; }; };
+    term true;
+};
+defn protocol_movies(value: JsonValue) -> Result<List<RankedMovie>,String> {
+    let entries: List<JsonValue> = protocol_array(value);
+    when !protocol_is_array(value) || entries .^Length > PROTOCOL_TOP { term Err("Supply at most five ranked recommendations."); };
+    let items: List<RankedMovie> = [];
+    foreach idx in 0..entries .^Length {
+        let movie: RankedMovie = RankedMovie { item_id: protocol_integer(protocol_member(entries[idx],"item_id")),
+            score: protocol_float(protocol_member(entries[idx],"score")) };
+        when !protocol_object(entries[idx]) || !protocol_movie_valid(movie) || !protocol_movie_new(items,movie.item_id) { term Err("Supply unique movie IDs and finite scores from 1 through 5."); };
+        when idx > 0 && !protocol_movie_after(items[idx-1],movie) { term Err("Order scores descending, breaking ties by ascending movie ID."); };
+        items <- movie;
+    };
+    term Ok(items);
+};
+defn protocol_movies_value(items: List<RankedMovie>) -> Result<JsonValue,String> {
+    when items .^Length > PROTOCOL_TOP { term Err("Supply at most five recommendations."); };
+    let values: List<JsonValue> = [];
+    let seen: List<RankedMovie> = [];
+    foreach idx in 0..items .^Length {
+        let movie: RankedMovie = items[idx];
+        when !protocol_movie_valid(movie) || !protocol_movie_new(seen,movie.item_id) { term Err("Supply unique movie IDs and finite scores from 1 through 5."); };
+        when idx > 0 && !protocol_movie_after(items[idx-1],movie) { term Err("Order scores descending with ascending movie-ID ties."); };
+        let pairs: List<(String,JsonValue)> = [("item_id",IntVal(movie.item_id)),("score",FloatVal(movie.score))];
+        values <- Object(pairs); seen <- movie;
+    };
+    term Ok(Array(values));
+};
+defn protocol_decode_accepted(value: JsonValue, profile: ProfileVersion) -> Result<RatingEvent,String> {
+    let original: Result<RatingSaved,String> = protocol_saved(value,profile);
+    when is_err(original) { term Err(unwrap_err(original)); };
+    let rating: Result<ProfileRating,String> = protocol_rating(value);
+    when is_err(rating) { term Err(unwrap_err(rating)); };
+    term Ok(AcceptedRating(RatingAccepted { profile: profile, operation_id: unwrap(original).operation_id, delta: unwrap(rating) }));
+};
+defn protocol_decode_saved(value: JsonValue, profile: ProfileVersion) -> Result<RatingEvent,String> {
+    let saved: Result<RatingSaved,String> = protocol_saved(value,profile);
+    when is_err(saved) { term Err(unwrap_err(saved)); };
+    term Ok(SavedRating(unwrap(saved)));
+};
+defn protocol_decode_failure(value: JsonValue, profile: ProfileVersion) -> Result<RatingEvent,String> {
+    let failure: RatingSaveFailed = RatingSaveFailed { profile: profile,
+        operation_id: protocol_text(protocol_member(value,"operation_id")),
+        error: protocol_text(protocol_member(value,"error")), message: protocol_text(protocol_member(value,"message")),
+        retryable: protocol_boolean(protocol_member(value,"retryable")) };
+    when !protocol_failure_valid(failure) || !protocol_is_boolean(protocol_member(value,"retryable")) { term Err("Supply an operation, error code, actionable message and boolean retryability."); };
+    term Ok(FailedRating(failure));
+};
+defn protocol_decode_result(value: JsonValue, profile: ProfileVersion) -> Result<RatingEvent,String> {
+    let tag: Result<PredictionTag,String> = protocol_prediction_tag(value,profile);
+    when is_err(tag) { term Err(unwrap_err(tag)); };
+    let movies: Result<List<RankedMovie>,String> = protocol_movies(protocol_member(value,"recommendations"));
+    when is_err(movies) { term Err(unwrap_err(movies)); };
+    let cold: JsonValue = protocol_member(value,"cold_start");
+    when !protocol_is_boolean(cold) || (protocol_boolean(cold) && unwrap(movies) .^Length != 0) { term Err("Supply a boolean cold-start flag and no recommendations during cold start."); };
+    term Ok(PredictedRatings(RecommendationResult { tag: unwrap(tag), cold_start: protocol_boolean(cold), items: unwrap(movies) }));
+};
+defn protocol_counter_at_least(left: String, right: String) -> Bool {
+    when !protocol_counter(left) || !protocol_counter(right) { term false; };
+    when left .^Length != right .^Length { term left .^Length > right .^Length; };
+    foreach idx in 0..left .^Length {
+        when byte_at(left,idx) > byte_at(right,idx) { term true; };
+        when byte_at(left,idx) < byte_at(right,idx) { term false; };
+    };
+    term true;
+};
+defn protocol_decode_discard(value: JsonValue, profile: ProfileVersion) -> Result<RatingEvent,String> {
+    let original: Result<RatingSaved,String> = protocol_saved(value,profile);
+    when is_err(original) { term Err(unwrap_err(original)); };
+    let revision: String = protocol_text(protocol_member(value,"profile_revision"));
+    let ratings: Result<List<ProfileRating>,String> = protocol_ratings(protocol_member(value,"ratings"));
+    when is_err(ratings) { term Err(unwrap_err(ratings)); };
+    when !protocol_counter_at_least(revision,profile.revision) { term Err("The resolved profile revision cannot precede the discarded operation."); };
+    term Ok(DiscardedRating(RatingDiscarded { original: unwrap(original), profile_revision: revision, ratings: unwrap(ratings) }));
+};
+defn protocol_decode_event(text: String) -> Result<RatingEvent,String> {
+    let parsed: Result<JsonValue,String> = protocol_document(text);
+    when is_err(parsed) { term Err(unwrap_err(parsed)); };
+    let value: JsonValue = unwrap(parsed);
+    let version: Result<ProfileVersion,String> = protocol_profile(value);
+    when is_err(version) { term Err(unwrap_err(version)); };
+    let profile: ProfileVersion = unwrap(version);
+    let kind: String = protocol_text(protocol_member(value,"type"));
+    when kind == "accepted" { term protocol_decode_accepted(value,profile); };
+    when kind == "saved" { term protocol_decode_saved(value,profile); };
+    when kind == "save-failed" { term protocol_decode_failure(value,profile); };
+    when kind == "recommendations" { term protocol_decode_result(value,profile); };
+    when kind == "discarded" { term protocol_decode_discard(value,profile); };
+    term Err("Unknown event type; reload a compatible application.");
+};

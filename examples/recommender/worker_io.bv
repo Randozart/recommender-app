@@ -1,0 +1,161 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./worker_framing.bv";
+import "std/posix/syscall.bv";
+
+const WORKER_F_GETFL: Int = 3;
+const WORKER_F_SETFL: Int = 4;
+const WORKER_O_NONBLOCK: Int = 2048;
+const WORKER_EAGAIN: Int = -11;
+const WORKER_EINTR: Int = -4;
+const WORKER_MSG_NOSIGNAL: Int = 16384;
+
+obj WorkerChannel {
+    fd: Int;
+    pid: Int;
+    role: String;
+    epoch: String;
+    ready: Bool;
+    partial_read: Bool;
+    tx: GrowBuf;
+    tx_offset: Int;
+    rx: GrowBuf;
+    terminal: Int;
+};
+obj WorkerReceived { channel: WorkerChannel; frame: WorkerFrame; };
+
+defn worker_channel_open(fd: Int, pid: Int, role: String, epoch: String) -> Result<WorkerChannel,String> {
+    when fd < 0 || pid <= 0 || (role != "prediction" && role != "persistence") || !protocol_hex(epoch,32) { term Err("Worker channel requires an open endpoint, valid role, epoch and child process ID."); };
+    let tx: GrowBuf = grow_new(1);
+    let rx: GrowBuf = grow_new(65544);
+    let valid: Bool = tx.ptr != 0 && rx.ptr != 0;
+    when !valid {
+        when tx.ptr != 0 { grow_free(tx); };
+        when rx.ptr != 0 { grow_free(rx); };
+        syscall(SYS_CLOSE,fd);
+        term Err("Cannot allocate the bounded worker channel buffers.");
+    };
+    let flags: Int = syscall(SYS_FCNTL,fd,WORKER_F_GETFL,0);
+    when flags < 0 || syscall(SYS_FCNTL,fd,WORKER_F_SETFL,flags|WORKER_O_NONBLOCK) < 0 {
+        grow_free(tx); grow_free(rx); syscall(SYS_CLOSE,fd);
+        term Err("Cannot make the worker IPC endpoint nonblocking.");
+    };
+    term Ok(WorkerChannel { fd: fd, pid: pid, role: role, epoch: epoch, ready: false, partial_read: false,
+        tx: tx, tx_offset: 0, rx: rx, terminal: 0 });
+};
+
+defn worker_channel_close(channel: WorkerChannel) -> WorkerChannel {
+    when channel.fd >= 0 { syscall(SYS_CLOSE,channel.fd); };
+    when channel.tx.ptr != 0 { grow_free(channel.tx); };
+    when channel.rx.ptr != 0 { grow_free(channel.rx); };
+    term WorkerChannel { fd: -1, pid: channel.pid, role: channel.role, epoch: channel.epoch, ready: false, partial_read: false,
+        tx: GrowBuf { ptr: 0, len: 0, cap: 0 },
+        tx_offset: 0, rx: GrowBuf { ptr: 0, len: 0, cap: 0 }, terminal: 1 };
+};
+
+// Release buffers after worker_child_poll has already closed/reaped the child
+// endpoint; this variant never closes the descriptor a second time.
+defn worker_channel_release_after_child(channel: WorkerChannel) -> WorkerChannel {
+    when channel.tx.ptr != 0 { grow_free(channel.tx); };
+    when channel.rx.ptr != 0 { grow_free(channel.rx); };
+    term WorkerChannel { fd: -1, pid: channel.pid, role: channel.role, epoch: channel.epoch, ready: false, partial_read: false,
+        tx: GrowBuf { ptr: 0, len: 0, cap: 0 },
+        tx_offset: 0, rx: GrowBuf { ptr: 0, len: 0, cap: 0 }, terminal: 1 };
+};
+
+// Enqueue exactly one complete frame. A channel has at most one outstanding
+// frame in each direction; callers reserve job capacity before admission.
+defn worker_channel_queue(channel: WorkerChannel, payload: String) -> Result<WorkerChannel,String> {
+    when channel.fd < 0 || channel.terminal != 0 || !channel.ready || channel.tx.ptr == 0 || channel.rx.ptr == 0 || channel.tx_offset < channel.tx.len {
+        term Err("Worker channel is not ready, is unavailable, or already has a queued request.");
+    };
+    let encoded: Result<GrowBuf,String> = worker_frame_encode(payload);
+    when is_err(encoded) { term Err(unwrap_err(encoded)); };
+    grow_free(channel.tx);
+    term Ok(WorkerChannel { fd: channel.fd, pid: channel.pid, role: channel.role, epoch: channel.epoch,
+        ready: channel.ready, partial_read: channel.partial_read, tx: unwrap(encoded),
+        tx_offset: 0, rx: channel.rx, terminal: 0 });
+};
+
+// Advance nonblocking output by one syscall. EAGAIN/EINTR preserve the suffix;
+// fatal errors close the endpoint so the supervisor can restart/reconcile it.
+defn worker_channel_write(channel: WorkerChannel) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || channel.tx_offset >= channel.tx.len { term channel; };
+    let sent: Int = syscall(SYS_SEND,channel.fd,channel.tx.ptr+channel.tx_offset,channel.tx.len-channel.tx_offset,WORKER_MSG_NOSIGNAL);
+    when sent == WORKER_EAGAIN || sent == WORKER_EINTR { term channel; };
+    when sent <= 0 { term worker_channel_close(channel); };
+    let offset: Int = channel.tx_offset+sent;
+    when offset < channel.tx.len { term WorkerChannel { fd: channel.fd, pid: channel.pid, role: channel.role,
+        epoch: channel.epoch, ready: channel.ready, partial_read: channel.partial_read,
+        tx: channel.tx, tx_offset: offset, rx: channel.rx, terminal: 0 }; };
+    term WorkerChannel { fd: channel.fd, pid: channel.pid, role: channel.role, epoch: channel.epoch,
+        ready: channel.ready, partial_read: channel.partial_read, tx: channel.tx,
+        tx_offset: channel.tx.len, rx: channel.rx, terminal: 0 };
+};
+
+// Read at most the remaining protocol budget plus header room. Malformed or
+// oversized frames terminate the channel before a payload-sized allocation.
+defn worker_channel_read(channel: WorkerChannel) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || channel.rx.ptr == 0 || channel.rx.cap != 65544 { term worker_channel_close(channel); };
+    when channel.rx.len >= 65544 { term channel; };
+    let room: Int = 65544-channel.rx.len;
+    let next: GrowBuf = channel.rx;
+    let received: Int = syscall(SYS_RECV,channel.fd,next.ptr+next.len,room,0);
+    when received == WORKER_EAGAIN || received == WORKER_EINTR {
+        term WorkerChannel { fd: channel.fd, pid: channel.pid, role: channel.role, epoch: channel.epoch,
+            ready: channel.ready, partial_read: channel.partial_read, tx: channel.tx,
+            tx_offset: channel.tx_offset, rx: next, terminal: 0 };
+    };
+    when received <= 0 { term worker_channel_close(WorkerChannel { fd: channel.fd,
+        role: channel.role, epoch: channel.epoch, ready: channel.ready, partial_read: channel.partial_read,
+        pid: channel.pid, tx: channel.tx, tx_offset: channel.tx_offset,
+        rx: next, terminal: 0 }); };
+    let filled: GrowBuf = GrowBuf { ptr: next.ptr, len: next.len+received, cap: next.cap };
+    let view: ByteBuf = ByteBuf { ptr: filled.ptr, len: filled.len, cap: filled.cap };
+    let frame_size: Int = worker_frame_size(view);
+    when frame_size < 0 || filled.len > 65544 { term worker_channel_close(WorkerChannel { fd: channel.fd,
+        pid: channel.pid, role: channel.role, epoch: channel.epoch, ready: channel.ready, partial_read: channel.partial_read,
+        tx: channel.tx, tx_offset: channel.tx_offset, rx: filled, terminal: 0 }); };
+    let ready: Bool = worker_channel_ready(channel,view,frame_size);
+    when !ready && !channel.ready && frame_size > 0 && filled.len >= frame_size { term worker_channel_close(WorkerChannel { fd: channel.fd, pid: channel.pid,
+        role: channel.role, epoch: channel.epoch, ready: channel.ready, partial_read: channel.partial_read, tx: channel.tx,
+        tx_offset: channel.tx_offset, rx: filled, terminal: 0 }); };
+    let partial_read: Bool = channel.partial_read || (filled.len > 0 && (frame_size == 0 || filled.len < frame_size));
+    term WorkerChannel { fd: channel.fd, pid: channel.pid, role: channel.role, epoch: channel.epoch,
+        ready: ready, partial_read: partial_read, tx: channel.tx,
+        tx_offset: channel.tx_offset, rx: filled, terminal: 0 };
+};
+
+defn worker_channel_take(channel: WorkerChannel) -> Result<WorkerReceived,String> {
+    let view: ByteBuf = ByteBuf { ptr: channel.rx.ptr, len: channel.rx.len, cap: channel.rx.cap };
+    let decoded: Result<WorkerFrame,String> = worker_frame_decode(view);
+    when is_err(decoded) { term Err(unwrap_err(decoded)); };
+    let frame: WorkerFrame = unwrap(decoded);
+    let remaining: Int = channel.rx.len-frame.consumed;
+    let suffix: GrowBuf = grow_new(65544);
+    when suffix.ptr == 0 {
+        Free#(((frame.text as Data) as Int) as Ptr);
+        term Err("Cannot retain the bounded suffix after consuming a worker frame.");
+    };
+    when remaining > 0 { Copy#(suffix.ptr,channel.rx.ptr+frame.consumed,remaining); };
+    let retained: GrowBuf = GrowBuf { ptr: suffix.ptr, len: remaining, cap: suffix.cap };
+    grow_free(channel.rx);
+    let updated: WorkerChannel = WorkerChannel { fd: channel.fd, pid: channel.pid,
+        role: channel.role, epoch: channel.epoch, ready: channel.ready, partial_read: false,
+        tx: channel.tx, tx_offset: channel.tx_offset, rx: retained, terminal: channel.terminal };
+    term Ok(WorkerReceived { channel: updated, frame: frame });
+};
+
+defn worker_channel_ready(channel: WorkerChannel, buffer: ByteBuf, frame_size: Int) -> Bool {
+    when channel.ready { term true; };
+    when frame_size <= 0 || buffer.len < frame_size { term false; };
+    let decoded_frame: Result<WorkerFrame,String> = worker_frame_decode(buffer);
+    when is_err(decoded_frame) { term false; };
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(unwrap(decoded_frame).text);
+    when is_err(decoded) { term false; };
+    let message: WorkerMessage = unwrap(decoded);
+    term message.kind == "started" && worker_message_valid(message) && message.tag.profile.server_epoch == channel.epoch &&
+        message.tag.profile.account_id == 0 && message.tag.profile.revision == "0" &&
+        protocol_text(protocol_member(message.payload,"role")) == channel.role;
+};

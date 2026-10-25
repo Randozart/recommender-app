@@ -1,0 +1,153 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/net/socket.bv";
+import { syscall, SYS_POLL } from "std/posix/syscall.bv";
+
+obj Reactor { listener: Int; polls: Int; connections: Int; capacity: Int; };
+
+defn reactor_first_error(first: Int, second: Int) -> Int {
+    when first < 0 { term first; };
+    term second;
+};
+
+defn reactor_listener_interest(slot: Int) -> Int {
+    when slot < 0 { term 0; };
+    term 1;
+};
+// 2026-10-21: stable slots bound memory independently of kernel fd numbers.
+// Each 128-byte row owns fd, account, upgraded, owner, parse length, input ptr,
+// output ptr, sent offset, phase, output length, input capacity, fragment ptr,
+// fragment length, fragment opcode, close-after-write and read-EOF.
+// Buffer pointers start null; lifecycle code owns their allocation. Replace
+// this raw table when the language supplies mutable indexed object storage.
+defn reactor_row(reactor: Reactor, slot: Int)
+    [slot >= 0 && slot < reactor.capacity][true] -> Int {
+    term reactor.connections + slot * 128;
+};
+
+defn reactor_clear_words(address: Int, count: Int) [count >= 0][true] -> Bool {
+    when count == 0 { term true; };
+    Store#(address, 0, 8);
+    reactor_clear_words(address + 8, count - 1);
+    term true;
+};
+
+defn reactor_init_slots(reactor: Reactor, slot: Int) -> Bool {
+    when slot >= reactor.capacity { term true; };
+    let row: Int = reactor_row(reactor, slot);
+    reactor_clear_words(row, 16);
+    Store#(row, -1, 8);
+    Store#(reactor.polls + (slot + 1) * 8, 4294967295, 8);
+    reactor_init_slots(reactor, slot + 1);
+    term true;
+};
+
+defn reactor_free_slot(reactor: Reactor, slot: Int) -> Int {
+    when slot < 0 || slot >= reactor.capacity { term -1; };
+    when Load#(reactor_row(reactor, slot), 8) == -1 { term slot; };
+    term reactor_free_slot(reactor, slot + 1);
+};
+
+defn reactor_find(reactor: Reactor, fd: Int, slot: Int) -> Int {
+    when fd < 0 || slot < 0 || slot >= reactor.capacity { term -1; };
+    when Load#(reactor_row(reactor, slot), 8) == fd { term slot; };
+    term reactor_find(reactor, fd, slot + 1);
+};
+
+defn reactor_open(port: Int, capacity: Int) -> Reactor {
+    let failed: Reactor = Reactor { listener: -22, polls: 0, connections: 0, capacity: 0 };
+    when port < 0 || port > 65535 || capacity < 1 || capacity > 65535 { term failed; };
+    let listener: Socket = sock_tcp();
+    when listener.fd < 0 { term Reactor { listener: listener.fd, polls: 0, connections: 0, capacity: 0 }; };
+    let bound: Int = sock_bind_listen(listener, port, capacity);
+    let nonblocking: Int = sock_set_nonblocking(listener);
+    when bound < 0 || nonblocking < 0 {
+        let closed: Int = sock_close(listener);
+        let error: Int = reactor_first_error(bound, nonblocking);
+        term Reactor { listener: error, polls: 0, connections: 0, capacity: 0 };
+    };
+    let polls: Int = Malloc#((capacity + 1) * 8) as Int;
+    let connections: Int = Malloc#(capacity * 128) as Int;
+    when polls == 0 || connections == 0 {
+        Free#(polls as Ptr);
+        Free#(connections as Ptr);
+        let closed: Int = sock_close(listener);
+        term Reactor { listener: -12, polls: 0, connections: 0, capacity: 0 };
+    };
+    let reactor: Reactor = Reactor { listener: listener.fd, polls: polls, connections: connections, capacity: capacity };
+    Store#(polls, listener.fd, 4);
+    Store#(polls + 4, 1, 4);
+    reactor_init_slots(reactor, 0);
+    term reactor;
+};
+
+defn reactor_remove(reactor: Reactor, slot: Int)
+    [slot >= 0 && slot < reactor.capacity][true] -> Bool {
+    let row: Int = reactor_row(reactor, slot);
+    let fd: Int = Load#(row, 8);
+    when fd == -1 { term true; };
+    let closed: Int = sock_close(Socket { fd: fd });
+    Free#(Load#(row + 40, 8) as Ptr);
+    Free#(Load#(row + 48, 8) as Ptr);
+    Free#(Load#(row + 88, 8) as Ptr);
+    reactor_clear_words(row, 16);
+    Store#(row, -1, 8);
+    Store#(reactor.polls + (slot + 1) * 8, 4294967295, 8);
+    term true;
+};
+
+defn reactor_close_slots(reactor: Reactor, slot: Int) -> Bool {
+    when slot >= reactor.capacity { term true; };
+    reactor_remove(reactor, slot);
+    reactor_close_slots(reactor, slot + 1);
+    term true;
+};
+
+defn reactor_close(reactor: Reactor) -> Bool {
+    when reactor.listener < 0 { term true; };
+    reactor_close_slots(reactor, 0);
+    let closed: Int = sock_close(Socket { fd: reactor.listener });
+    Free#(reactor.polls as Ptr);
+    Free#(reactor.connections as Ptr);
+    term true;
+};
+
+defn reactor_accept_ready(reactor: Reactor, slot: Int) -> Int {
+    when slot < 0 { term 0; };
+    let peer: Socket = sock_accept(Socket { fd: reactor.listener });
+    when peer.fd == -11 || peer.fd == -4 { term 0; };
+    when peer.fd < 0 { term peer.fd; };
+    let nonblocking: Int = sock_set_nonblocking(peer);
+    when nonblocking < 0 { let closed: Int = sock_close(peer); term nonblocking; };
+    Store#(reactor_row(reactor, slot), peer.fd, 8);
+    let record: Int = reactor.polls + (slot + 1) * 8;
+    Store#(record, peer.fd, 4);
+    Store#(record + 4, 1, 4);
+    term 1;
+};
+
+// 2026-10-21: one accept per readiness sweep bounds listener work. Disabled
+// listener interest at capacity avoids spinning on a permanently ready queue.
+// HUP/ERR remain visible to lifecycle code so buffered input is not discarded.
+// Replace the acceptance bound only with a measured fair scheduling policy.
+defn reactor_poll(reactor: Reactor, timeout: Int) -> Int {
+    when reactor.listener < 0 || timeout < -1 { term -22; };
+    let slot: Int = reactor_free_slot(reactor, 0);
+    let interest: Int = reactor_listener_interest(slot);
+    Store#(reactor.polls + 4, interest, 4);
+    let ready: Int = syscall(SYS_POLL, reactor.polls, reactor.capacity + 1, timeout);
+    when ready == -4 { term 0; };
+    when ready <= 0 { term ready; };
+    when (Load#(reactor.polls + 6, 2) & 56) != 0 { term -9; };
+    when (Load#(reactor.polls + 6, 2) & 1) != 0 {
+        let accepted: Int = reactor_accept_ready(reactor, slot);
+        when accepted < 0 { term accepted; };
+    };
+    term ready;
+};
+
+defn reactor_events(reactor: Reactor, slot: Int)
+    [slot >= 0 && slot < reactor.capacity][true] -> Int {
+    term Load#(reactor.polls + (slot + 1) * 8 + 6, 2);
+};

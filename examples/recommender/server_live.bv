@@ -1,0 +1,131 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_state.bv";
+
+defn live_key_valid(key: String) -> Bool {
+    when key .^Length != 24 || key[22:24] != "==" { term false; };
+    let alphabet: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    foreach idx in 0..22 { when str_find(alphabet,key[idx:idx+1]) < 0 { term false; }; };
+    term str_find("AQgw",key[21:22]) >= 0;
+};
+
+defn live_connection_token(header: String, offset: Int) -> Bool {
+    when offset >= header .^Length { term false; };
+    let end: Int = str_find_from(header,",",offset);
+    when end < 0 { end = header .^Length; };
+    let token: String = io_trim(header[offset:end]);
+    when str_eq_ci(token,"upgrade") { term true; };
+    term live_connection_token(header,end+1);
+};
+
+defn live_upgrade(state: ServerState, slot: Int, request: HttpRequest) -> ServerState {
+    let key: String = io_header(request,"Sec-WebSocket-Key");
+    let valid: Bool = request.method == "GET" && str_eq_ci(io_header(request,"Upgrade"),"websocket") &&
+        io_header(request,"Sec-WebSocket-Version") == "13" &&
+        live_connection_token(io_header(request,"Connection"),0) && live_key_valid(key);
+    when !valid { io_http_reply(state.reactor,slot,400,"{\"error\":\"invalid-upgrade\"}"); term state; };
+    let token: String = api_token(request.path);
+    let owner: Int = session_account(state.sessions,token);
+    when owner <= 0 || server_owner_view(state.views,owner) .^Length == 0 {
+        let error: ApiReply = api_error("auth-failed",state.sessions);
+        io_http_reply(state.reactor,slot,error.status,error.body); term state;
+    };
+    let row: Int = reactor_row(state.reactor,slot);
+    Store#(row+8,owner,8); Store#(row+24,owner,8);
+    Store#(row+16,1,8); Store#(row+64,2,8);
+    let normalized: HttpRequest = HttpRequest { method: request.method, path: request.path,
+        headers: "Sec-WebSocket-Key: "+key, body: "" };
+    io_queue(state.reactor,slot,ws_handshake_response(normalized));
+    term server_track_live_session(state,slot,owner,token);
+};
+
+defn live_text(state: ServerState, slot: Int, text: String) -> ServerState {
+    when !io_utf8(text,0) { io_ws_close(state.reactor,slot,1007); term state; };
+    api_trace(text,"");
+    let owner: Int = Load#(reactor_row(state.reactor,slot)+24,8);
+    let fd: Int = Load#(reactor_row(state.reactor,slot),8);
+    let token: String = server_live_session_token(state,slot,fd,0);
+    when token .^Length == 0 { io_ws_close(state.reactor,slot,1008); term state; };
+    let command: Result<RatingCommand,String> = protocol_decode_command(text);
+    when is_err(command) { io_queue(state.reactor,slot,ws_encode_text("{\"error\":\"validation\"}")); term state; };
+    let dispatched: ServerAdmissionResult = server_dispatch_admission(state,owner,token,unwrap(command));
+    when !dispatched.accepted { io_queue(state.reactor,slot,ws_encode_text(dispatched.body)); };
+    term dispatched.state;
+};
+
+defn live_close_payload_code(payload: String) -> Int {
+    when payload .^Length == 0 { term 0; };
+    when payload .^Length == 1 { term 1002; };
+    let code: Int = byte_at(payload,0)*256 + byte_at(payload,1);
+    when code < 1000 || code >= 5000 || code == 1004 || code == 1005 || code == 1006 || code == 1015 ||
+        (code >= 1016 && code < 3000) { term 1002; };
+    when !io_utf8(payload[2:payload .^Length],0) { term 1007; };
+    term 0;
+};
+
+defn live_control(state: ServerState, slot: Int, frame: WsFrame, message: WsMessage) -> ServerState {
+    let data: Int = (message.payload as Data) as Int;
+    when frame.opcode == 8 {
+        let error: Int = live_close_payload_code(message.payload);
+        when error != 0 { io_ws_close(state.reactor,slot,error); term state; };
+        Store#(reactor_row(state.reactor,slot)+112,1,8);
+        io_queue(state.reactor,slot,ws_encode(grow_new(128),true,8,false,0,data+8,message.payload .^Length));
+        term state;
+    };
+    when frame.opcode == 9 { io_queue(state.reactor,slot,ws_encode(grow_new(128),true,10,false,0,data+8,message.payload .^Length)); };
+    term state;
+};
+
+defn live_fragment(state: ServerState, slot: Int, frame: WsFrame, message: WsMessage) -> ServerState {
+    let row: Int = reactor_row(state.reactor,slot);
+    let pending: Int = Load#(row+104,8);
+    when (frame.opcode == 0 && pending == 0) || (frame.opcode == 1 && pending != 0) {
+        io_ws_close(state.reactor,slot,1002); term state;
+    };
+    when frame.opcode == 1 && frame.fin { term live_text(state,slot,message.payload); };
+    let length: Int = Load#(row+96,8);
+    when message.payload .^Length > SERVER_INPUT_LIMIT - length { io_ws_close(state.reactor,slot,1009); term state; };
+    let memory: Int = Load#(row+88,8);
+    when memory == 0 {
+        memory = Malloc#(SERVER_INPUT_LIMIT) as Int;
+        when memory == 0 { reactor_remove(state.reactor,slot); term server_forget_live_session(state,slot); };
+        Store#(row+88,memory,8);
+    };
+    Copy#((memory+length) as Ptr,(((message.payload as Data) as Int)+8) as Ptr,message.payload .^Length);
+    Store#(row+96,length+message.payload .^Length,8); Store#(row+104,1,8);
+    when !frame.fin { term state; };
+    let assembled: String = buf_slice_string(ByteBuf { ptr: memory, len: length+message.payload .^Length, cap: SERVER_INPUT_LIMIT },0,length+message.payload .^Length);
+    Free#(memory as Ptr); Store#(row+88,0,8); Store#(row+96,0,8); Store#(row+104,0,8);
+    term live_text(state,slot,assembled);
+};
+
+defn live_frame(state: ServerState, slot: Int, frame: WsFrame, message: WsMessage) -> ServerState {
+    when frame.opcode >= 8 { term live_control(state,slot,frame,message); };
+    when frame.opcode == 2 { io_ws_close(state.reactor,slot,1003); term state; };
+    term live_fragment(state,slot,frame,message);
+};
+
+defn live_frames(state: ServerState, slot: Int, budget: Int) -> ServerState {
+    let row: Int = reactor_row(state.reactor,slot);
+    when budget <= 0 || Load#(row,8) < 0 || Load#(row+112,8) != 0 { term state; };
+    let input: ByteBuf = io_buffer(state.reactor,slot);
+    when input.len < 2 { term state; };
+    let decoded: Result<WsFrame,String> = ws_decode(input,0);
+    when is_err(decoded) {
+        when unwrap_err(decoded) != "incomplete" { io_ws_close(state.reactor,slot,1002); };
+        term state;
+    };
+    let frame: WsFrame = unwrap(decoded);
+    when !frame.masked || (Load#(input.ptr,1) & 112) != 0 ||
+        (frame.opcode > 2 && frame.opcode < 8) || frame.opcode > 10 ||
+        (frame.opcode >= 8 && (!frame.fin || frame.payload_len > 125)) {
+        io_ws_close(state.reactor,slot,1002); term state;
+    };
+    when frame.payload_len > SERVER_INPUT_LIMIT - frame.header_len { io_ws_close(state.reactor,slot,1009); term state; };
+    when frame.header_len + frame.payload_len > input.len { term state; };
+    let message: WsMessage = ws_message(input,0);
+    io_consume(state.reactor,slot,message.consumed);
+    let updated: ServerState = live_frame(state,slot,frame,message);
+    term live_frames(updated,slot,budget-1);
+};

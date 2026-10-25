@@ -1,0 +1,101 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_values.bv";
+
+defn protocol_profile(value: JsonValue) -> Result<ProfileVersion,String> {
+    let profile: ProfileVersion = ProfileVersion {
+        server_epoch: protocol_text(protocol_member(value,"server_epoch")),
+        account_id: protocol_integer(protocol_member(value,"account_id")),
+        revision: protocol_text(protocol_member(value,"revision")) };
+    when !protocol_version_valid(profile) { term Err("Supply a valid epoch, positive account ID and canonical decimal revision string."); };
+    term Ok(profile);
+};
+defn protocol_fields(profile: ProfileVersion, kind: String) -> List<(String,JsonValue)> {
+    term [("v",IntVal(RECOMMENDER_PROTOCOL)),("type",StrVal(kind)),
+        ("server_epoch",StrVal(profile.server_epoch)),("account_id",IntVal(profile.account_id)),
+        ("revision",StrVal(profile.revision))];
+};
+defn protocol_decode_command(text: String) -> Result<RatingCommand,String> {
+    let parsed: Result<JsonValue,String> = protocol_document(text);
+    when is_err(parsed) { term Err(unwrap_err(parsed)); };
+    term protocol_command_value(unwrap(parsed));
+};
+defn protocol_command_value(value: JsonValue) -> Result<RatingCommand,String> {
+    let command: RatingCommand = RatingCommand {
+        server_epoch: protocol_text(protocol_member(value,"server_epoch")),
+        operation_id: protocol_text(protocol_member(value,"operation_id")),
+        item_id: protocol_integer(protocol_member(value,"item_id")),
+        rating: protocol_integer(protocol_member(value,"rating")) };
+    when !protocol_object(value) || !protocol_command_valid(command) {
+        term Err("Use an epoch-prefixed operation ID, item 0..1681 and integer rating 1..5.");
+    };
+    term Ok(command);
+};
+defn protocol_command_fields(command: RatingCommand) -> List<(String,JsonValue)> {
+    term [("v",IntVal(RECOMMENDER_PROTOCOL)),("server_epoch",StrVal(command.server_epoch)),
+        ("operation_id",StrVal(command.operation_id)),("item_id",IntVal(command.item_id)),("rating",IntVal(command.rating))];
+};
+defn protocol_encode_command(command: RatingCommand) -> Result<String,String> {
+    when !protocol_command_valid(command) { term Err("Supply a valid rating command before sending it."); };
+    term protocol_encode_object(protocol_command_fields(command));
+};
+defn protocol_require_current_epoch(command: RatingCommand, epoch: String) -> Result<RatingCommand,String> {
+    when !protocol_command_valid(command) || !protocol_hex(epoch,32) { term Err("Supply a valid rating command and server epoch."); };
+    when command.server_epoch != epoch { term Err("The server epoch changed; check durable receipts and current ratings before deliberately resubmitting with a new operation ID."); };
+    term Ok(command);
+};
+defn protocol_same_command(left: RatingCommand, right: RatingCommand) -> Bool {
+    term left.server_epoch == right.server_epoch && left.operation_id == right.operation_id &&
+        left.item_id == right.item_id && left.rating == right.rating;
+};
+defn protocol_rating(value: JsonValue) -> Result<ProfileRating,String> {
+    let rating: ProfileRating = ProfileRating { item_id: protocol_integer(protocol_member(value,"item_id")),
+        rating: protocol_integer(protocol_member(value,"rating")) };
+    when !protocol_object(value) || !protocol_rating_valid(rating) { term Err("Use unique rating fields, item 0..1681 and integer rating 1..5."); };
+    term Ok(rating);
+};
+defn protocol_ratings(value: JsonValue) -> Result<List<ProfileRating>,String> {
+    let entries: List<JsonValue> = protocol_array(value);
+    when !protocol_is_array(value) || entries .^Length > PROTOCOL_ITEMS { term Err("Supply at most 1682 ratings in ascending item order."); };
+    let ratings: List<ProfileRating> = [];
+    let previous: Int = -1;
+    foreach idx in 0..entries .^Length {
+        let decoded: Result<ProfileRating,String> = protocol_rating(entries[idx]);
+        when is_err(decoded) { term Err(unwrap_err(decoded)); };
+        let row: ProfileRating = unwrap(decoded);
+        when row.item_id <= previous { term Err("List each rated item once, in ascending item order."); };
+        ratings <- row;
+        previous = row.item_id;
+    };
+    term Ok(ratings);
+};
+defn protocol_ratings_value(ratings: List<ProfileRating>) -> Result<JsonValue,String> {
+    when ratings .^Length > PROTOCOL_ITEMS { term Err("Supply at most 1682 ratings."); };
+    let values: List<JsonValue> = [];
+    let previous: Int = -1;
+    foreach idx in 0..ratings .^Length {
+        let row: ProfileRating = ratings[idx];
+        when !protocol_rating_valid(row) || row.item_id <= previous { term Err("Supply valid unique ratings in ascending item order."); };
+        let pairs: List<(String,JsonValue)> = [("item_id",IntVal(row.item_id)),("rating",IntVal(row.rating))];
+        values <- Object(pairs);
+        previous = row.item_id;
+    };
+    term Ok(Array(values));
+};
+defn protocol_prediction_tag(value: JsonValue, profile: ProfileVersion) -> Result<PredictionTag,String> {
+    let generation: String = protocol_text(protocol_member(value,"model_generation"));
+    let job: String = protocol_text(protocol_member(value,"job_id"));
+    let attempt: Int = protocol_integer(protocol_member(value,"attempt"));
+    when !protocol_positive(generation) || !protocol_positive(job) || attempt < 1 || attempt > 65535 {
+        term Err("Supply positive decimal model/job strings and attempt 1..65535.");
+    };
+    term Ok(PredictionTag { profile: profile, model_generation: generation, job_id: job, attempt: attempt });
+};
+defn protocol_same_profile(left: ProfileVersion, right: ProfileVersion) -> Bool {
+    term left.server_epoch == right.server_epoch && left.account_id == right.account_id && left.revision == right.revision;
+};
+defn protocol_result_current(result: PredictionTag, profile: ProfileVersion, issued: PredictionTag) -> Bool {
+    term protocol_same_profile(result.profile,profile) && protocol_same_profile(result.profile,issued.profile) &&
+        result.model_generation == issued.model_generation && result.job_id == issued.job_id && result.attempt == issued.attempt;
+};

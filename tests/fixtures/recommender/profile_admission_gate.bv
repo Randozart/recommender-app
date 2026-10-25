@@ -1,0 +1,382 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/admission.bv";
+import "std/env.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+defn profile_fixture_command(epoch: String, nonce: String, item: Int, rating: Int) -> RatingCommand {
+    term RatingCommand { server_epoch: epoch, operation_id: unwrap(protocol_operation_id(epoch,nonce)), item_id: item, rating: rating };
+};
+
+defn profile_fixture_context(owner: Int, id: String) -> AdmissionContext {
+    let reservation: QueueReservation = QueueReservation { id: id, owner: owner, profile_bytes: 64, operation_bytes: 1024,
+        prediction_slot: true, persistence_slot: true };
+    term AdmissionContext { owner: owner, session_generation: "session-1", timestamp: "1", database_identity: "fixture-db",
+        reservation: ReservedAdmission(reservation) };
+};
+
+defn profile_fixture_large_context(owner: Int, id: String) -> AdmissionContext {
+    let reservation: QueueReservation = QueueReservation { id: id, owner: owner, profile_bytes: 4096, operation_bytes: 4096,
+        prediction_slot: true, persistence_slot: true };
+    term AdmissionContext { owner: owner, session_generation: "session-1", timestamp: "1", database_identity: "fixture-db",
+        reservation: ReservedAdmission(reservation) };
+};
+
+defn profile_fixture_nonce(index: Int) -> String {
+    match index {
+        0 => "11111111111111111111111111111111",
+        1 => "22222222222222222222222222222222",
+        2 => "33333333333333333333333333333333",
+        3 => "44444444444444444444444444444444",
+        4 => "55555555555555555555555555555555",
+        5 => "66666666666666666666666666666666",
+        6 => "77777777777777777777777777777777",
+        _ => "88888888888888888888888888888888",
+    }
+};
+
+defn profile_fixture_worker(saved: RatingSaved, job: String) -> WorkerTag {
+    term WorkerTag { profile: saved.profile, job_id: job, attempt: 1, model_generation: "0" };
+};
+
+defn profile_fixture_new(decision: AdmissionDecision, revision: String, owner: Int, item: Int, rating: Int, operation: String) -> Bool {
+    let accepted: Bool = match decision.outcome {
+        NewAdmission(value) => value.profile.revision == revision && value.profile.account_id == owner &&
+            value.delta.item_id == item && value.delta.rating == rating && value.operation_id == operation,
+        _ => false,
+    };
+    term accepted && decision.update.state.profiles .^Length == 1 && decision.update.state.operations .^Length == 1 &&
+        decision.update.actions .^Length == 3 && profile_distinct_count(decision.update.state,owner) == 1;
+};
+
+defn profile_fixture_known_revision(decision: AdmissionDecision, revision: String) -> Bool {
+    match decision.outcome { KnownAdmission(value) => value.accepted.profile.revision == revision, _ => false, }
+};
+
+defn profile_fixture_conflict(decision: AdmissionDecision) -> Bool {
+    match decision.outcome { AdmissionRejected(error) => error.code == "operation-conflict", _ => false, }
+};
+
+defn profile_fixture_reservation_rejected(decision: AdmissionDecision) -> Bool {
+    match decision.outcome { AdmissionRejected(error) => error.code == "reservation-required", _ => false, }
+};
+
+defn profile_fixture_new_revision(decision: AdmissionDecision, revision: String, owner: Int) -> Bool {
+    match decision.outcome { NewAdmission(value) => value.profile.revision == revision && value.profile.account_id == owner, _ => false, }
+};
+
+defn profile_fixture_admission_checks(epoch: String) -> Int {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 2, pending_global: 4, pending_owner: 2, receipt_slots: 4, retained_bytes: 65536 };
+    let state: AdmissionState = profile_empty(epoch,limits);
+    let command: RatingCommand = profile_fixture_command(epoch,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",9,4);
+    let insufficient: QueueReservation = QueueReservation { id: "small-reserve", owner: 7, profile_bytes: 0, operation_bytes: 1024,
+        prediction_slot: true, persistence_slot: true };
+    let small_context: AdmissionContext = AdmissionContext { owner: 7, session_generation: "session-1", timestamp: "1",
+        database_identity: "fixture-db", reservation: ReservedAdmission(insufficient) };
+    let denied: AdmissionDecision = profile_admit(state,small_context,command);
+    when !profile_fixture_reservation_rejected(denied) || denied.update.state.clock.revision != "0" || denied.update.state.operations .^Length != 0 { term 1; };
+    let first: AdmissionDecision = profile_admit(state,profile_fixture_context(7,"reserve-1"),command);
+    when !profile_fixture_new(first,"1",7,9,4,command.operation_id) { term 2; };
+    let large_limits: AdmissionLimits = AdmissionLimits { profiles: 16, pending_global: 16, pending_owner: 16,
+        receipt_slots: 16, retained_bytes: 65536 };
+    let saturated: AdmissionState = profile_fixture_fill_reservations(profile_empty(epoch,large_limits),epoch);
+    let held: AdmissionDecision = profile_admit(saturated,profile_fixture_large_context(8,"reserve-over-cap"),
+        profile_fixture_command(epoch,"88888888888888888888888888888888",10,2));
+    when match held.outcome { AdmissionRejected(error) => error.code == "memory-capacity", _ => false, } == false { term 3; };
+    let ordered: List<ProfileRating> = profile_upsert_rating([ProfileRating { item_id: 2, rating: 1 },ProfileRating { item_id: 9, rating: 3 }],
+        ProfileRating { item_id: 5, rating: 4 });
+    when ordered .^Length != 3 || ordered[0].item_id != 2 || ordered[1].item_id != 5 || ordered[2].item_id != 9 { term 4; };
+    let duplicate: AdmissionDecision = profile_admit(first.update.state,profile_fixture_context(7,"reserve-duplicate"),command);
+    when !profile_fixture_known_revision(duplicate,"1") ||
+        duplicate.update.state.clock.revision != "1" || duplicate.update.actions .^Length != 0 { term 5; };
+    let conflict: RatingCommand = profile_fixture_command(epoch,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",9,5);
+    when !profile_fixture_conflict(profile_admit(first.update.state,profile_fixture_context(7,"reserve-conflict"),conflict)) { term 6; };
+    let foreign: AdmissionDecision = profile_admit(first.update.state,profile_fixture_context(8,"reserve-foreign"),command);
+    when !profile_fixture_new_revision(foreign,"2",8) ||
+        foreign.update.state.profiles .^Length != 2 || foreign.update.state.profiles[0].version.account_id != 7 ||
+        profile_distinct_count(foreign.update.state,7) != 1 || profile_distinct_count(foreign.update.state,8) != 1 { term 7; };
+    let edit: RatingCommand = profile_fixture_command(epoch,"cccccccccccccccccccccccccccccccc",9,2);
+    let edited: AdmissionDecision = profile_admit(first.update.state,profile_fixture_context(7,"reserve-edit"),edit);
+    when !profile_fixture_new_revision(edited,"2",7) ||
+        profile_distinct_count(edited.update.state,7) != 1 || edited.update.state.profiles[0].ratings[0].rating != 2 { term 8; };
+    let too_many: AdmissionState = AdmissionState { clock: edited.update.state.clock,
+        limits: AdmissionLimits { profiles: 2, pending_global: 4, pending_owner: 2, receipt_slots: 1, retained_bytes: 65536 },
+        profiles: edited.update.state.profiles, operations: edited.update.state.operations };
+    let full: RatingCommand = profile_fixture_command(epoch,"dddddddddddddddddddddddddddddddd",10,3);
+    let refused: AdmissionDecision = profile_admit(too_many,profile_fixture_context(7,"reserve-full"),full);
+    let final_ok: Bool = match refused.outcome { AdmissionRejected(error) => error.code == "receipt-capacity", _ => false, } &&
+        refused.update.state.clock.revision == too_many.clock.revision && refused.update.state.operations .^Length == too_many.operations .^Length;
+    when !final_ok { term 9; };
+    term 0;
+};
+
+defn profile_fixture_fill_reservations(state: AdmissionState, epoch: String) -> AdmissionState {
+    let current: AdmissionState = state;
+    foreach idx in 0..7 {
+        let owner: Int = idx + 1;
+        let command: RatingCommand = profile_fixture_command(epoch,profile_fixture_nonce(idx),idx,2);
+        let decision: AdmissionDecision = profile_admit(current,profile_fixture_large_context(owner,"reserve-large-"+profile_fixture_nonce(idx)),command);
+        when match decision.outcome { NewAdmission(value) => false, _ => true, } { term state; };
+        current = decision.update.state;
+    };
+    term current;
+};
+
+defn profile_fixture_has_prediction_action(actions: List<ProfileAction>) -> Bool {
+    foreach idx in 0..actions .^Length { when profile_fixture_is_prediction_action(actions[idx]) { term true; }; };
+    term false;
+};
+
+defn profile_fixture_is_prediction_action(action: ProfileAction) -> Bool {
+    match action { ComputeProfile(version) => true, _ => false, }
+};
+
+defn profile_fixture_is_saved_action(action: ProfileAction, operation: String) -> Bool {
+    match action {
+        PublishEvent(event) => profile_fixture_saved_event(event,operation),
+        _ => false,
+    }
+};
+
+defn profile_fixture_saved_event(event: RatingEvent, operation: String) -> Bool {
+    match event { SavedRating(value) => value.operation_id == operation, _ => false, }
+};
+
+defn profile_fixture_is_discarded_action(action: ProfileAction, revision: String) -> Bool {
+    match action {
+        PublishEvent(event) => profile_fixture_discarded_event(event,revision),
+        _ => false,
+    }
+};
+
+defn profile_fixture_discarded_event(event: RatingEvent, revision: String) -> Bool {
+    match event { DiscardedRating(value) => value.profile_revision == revision && value.ratings .^Length == 0, _ => false, }
+};
+
+defn profile_fixture_is_saved_phase(phase: PersistencePhase) -> Bool {
+    match phase { PersistSaved() => true, _ => false, }
+};
+
+defn profile_fixture_is_discarded_phase(phase: PersistencePhase) -> Bool {
+    match phase { PersistDiscarded() => true, _ => false, }
+};
+
+defn profile_fixture_is_prediction_for(actions: List<ProfileAction>, version: ProfileVersion) -> Bool {
+    foreach idx in 0..actions .^Length {
+        when profile_fixture_prediction_matches(actions[idx],version) { term true; };
+    };
+    term false;
+};
+
+defn profile_fixture_prediction_matches(action: ProfileAction, version: ProfileVersion) -> Bool {
+    match action { ComputeProfile(value) => protocol_same_profile(value,version), _ => false, }
+};
+
+defn profile_fixture_operation_phase(state: AdmissionState, owner: Int, operation: String) -> PersistencePhase {
+    let idx: Int = profile_operation_at(state,owner,operation);
+    when idx < 0 { term PersistQueued(); };
+    term state.operations[idx].phase;
+};
+
+defn profile_fixture_command_version(decision: AdmissionDecision) -> ProfileVersion {
+    match decision.outcome {
+        NewAdmission(value) => value.profile,
+        _ => ProfileVersion { server_epoch: "", account_id: 0, revision: "0" },
+    }
+};
+
+defn profile_fixture_save_checks(epoch: String) -> Bool {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 2, pending_global: 4, pending_owner: 3, receipt_slots: 4, retained_bytes: 65536 };
+    let command: RatingCommand = profile_fixture_command(epoch,"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",17,5);
+    let decision: AdmissionDecision = profile_admit(profile_empty(epoch,limits),profile_fixture_context(12,"save-reserve"),command);
+    let profile: ProfileVersion = match decision.outcome {
+        NewAdmission(value) => value.profile,
+        _ => ProfileVersion { server_epoch: epoch, account_id: 12, revision: "0" },
+    };
+    let saved: RatingSaved = RatingSaved { profile: profile, operation_id: command.operation_id };
+    let dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(decision.update.state,saved,DispatchPersist(),"2");
+    when is_err(dispatched) { term false; };
+    let tag: WorkerTag = profile_fixture_worker(saved,"101");
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(unwrap(dispatched).state,saved,tag);
+    when is_err(bound) { term false; };
+    let committed: Result<ProfileUpdate,AdmissionError> = profile_save_transition(unwrap(bound).state,saved,tag,CommitPersist(),"");
+    when is_err(committed) { term false; };
+    let update: ProfileUpdate = unwrap(committed);
+    let busy: AdmissionState = profile_evict_idle(update.state,12);
+    let prior: ProfileSnapshot = update.state.profiles[0];
+    let ready: ProfileSnapshot = ProfileSnapshot { version: prior.version, ratings: prior.ratings, committed: prior.committed,
+        model_generation: prior.model_generation, prediction_running: NoOperationJob(), prediction_pending: false, last_active: prior.last_active };
+    let ready_profiles: List<ProfileSnapshot> = [ready];
+    let ready_state: AdmissionState = AdmissionState { clock: update.state.clock, limits: update.state.limits,
+        profiles: ready_profiles, operations: update.state.operations };
+    let evicted: AdmissionState = profile_evict_idle(ready_state,12);
+    term profile_fixture_is_saved_phase(update.state.operations[0].phase) && update.state.profiles[0].committed .^Length == 1 &&
+        update.state.profiles[0].ratings .^Length == 1 && update.actions .^Length == 1 &&
+        !profile_fixture_has_prediction_action(update.actions) &&
+        profile_fixture_is_saved_action(update.actions[0],command.operation_id) && busy.profiles .^Length == 1 && evicted.profiles .^Length == 0;
+};
+
+defn profile_fixture_cold_start_checks(epoch: String) -> Bool {
+    let four: List<ProfileRating> = [ProfileRating { item_id: 0, rating: 1 },ProfileRating { item_id: 1, rating: 2 },
+        ProfileRating { item_id: 2, rating: 3 },ProfileRating { item_id: 3, rating: 4 }];
+    let fifth: List<ProfileRating> = [ProfileRating { item_id: 4, rating: 5 }];
+    let five: List<ProfileRating> = four + fifth;
+    let version: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 13, revision: "1" };
+    let profile4: ProfileSnapshot = ProfileSnapshot { version: version, ratings: four, committed: four, model_generation: "1",
+        prediction_running: NoOperationJob(), prediction_pending: false, last_active: "1" };
+    let profile5: ProfileSnapshot = ProfileSnapshot { version: version, ratings: five, committed: five, model_generation: "1",
+        prediction_running: NoOperationJob(), prediction_pending: false, last_active: "1" };
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 2, pending_global: 2, pending_owner: 2, receipt_slots: 2, retained_bytes: 65536 };
+    let profile4_list: List<ProfileSnapshot> = [profile4];
+    let profile5_list: List<ProfileSnapshot> = [profile5];
+    let no_operations: List<OperationStatus> = [];
+    let state4: AdmissionState = AdmissionState { clock: RevisionClock { server_epoch: epoch, revision: "1" }, limits: limits,
+        profiles: profile4_list, operations: no_operations };
+    let state5: AdmissionState = AdmissionState { clock: RevisionClock { server_epoch: epoch, revision: "1" }, limits: limits,
+        profiles: profile5_list, operations: no_operations };
+    term profile_cold_start(state4,13) && !profile_cold_start(state5,13);
+};
+
+defn profile_fixture_stale_result_checks(epoch: String) -> Bool {
+    let old: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 14, revision: "1" };
+    let current: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 14, revision: "2" };
+    let job: WorkerTag = WorkerTag { profile: old, job_id: "7", attempt: 1, model_generation: "1" };
+    let rating: List<ProfileRating> = [ProfileRating { item_id: 1, rating: 4 }];
+    let empty_ratings: List<ProfileRating> = [];
+    let profile: ProfileSnapshot = ProfileSnapshot { version: current, ratings: rating, committed: empty_ratings, model_generation: "1",
+        prediction_running: OwnedOperationJob(job), prediction_pending: true, last_active: "1" };
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 1, pending_global: 2, pending_owner: 2, receipt_slots: 2, retained_bytes: 65536 };
+    let profile_list: List<ProfileSnapshot> = [profile];
+    let no_operations: List<OperationStatus> = [];
+    let state: AdmissionState = AdmissionState { clock: RevisionClock { server_epoch: epoch, revision: "2" }, limits: limits,
+        profiles: profile_list, operations: no_operations };
+    let tag: PredictionTag = PredictionTag { profile: old, model_generation: "1", job_id: "7", attempt: 1 };
+    let no_items: List<RankedMovie> = [];
+    let result: RecommendationResult = RecommendationResult { tag: tag, cold_start: false, items: no_items };
+    let update: ProfileUpdate = profile_prediction_complete(state,result);
+    term update.actions .^Length == 1 && profile_fixture_is_prediction_action(update.actions[0]) &&
+        update.state.profiles[0].version.revision == "2";
+};
+
+defn profile_fixture_hydration_checks(epoch: String) -> Bool {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 1, pending_global: 2, pending_owner: 2, receipt_slots: 2, retained_bytes: 65536 };
+    let source: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 16, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: source, job_id: "1", attempt: 1, model_generation: "1" };
+    let rows: List<ProfileRating> = [ProfileRating { item_id: 2, rating: 4 },ProfileRating { item_id: 8, rating: 3 }];
+    let hydrated: HydratedProfile = HydratedProfile { tag: tag, username: "sixteen", ratings: rows };
+    let result: Result<ProfileUpdate,AdmissionError> = profile_hydrate(profile_empty(epoch,limits),hydrated);
+    when is_err(result) { term false; };
+    let state: AdmissionState = unwrap(result).state;
+    when state.profiles .^Length != 1 || state.profiles[0].version.revision != "0" ||
+        state.profiles[0].ratings .^Length != 2 || state.profiles[0].committed[1].item_id != 8 { term false; };
+    let command: RatingCommand = profile_fixture_command(epoch,"12121212121212121212121212121212",9,5);
+    let accepted: AdmissionDecision = profile_admit(state,profile_fixture_context(16,"hydrate-reserve"),command);
+    when !profile_fixture_new_revision(accepted,"1",16) { term false; };
+    term is_err(profile_hydrate(accepted.update.state,hydrated));
+};
+
+defn profile_fixture_discard_checks(epoch: String) -> Int {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 1, pending_global: 3, pending_owner: 3, receipt_slots: 3, retained_bytes: 65536 };
+    let command: RatingCommand = profile_fixture_command(epoch,"ffffffffffffffffffffffffffffffff",22,5);
+    let admitted: AdmissionDecision = profile_admit(profile_empty(epoch,limits),profile_fixture_context(15,"discard-reserve"),command);
+    let profile: ProfileVersion = match admitted.outcome { NewAdmission(value) => value.profile, _ => ProfileVersion { server_epoch: epoch, account_id: 15, revision: "0" } };
+    let original: RatingSaved = RatingSaved { profile: profile, operation_id: command.operation_id };
+    let dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(admitted.update.state,original,DispatchPersist(),"2");
+    when is_err(dispatched) { term 1; };
+    let tag: WorkerTag = profile_fixture_worker(original,"102");
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(unwrap(dispatched).state,original,tag);
+    when is_err(bound) { term 2; };
+    let failed: Result<ProfileUpdate,AdmissionError> = profile_save_transition(unwrap(bound).state,original,tag,FailPersist(),"offline");
+    when is_err(failed) { term 3; };
+    let pending: AdmissionState = profile_evict_idle(unwrap(failed).state,15);
+    when pending.profiles .^Length != 1 { term 4; };
+    let discard: Result<ProfileUpdate,AdmissionError> = profile_discard_failed_head(unwrap(failed).state,15,command.operation_id);
+    when is_err(discard) { term 5; };
+    let requested: ProfileUpdate = unwrap(discard);
+    when requested.state.profiles[0].ratings .^Length != 0 || requested.state.profiles[0].version.revision != "2" ||
+        profile_fixture_has_prediction_action(requested.actions) || !requested.state.profiles[0].prediction_pending { term 6; };
+    let dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(requested.state,original,DispatchPersist(),"3");
+    when is_err(dispatched) { term 7; };
+    let tag: WorkerTag = profile_fixture_worker(original,"103");
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(unwrap(dispatched).state,original,tag);
+    when is_err(bound) { term 8; };
+    let committed: Result<ProfileUpdate,AdmissionError> = profile_save_transition(unwrap(bound).state,original,tag,CommitDiscard(),"");
+    when is_err(committed) { term 9; };
+    let complete: ProfileUpdate = unwrap(committed);
+    let complete_ok: Bool = profile_fixture_is_discarded_phase(complete.state.operations[0].phase) && complete.actions .^Length == 1 &&
+        profile_fixture_is_discarded_action(complete.actions[0],"2") &&
+        !profile_fixture_has_prediction_action(complete.actions) && requested.state.profiles[0].prediction_pending;
+    when !complete_ok { term 10; };
+    term 0;
+};
+
+defn profile_fixture_ordered_save_checks(epoch: String) -> Int {
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 1, pending_global: 3, pending_owner: 3, receipt_slots: 3, retained_bytes: 65536 };
+    let first_command: RatingCommand = profile_fixture_command(epoch,"11111111111111111111111111111111",1,4);
+    let first: AdmissionDecision = profile_admit(profile_empty(epoch,limits),profile_fixture_context(31,"ordered-1"),first_command);
+    let second_command: RatingCommand = profile_fixture_command(epoch,"22222222222222222222222222222222",2,5);
+    let second: AdmissionDecision = profile_admit(first.update.state,profile_fixture_context(31,"ordered-2"),second_command);
+    when profile_fixture_is_persist_action(second.update.actions,second_command.operation_id) { term 1; };
+    let second_saved: RatingSaved = RatingSaved { profile: profile_fixture_command_version(second), operation_id: second_command.operation_id };
+    let blocked_second: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(second.update.state,second_saved,DispatchPersist(),"2");
+    when !is_err(blocked_second) { term 12; };
+    let saved: RatingSaved = RatingSaved { profile: profile_fixture_command_version(first), operation_id: first_command.operation_id };
+    let dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(second.update.state,saved,DispatchPersist(),"2");
+    when is_err(dispatched) { term 2; };
+    let tag: WorkerTag = profile_fixture_worker(saved,"201");
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(unwrap(dispatched).state,saved,tag);
+    when is_err(bound) { term 3; };
+    let committed: Result<ProfileUpdate,AdmissionError> = profile_save_transition(unwrap(bound).state,saved,tag,CommitPersist(),"");
+    when is_err(committed) { term 4; };
+    let update: ProfileUpdate = unwrap(committed);
+    let next_dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(update.state,
+        second_saved,DispatchPersist(),"3");
+    let out_of_order_failure: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(update.state,
+        second_saved,FailPersist(),"3");
+    let first_still_pending: Bool = !profile_fixture_is_saved_phase(profile_fixture_operation_phase(update.state,31,second_command.operation_id));
+    let current: ProfileVersion = update.state.profiles[0].version;
+    when update.state.profiles[0].ratings .^Length != 2 || update.state.profiles[0].committed .^Length != 1 { term 5; };
+    when profile_fixture_is_prediction_for(update.actions,current) { term 6; };
+    when !first_still_pending { term 7; };
+    when !profile_fixture_is_persist_action(update.actions,second_command.operation_id) { term 8; };
+    when !profile_fixture_is_running(profile_fixture_operation_phase(unwrap(next_dispatched).state,31,second_command.operation_id)) { term 9; };
+    when !is_err(out_of_order_failure) { term 10; };
+    when !profile_fixture_is_queued(profile_fixture_operation_phase(update.state,31,second_command.operation_id)) { term 11; };
+    term 0;
+};
+
+defn profile_fixture_is_queued(phase: PersistencePhase) -> Bool {
+    match phase { PersistQueued() => true, _ => false, }
+};
+
+defn profile_fixture_is_running(phase: PersistencePhase) -> Bool {
+    match phase { PersistRunning() => true, _ => false, }
+};
+
+defn profile_fixture_is_persist_action(actions: List<ProfileAction>, operation: String) -> Bool {
+    foreach idx in 0..actions .^Length {
+        when profile_fixture_persist_matches(actions[idx],operation) { term true; };
+    };
+    term false;
+};
+
+defn profile_fixture_persist_matches(action: ProfileAction, operation: String) -> Bool {
+    match action { PersistOperation(value) => value.operation_id == operation, _ => false, }
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let epoch: String = get_env("PROFILE_ADMISSION_TEST_EPOCH");
+    when epoch .^Length == 0 { epoch = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; };
+    let admission_code: Int = profile_fixture_admission_checks(epoch);
+    let save_ok: Bool = profile_fixture_save_checks(epoch);
+    let cold_ok: Bool = profile_fixture_cold_start_checks(epoch);
+    let stale_ok: Bool = profile_fixture_stale_result_checks(epoch);
+    let hydration_ok: Bool = profile_fixture_hydration_checks(epoch);
+    let discard_code: Int = profile_fixture_discard_checks(epoch);
+    let ordered_save_code: Int = profile_fixture_ordered_save_checks(epoch);
+    println!("profile_admission_code={} save_without_prediction={} cold_start={} stale_result={} hydration={} discard_code={} ordered_save_code={}",admission_code,save_ok,cold_ok,stale_ok,hydration_ok,discard_code,ordered_save_code); stdout_flush();
+    when admission_code != 0 || !save_ok || !cold_ok || !stale_ok || !hydration_ok || discard_code != 0 || ordered_save_code != 0 { endprogram 1; };
+    tick = 1; endprogram;
+};

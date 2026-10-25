@@ -1,0 +1,44 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/env.bv";
+import { syscall } from "std/posix/syscall.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+let trace_enabled: Bool = get_env("RECOMMENDER_TRACE") == "1";
+let trace_operation: String = "";
+
+// 2026-10-22: opt-in I01 diagnostics use one reactor-owned correlation context.
+// Never log credentials/tokens or arbitrary client strings. Persistent workers
+// must carry correlation explicitly in IPC when I05 replaces this serial path.
+defn trace_begin(operation: String) -> Bool {
+    trace_operation = "";
+    when operation .^Length > 64 { term false; };
+    foreach idx in 0..operation .^Length {
+        let byte: Int = byte_at(operation,idx);
+        let valid: Bool = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 95;
+        when !valid { term false; };
+    };
+    trace_operation = operation;
+    term true;
+};
+
+defn trace_clock() -> Int {
+    when !trace_enabled { term 0; };
+    let memory: Int = Malloc#(16) as Int;
+    when memory == 0 { term -1; };
+    let result: Int = syscall(228,1,memory);
+    when result < 0 { Free#(memory as Ptr); term -1; };
+    let now: Int = Load#(memory,8)*1000000 + Load#(memory+8,8)/1000;
+    Free#(memory as Ptr);
+    term now;
+};
+
+defn trace_stage(stage: String, started: Int) -> Bool {
+    when !trace_enabled { term true; };
+    let finished: Int = trace_clock();
+    println!("TRACE op={} stage={} start_us={} end_us={}",trace_operation,stage,started,finished);
+    stdout_flush();
+    term started >= 0 && finished >= started;
+};

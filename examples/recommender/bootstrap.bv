@@ -1,0 +1,167 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./store.bv";
+import "./udata.bv";
+import "std/os/fs.bv";
+import { Ok, Err, is_ok, is_err, unwrap, unwrap_err } from "std/result.bv";
+
+obj BaselineLoad {
+    ok: Bool;
+    loaded: Bool;
+    accepted: Int;
+    discarded: Int;
+    err_code: String;
+    err_msg: String;
+};
+
+obj BaselineProgress {
+    pending: List<UDataRecord>;
+    accepted: Int;
+    discarded: Int;
+    result: PgResult;
+};
+
+defn baseline_load_result(result: PgResult, loaded: Bool, accepted: Int, discarded: Int) -> BaselineLoad {
+    term BaselineLoad {
+        ok: result.ok, loaded: loaded && result.ok,
+        accepted: accepted, discarded: discarded,
+        err_code: result.err_code, err_msg: result.err_msg
+    };
+};
+
+// 2026-10-21: inspect the locked marker before opening the source file. A
+// completed load survives file removal and never imports a changed baseline
+// accidentally. All failures before commit roll back both records and marker.
+// Requires an idle dedicated connection and the schema from store.bv.
+defn baseline_bootstrap(conn: PgConn, path: String) -> BaselineLoad {
+    let marker: PgResult = store_baseline_begin(conn);
+    when marker.ok == false { term baseline_load_result(marker, false, 0, 0); };
+    when pg_row_text(marker, 0, 0) == "t" {
+        let committed: PgResult = pg_simple_query(conn, "COMMIT");
+        term baseline_load_result(committed, false, 0, 0);
+    };
+    let file: Result<String, Int> = read_file(path);
+    when is_err(file) {
+        let message: String = "Cannot read baseline file " + path +
+            " (errno " + (unwrap_err(file) as String) + "); supply a readable u.data file.";
+        let failure: PgResult = store_abort(conn, store_error(message));
+        term baseline_load_result(failure, false, 0, 0);
+    };
+    // A failed older/external attempt may have left rows with done=false.
+    // Replace that incomplete population atomically with this file's contents.
+    let cleared: PgResult = pg_simple_query(conn, "DELETE FROM baseline_ratings");
+    when cleared.ok == false {
+        term baseline_load_result(store_abort(conn, cleared), false, 0, 0);
+    };
+    let empty: List<UDataRecord> = [];
+    let initial: BaselineProgress = BaselineProgress {
+        pending: empty, accepted: 0, discarded: 0, result: pg_result_empty()
+    };
+    let progress: BaselineProgress = baseline_scan(conn, unwrap(file), 0, 0, initial);
+    when progress.result.ok == false {
+        term baseline_load_result(store_abort(conn, progress.result), false,
+            progress.accepted, progress.discarded);
+    };
+    when progress.accepted == 0 {
+        let failure: PgResult = store_abort(conn,
+            store_error("Baseline file contains no valid ratings; supply a nonempty MovieLens u.data file."));
+        term baseline_load_result(failure, false, 0, progress.discarded);
+    };
+    term baseline_complete(conn, progress);
+};
+
+defn baseline_complete(conn: PgConn, progress: BaselineProgress) -> BaselineLoad {
+    let marked: PgResult = pg_simple_query(conn,
+        "UPDATE load_state SET done = TRUE WHERE key = 'baseline' AND done = FALSE RETURNING key");
+    when marked.ok == false {
+        term baseline_load_result(store_abort(conn, marked), false, progress.accepted, progress.discarded);
+    };
+    when marked.nrows != 1 {
+        let failure: PgResult = store_abort(conn,
+            store_error("Baseline load marker changed unexpectedly; retry on a fresh connection."));
+        term baseline_load_result(failure, false, progress.accepted, progress.discarded);
+    };
+    let committed: PgResult = pg_simple_query(conn, "COMMIT");
+    term baseline_load_result(committed, true, progress.accepted, progress.discarded);
+};
+
+// 2026-10-21: parse individual lines with the same strict parser as Task 10.1.
+// Keep at most 64 records pending; do not concatenate the whole dataset into
+// a growing list. The fixed bound also bounds SQL text and parameter storage.
+// Empty input has no phantom row; CRLF and a missing final LF retain parser
+// semantics. Stop immediately after a database error; the owner rolls back.
+defn baseline_scan(conn: PgConn, text: String, idx: Int, start: Int, state: BaselineProgress)
+    -> BaselineProgress
+{
+    when state.result.ok == false { term state; };
+    when idx >= text .^Length {
+        when start < idx {
+            let last: BaselineProgress = baseline_line(conn, text[start:idx], state);
+            term baseline_flush(conn, last);
+        };
+        term baseline_flush(conn, state);
+    };
+    when byte_at(text, idx) == 10 {
+        let next: BaselineProgress = baseline_line(conn, text[start:idx], state);
+        term baseline_scan(conn, text, idx + 1, idx + 1, next);
+    };
+    term baseline_scan(conn, text, idx + 1, start, state);
+};
+
+defn baseline_line(conn: PgConn, line: String, state: BaselineProgress) -> BaselineProgress {
+    let parsed: UDataBatch = udata_parse(line);
+    let pending: List<UDataRecord> = state.pending + parsed.records;
+    let next: BaselineProgress = BaselineProgress {
+        pending: pending, accepted: state.accepted + parsed.records .^Length,
+        discarded: state.discarded + parsed.discarded, result: state.result
+    };
+    when pending .^Length >= 64 { term baseline_flush(conn, next); };
+    term next;
+};
+
+defn baseline_flush(conn: PgConn, state: BaselineProgress) -> BaselineProgress {
+    when state.result.ok == false || state.pending .^Length == 0 { term state; };
+    let sql: String = baseline_insert_sql(state.pending .^Length);
+    let empty_params: List<String> = [];
+    let params: List<String> = baseline_params(state.pending, 0, empty_params);
+    let inserted: PgResult = pg_exec(conn, sql, params);
+    let empty: List<UDataRecord> = [];
+    term BaselineProgress {
+        pending: empty, accepted: state.accepted, discarded: state.discarded,
+        result: inserted
+    };
+};
+
+// DISTINCT ON picks the last source occurrence within a batch. Without this,
+// duplicate keys in one INSERT ... ON CONFLICT DO UPDATE cause PostgreSQL's
+// cardinality violation. Later batches overwrite earlier ones, giving the same
+// last-record rule across boundaries. Only generated placeholder/ordinal
+// numbers enter SQL text; every dataset value is a bound parameter.
+defn baseline_insert_sql(count: Int) [count > 0 && count <= 64][true] -> String {
+    term "INSERT INTO baseline_ratings (user_idx, item_id, rating, ts) " +
+        "SELECT DISTINCT ON (user_idx, item_id) user_idx, item_id, rating, ts FROM (VALUES " +
+        baseline_value_slots(count, 0, "") +
+        ") AS source(user_idx, item_id, rating, ts, source_order) " +
+        "ORDER BY user_idx, item_id, source_order DESC " +
+        "ON CONFLICT (user_idx, item_id) DO UPDATE " +
+        "SET rating = EXCLUDED.rating, ts = EXCLUDED.ts";
+};
+
+defn baseline_value_slots(count: Int, idx: Int, text: String) -> String {
+    when idx >= count { term text; };
+    let first: Int = idx * 4 + 1;
+    let slot: String = "($" + (first as String) + "::integer,$" +
+        ((first + 1) as String) + "::integer,$" + ((first + 2) as String) +
+        "::smallint,$" + ((first + 3) as String) + "::bigint," + (idx as String) + ")";
+    when idx == 0 { term baseline_value_slots(count, idx + 1, slot); };
+    term baseline_value_slots(count, idx + 1, text + "," + slot);
+};
+
+defn baseline_params(records: List<UDataRecord>, idx: Int, params: List<String>) -> List<String> {
+    when idx >= records .^Length { term params; };
+    let record: UDataRecord = records[idx];
+    let values: List<String> = [record.user_idx as String, record.item_idx as String,
+        record.rating as String, record.timestamp as String];
+    term baseline_params(records, idx + 1, params + values);
+};

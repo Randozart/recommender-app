@@ -1,0 +1,13 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_contract_checks.bv";
+
+defn contract_web_result() -> String {
+    when contract_base_checks("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") &&
+        contract_base_checks("0123456789abcdef0123456789abcdef") { term "PASS"; };
+    term "FAIL";
+};
+let result: String = contract_web_result();
+<view><main><p id="contract-result" b-text="result">Waiting</p></main></view>
+when true { reside; };

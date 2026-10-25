@@ -1,0 +1,88 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_encode.bv";
+
+// 2026-10-22: I02 separates receipt resolution from the rating payload. A failed
+// discard must retry a tombstone, never accidentally requeue the original edit.
+// These pure transitions are the shared contract; I04/I07 own scheduling/SQL.
+defn protocol_phase_choice(discard: Bool, regular: PersistencePhase, resolution: PersistencePhase) -> PersistencePhase {
+    when discard { term resolution; };
+    term regular;
+};
+defn protocol_transition_error() -> Result<PersistencePhase,String> {
+    term Err("Reconcile an uncertain write first; retry or discard only a definitively failed head operation.");
+};
+defn protocol_queued_next(signal: PersistenceSignal, discard: Bool) -> Result<PersistencePhase,String> {
+    match signal {
+        DispatchPersist() => Ok(protocol_phase_choice(discard,PersistRunning(),PersistDiscardRunning())),
+        _ => protocol_transition_error(),
+    }
+};
+defn protocol_running_next(signal: PersistenceSignal, discard: Bool) -> Result<PersistencePhase,String> {
+    match signal {
+        CommitPersist() => {
+            when discard { term protocol_transition_error(); };
+            term Ok(PersistSaved());
+        },
+        CommitDiscard() => {
+            when !discard { term protocol_transition_error(); };
+            term Ok(PersistDiscarded());
+        },
+        RollbackPersist() => Ok(protocol_phase_choice(discard,PersistRetryWait(),PersistDiscardFailed())),
+        FailPersist() => Ok(protocol_phase_choice(discard,PersistFailed(),PersistDiscardFailed())),
+        LosePersist() => Ok(protocol_phase_choice(discard,PersistUncertain(),PersistDiscardUncertain())),
+        _ => protocol_transition_error(),
+    }
+};
+defn protocol_failed_next(signal: PersistenceSignal, discard: Bool) -> Result<PersistencePhase,String> {
+    match signal {
+        RetryPersist() => Ok(protocol_phase_choice(discard,PersistQueued(),PersistDiscardQueued())),
+        RequestDiscard() => {
+            when discard { term protocol_transition_error(); };
+            term Ok(PersistDiscardQueued());
+        },
+        _ => protocol_transition_error(),
+    }
+};
+defn protocol_retry_next(signal: PersistenceSignal) -> Result<PersistencePhase,String> {
+    match signal {
+        RetryPersist() => Ok(PersistQueued()),
+        ExhaustPersist() => Ok(PersistFailed()),
+        RequestDiscard() => Ok(PersistDiscardQueued()),
+        _ => protocol_transition_error(),
+    }
+};
+defn protocol_uncertain_next(signal: PersistenceSignal, discard: Bool) -> Result<PersistencePhase,String> {
+    match signal {
+        CommitPersist() => Ok(PersistSaved()),
+        CommitDiscard() => {
+            when !discard { term protocol_transition_error(); };
+            term Ok(PersistDiscarded());
+        },
+        RollbackPersist() => Ok(protocol_phase_choice(discard,PersistRetryWait(),PersistDiscardQueued())),
+        LosePersist() => Ok(protocol_phase_choice(discard,PersistUncertain(),PersistDiscardUncertain())),
+        _ => protocol_transition_error(),
+    }
+};
+defn protocol_persistence_next(phase: PersistencePhase, signal: PersistenceSignal) -> Result<PersistencePhase,String> {
+    match phase {
+        PersistQueued() => protocol_queued_next(signal,false),
+        PersistRunning() => protocol_running_next(signal,false),
+        PersistRetryWait() => protocol_retry_next(signal),
+        PersistFailed() => protocol_failed_next(signal,false),
+        PersistUncertain() => protocol_uncertain_next(signal,false),
+        PersistDiscardQueued() => protocol_queued_next(signal,true),
+        PersistDiscardRunning() => protocol_running_next(signal,true),
+        PersistDiscardFailed() => protocol_failed_next(signal,true),
+        PersistDiscardUncertain() => protocol_uncertain_next(signal,true),
+        PersistSaved() => protocol_transition_error(),
+        PersistDiscarded() => protocol_transition_error(),
+    }
+};
+defn protocol_head_released(phase: PersistencePhase) -> Bool {
+    match phase { PersistSaved() => true, PersistDiscarded() => true, _ => false, }
+};
+defn protocol_event_replaces_recommendations(event: RatingEvent) -> Bool {
+    match event { PredictedRatings(result) => true, _ => false, }
+};

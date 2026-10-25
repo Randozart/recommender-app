@@ -1,0 +1,189 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./protocol_policy.bv";
+
+defn worker_request_kind(kind: String) -> Bool {
+    term kind == "predict" || kind == "persist" || kind == "hydrate" || kind == "receipt" ||
+        kind == "discard" || kind == "install" || kind == "shutdown" || kind == "login" || kind == "register";
+};
+defn worker_reply_kind(kind: String) -> Bool {
+    term kind == "result" || kind == "saved" || kind == "save-failed" || kind == "hydrated" ||
+        kind == "receipts" || kind == "ready" || kind == "stopped" || kind == "authenticated" ||
+        kind == "registered" || kind == "error" || kind == "started";
+};
+defn worker_control_kind(kind: String) -> Bool {
+    term kind == "install" || kind == "ready" || kind == "shutdown" || kind == "stopped" ||
+        kind == "login" || kind == "register" || kind == "authenticated" || kind == "registered" || kind == "error" || kind == "started";
+};
+defn worker_model_kind(kind: String) -> Bool {
+    term kind == "predict" || kind == "result" || kind == "install" || kind == "ready";
+};
+defn worker_tag_valid(tag: WorkerTag, kind: String) -> Bool {
+    when !protocol_hex(tag.profile.server_epoch,32) || !protocol_counter(tag.profile.revision) ||
+        !protocol_positive(tag.job_id) || tag.attempt < 1 || tag.attempt > 65535 { term false; };
+    when tag.profile.account_id < 0 || tag.profile.account_id > 2147483647 { term false; };
+    when worker_control_kind(kind) && kind != "error" && tag.profile.account_id != 0 { term false; };
+    when tag.profile.account_id == 0 && (!worker_control_kind(kind) || tag.profile.revision != "0") { term false; };
+    when kind == "predict" && !protocol_positive(tag.profile.revision) { term false; };
+    when kind == "error" { term protocol_counter(tag.model_generation); };
+    when worker_model_kind(kind) { term protocol_positive(tag.model_generation); };
+    term tag.model_generation == "0";
+};
+defn worker_text_bound(value: JsonValue, key: String, limit: Int) -> Bool {
+    let text: String = protocol_text(protocol_member(value,key));
+    term text .^Length > 0 && text .^Length <= limit;
+};
+defn worker_path_valid(path: String) -> Bool {
+    when path .^Length < 1 || path .^Length > 4096 { term false; };
+    when path[0:1] != "/" { term false; };
+    foreach idx in 0..path .^Length { when byte_at(path,idx) == 0 { term false; }; };
+    term true;
+};
+defn worker_operation_list(value: JsonValue) -> Bool {
+    let entries: List<JsonValue> = protocol_array(value);
+    when !protocol_is_array(value) || entries .^Length < 1 || entries .^Length > 64 { term false; };
+    foreach idx in 0..entries .^Length {
+        when !protocol_hex(protocol_text(entries[idx]),64) || !worker_operation_new(entries,idx) { term false; };
+    };
+    term true;
+};
+defn worker_operation_new(entries: List<JsonValue>, idx: Int) -> Bool {
+    foreach previous in 0..idx { when protocol_text(entries[previous]) == protocol_text(entries[idx]) { term false; }; };
+    term true;
+};
+defn worker_persist_payload(message: WorkerMessage) -> Bool {
+    let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(message.payload,"operation"));
+    when is_err(command) { term false; };
+    term protocol_positive(message.tag.profile.revision) && unwrap(command).server_epoch == message.tag.profile.server_epoch &&
+        protocol_counter(protocol_text(protocol_member(message.payload,"timestamp"))) &&
+        worker_text_bound(message.payload,"database_identity",4096);
+};
+defn worker_predict_payload(payload: JsonValue) -> Bool {
+    let lambda: JsonValue = protocol_member(payload,"lambda_milli");
+    let value: Int = protocol_integer(lambda);
+    when protocol_integer(lambda) < 0 { term false; };
+    when value < 0 || value > 1000 { term false; };
+    term is_ok(protocol_ratings(protocol_member(payload,"ratings")));
+};
+defn worker_install_payload(message: WorkerMessage) -> Bool {
+    let payload: JsonValue = message.payload;
+    let bytes: Int = protocol_integer(protocol_member(payload,"bytes"));
+    term protocol_text(protocol_member(payload,"generation")) == message.tag.model_generation &&
+        worker_path_valid(protocol_text(protocol_member(payload,"path"))) && worker_text_bound(payload,"identity",4096) &&
+        bytes > 0 && bytes <= 536870912;
+};
+defn worker_request_payload(message: WorkerMessage) -> Bool {
+    let payload: JsonValue = message.payload;
+    let kind: String = message.kind;
+    when kind == "predict" { term worker_predict_payload(payload); };
+    when kind == "persist" { term worker_persist_payload(message); };
+    when kind == "hydrate" { term worker_text_bound(payload,"database_identity",4096); };
+    when kind == "receipt" { term worker_operation_list(protocol_member(payload,"operation_ids")) && worker_text_bound(payload,"database_identity",4096); };
+    when kind == "discard" {
+        let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(payload,"operation"));
+        when is_err(command) { term false; };
+        term protocol_operation_version_valid(message.tag.profile,protocol_text(protocol_member(payload,"operation_id"))) &&
+            unwrap(command).operation_id == protocol_text(protocol_member(payload,"operation_id")) &&
+            unwrap(command).server_epoch == message.tag.profile.server_epoch &&
+            protocol_counter(protocol_text(protocol_member(payload,"timestamp"))) && worker_text_bound(payload,"database_identity",4096);
+    };
+    when kind == "install" { term worker_install_payload(message); };
+    when kind == "shutdown" { term protocol_counter(protocol_text(protocol_member(payload,"deadline_ms"))); };
+    when kind == "login" || kind == "register" {
+        term protocol_is_text(protocol_member(payload,"username")) && protocol_is_text(protocol_member(payload,"password"));
+    };
+    term false;
+};
+defn worker_event_payload(message: WorkerMessage) -> Bool {
+    let encoded: Result<String,String> = json_stringify(message.payload);
+    when is_err(encoded) { term false; };
+    let parsed: Result<RatingEvent,String> = protocol_decode_event(unwrap(encoded));
+    when is_err(parsed) { term false; };
+    match unwrap(parsed) {
+        PredictedRatings(value) => message.kind == "result" && protocol_result_current(value.tag,message.tag.profile,
+            PredictionTag { profile: message.tag.profile, model_generation: message.tag.model_generation, job_id: message.tag.job_id, attempt: message.tag.attempt }),
+        SavedRating(value) => message.kind == "saved" && protocol_same_profile(value.profile,message.tag.profile),
+        FailedRating(value) => message.kind == "save-failed" && protocol_same_profile(value.profile,message.tag.profile),
+        _ => false,
+    }
+};
+defn worker_receipt_entry(value: JsonValue, owner: Int) -> Bool {
+    when !protocol_object(value) || !protocol_hex(protocol_text(protocol_member(value,"operation_id")),64) { term false; };
+    let status: String = protocol_text(protocol_member(value,"status"));
+    when status == "unknown" { term true; };
+    when status != "saved" && status != "discarded" { term false; };
+    let profile: Result<ProfileVersion,String> = protocol_profile(value);
+    when is_err(profile) { term false; };
+    term unwrap(profile).account_id == owner && is_ok(protocol_saved(value,unwrap(profile))) && is_ok(protocol_rating(value));
+};
+defn worker_receipts_payload(message: WorkerMessage) -> Bool {
+    let entries: JsonValue = protocol_member(message.payload,"operations");
+    let receipts: List<JsonValue> = protocol_array(entries);
+    when !protocol_is_array(entries) || receipts .^Length < 1 || receipts .^Length > 64 ||
+        protocol_text(protocol_member(message.payload,"current_server_epoch")) != message.tag.profile.server_epoch { term false; };
+    let operations: List<JsonValue> = [];
+    foreach idx in 0..receipts .^Length {
+        when !worker_receipt_entry(receipts[idx],message.tag.profile.account_id) { term false; };
+        operations <- protocol_member(receipts[idx],"operation_id");
+    };
+    term worker_operation_list(Array(operations));
+};
+defn worker_reply_payload(message: WorkerMessage) -> Bool {
+    let kind: String = message.kind;
+    let payload: JsonValue = message.payload;
+    when kind == "result" || kind == "saved" || kind == "save-failed" { term worker_event_payload(message); };
+    when kind == "hydrated" { term worker_text_bound(payload,"username",PROTOCOL_JSON_LIMIT) && is_ok(protocol_ratings(protocol_member(payload,"ratings"))); };
+    when kind == "receipts" { term worker_receipts_payload(message); };
+    when kind == "ready" { term protocol_text(protocol_member(payload,"generation")) == message.tag.model_generation && worker_text_bound(payload,"identity",4096); };
+    when kind == "started" {
+        let role: String = protocol_text(protocol_member(payload,"role"));
+        term protocol_is_text(protocol_member(payload,"role")) && (role == "prediction" || role == "persistence");
+    };
+    when kind == "stopped" { term protocol_boolean(protocol_member(payload,"drained")) && protocol_is_boolean(protocol_member(payload,"drained")); };
+    when kind == "registered" || kind == "authenticated" {
+        let owner: Int = protocol_integer(protocol_member(payload,"account_id"));
+        when owner < 1 || owner > 2147483647 || !worker_text_bound(payload,"username",PROTOCOL_JSON_LIMIT) { term false; };
+        when kind == "registered" { term true; };
+        term worker_session_token_valid(protocol_text(protocol_member(payload,"token"))) &&
+            is_ok(protocol_ratings(protocol_member(payload,"ratings")));
+    };
+    when kind == "error" { term protocol_error_fields_valid(protocol_text(protocol_member(payload,"error")),protocol_text(protocol_member(payload,"message"))) && protocol_is_boolean(protocol_member(payload,"retryable")); };
+    term false;
+};
+defn worker_session_token_valid(token: String) -> Bool {
+    when token .^Length != 32 { term false; };
+    foreach idx in 0..token .^Length {
+        let byte: Int = byte_at(token,idx);
+        when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { term false; };
+    };
+    term true;
+};
+defn worker_message_valid(message: WorkerMessage) -> Bool {
+    when !worker_tag_valid(message.tag,message.kind) || !protocol_object(message.payload) { term false; };
+    when worker_request_kind(message.kind) { term worker_request_payload(message); };
+    when worker_reply_kind(message.kind) { term worker_reply_payload(message); };
+    term false;
+};
+defn protocol_encode_worker(message: WorkerMessage) -> Result<String,String> {
+    when !worker_message_valid(message) { term Err("Supply a valid version-1 worker kind, job identity and bounded payload."); };
+    let fields: List<(String,JsonValue)> = [("job_id",StrVal(message.tag.job_id)),("attempt",IntVal(message.tag.attempt)),
+        ("model_generation",StrVal(message.tag.model_generation)),("payload",message.payload)];
+    term protocol_encode_object(protocol_fields(message.tag.profile,message.kind)+fields);
+};
+defn protocol_decode_worker(text: String) -> Result<WorkerMessage,String> {
+    let parsed: Result<JsonValue,String> = protocol_document(text);
+    when is_err(parsed) { term Err(unwrap_err(parsed)); };
+    let value: JsonValue = unwrap(parsed);
+    let profile: ProfileVersion = ProfileVersion { server_epoch: protocol_text(protocol_member(value,"server_epoch")),
+        account_id: protocol_integer(protocol_member(value,"account_id")), revision: protocol_text(protocol_member(value,"revision")) };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: protocol_text(protocol_member(value,"job_id")),
+        attempt: protocol_integer(protocol_member(value,"attempt")), model_generation: protocol_text(protocol_member(value,"model_generation")) };
+    let message: WorkerMessage = WorkerMessage { kind: protocol_text(protocol_member(value,"type")), tag: tag, payload: protocol_member(value,"payload") };
+    when !worker_message_valid(message) { term Err("Invalid worker message; use the version-1 job and payload contract."); };
+    term Ok(message);
+};
+defn worker_same_tag(left: WorkerTag, right: WorkerTag) -> Bool {
+    term protocol_same_profile(left.profile,right.profile) && left.job_id == right.job_id &&
+        left.attempt == right.attempt && left.model_generation == right.model_generation;
+};

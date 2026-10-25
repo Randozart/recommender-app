@@ -1,0 +1,74 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./model_types.bv";
+import { base_sim_user, means_sum_all } from "./cf_engine.bv";
+import "std/matrix.bv";
+import { Ok, Err } from "std/result.bv";
+
+// 2026-10-22: I06 worker workspace, validated against the serial server engine.
+// Base similarities between unchanged rows depend only on the installed model.
+// Removing another row changes neither their observations nor their true means;
+// empty rows have zero base PCC under every global-mean fallback.
+// One bounded worker-owned allocation holds those facts and all per-job scratch.
+// Rebuild on model replacement; release once after its final job, before freeing
+// the borrowed model. Never share a workspace between concurrent evaluations.
+obj PredictionScratch {
+    storage: Int; bytes: Int; population_sum: Float; base: Matrix; profile: Vector;
+    profile_keys: IntVec; profile_values: Vector;
+    active_base: Vector; active_imputed: Vector; similarities: Vector;
+    candidates: Vector; deviations: Vector; used: IntVec;
+    scores: Vector; picked: IntVec;
+};
+
+defn prediction_scratch_new(model: ServerModel, byte_limit: Int) -> Result<PredictionScratch,String> {
+    let users: Int = model.population.nusers;
+    let items: Int = model.population.nitems;
+    when users < 1 || users > 65535 || items < 1 || items > 65535 || byte_limit < 1 || byte_limit > 536870912 {
+        term Err("Supply a validated model and a prediction workspace budget of at most 512 MiB.");
+    };
+    let capacity: Int = users;
+    when items > capacity { capacity = items; };
+    let zero: Float = 0.0;
+    let width: Int = zero .^^Bytes;
+    let float_bytes: Int = (users*users+2*users+4*items+2*capacity)*width;
+    let bytes: Int = ((float_bytes+7)/8)*8+(2*items+capacity)*8;
+    when bytes > byte_limit { term Err("Prediction workspace exceeds its memory budget; reduce worker count or increase the per-worker budget."); };
+    let storage: Int = Malloc#(bytes) as Int;
+    when storage == 0 { term Err("Cannot allocate the bounded prediction workspace; release memory and retry."); };
+    let offset: Int = storage+users*users*width;
+    let profile: Vector = Vector { ptr: offset, len: items }; offset = offset+items*width;
+    let profile_values: Vector = Vector { ptr: offset, len: items }; offset = offset+items*width;
+    let active_base: Vector = Vector { ptr: offset, len: users }; offset = offset+users*width;
+    let imputed: Vector = Vector { ptr: offset, len: items }; offset = offset+items*width;
+    let similarities: Vector = Vector { ptr: offset, len: users }; offset = offset+users*width;
+    let candidates: Vector = Vector { ptr: offset, len: capacity }; offset = offset+capacity*width;
+    let deviations: Vector = Vector { ptr: offset, len: capacity }; offset = offset+capacity*width;
+    let scores: Vector = Vector { ptr: offset, len: items }; offset = offset+items*width;
+    offset = storage+((offset-storage+7)/8)*8;
+    let keys: IntVec = IntVec { ptr: offset, len: items }; offset = offset+items*8;
+    let used: IntVec = IntVec { ptr: offset, len: capacity }; offset = offset+capacity*8;
+    let picked: IntVec = IntVec { ptr: offset, len: items };
+    let base: Matrix = Matrix { ptr: storage, rows: users, cols: users };
+    prediction_base_fill(model,base);
+    term Ok(PredictionScratch { storage: storage, bytes: bytes,
+        population_sum: means_sum_all(model.population.user_val,model.population.nnz,0,0.0), base: base, profile: profile,
+        profile_keys: keys, profile_values: profile_values,
+        active_base: active_base, active_imputed: imputed, similarities: similarities,
+        candidates: candidates, deviations: deviations, used: used, scores: scores, picked: picked });
+};
+
+defn prediction_base_fill(model: ServerModel, base: Matrix) -> Bool {
+    foreach row in 0..model.population.nusers {
+        foreach neighbor in 0..(row+1) {
+            let score: Float = base_sim_user(model.population,model.means,row,neighbor);
+            mat_set(base,row,neighbor,score); mat_set(base,neighbor,row,score);
+        };
+    };
+    term true;
+};
+
+defn prediction_scratch_free(scratch: PredictionScratch) -> Void {
+    Free#(scratch.storage as Ptr);
+    term;
+};

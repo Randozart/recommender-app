@@ -1,0 +1,57 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_test_support.bv";
+
+defn ws_bad_frame(state: ServerState, wire: String, code: Int) -> TestExchange {
+    let registered: TestExchange = test_http(state,"POST","/register","{\"username\":\"protocol\",\"password\":\"secret\"}");
+    let logged: TestExchange = test_http(registered.server,"POST","/login","{\"username\":\"protocol\",\"password\":\"secret\"}");
+    let token: String = api_input(test_body(logged.response)).token;
+    let socket: Socket = sock_tcp();
+    let connected: Int = sock_connect(socket,LOOPBACK,test_port(state.reactor.listener));
+    let upgraded: Bool = test_upgrade(socket,token);
+    let nb: Int = sock_set_nonblocking(socket);
+    let updated: ServerState = test_pump(logged.server);
+    let handshake: String = test_read(socket);
+    let sent: Bool = test_send(socket,wire);
+    updated = test_pump(updated);
+    let close: String = test_ws_payload(test_read(socket));
+    let valid: Bool = close .^Length >= 2 && byte_at(close,0)*256+byte_at(close,1) == code;
+    let closed: Int = sock_close(socket);
+    when !valid { println!("bad frame expected close={} actual_len={}",code,close .^Length); };
+    term TestExchange { server: updated, response: valid as String };
+};
+
+defn ws_wire(opcode: Int, fin: Bool, masked: Bool, payload: String) -> String {
+    let frame: GrowBuf = ws_encode(grow_new(payload .^Length+16),fin,opcode,masked,0,(((payload as Data) as Int)+8),payload .^Length);
+    let text: String = buf_slice_string(ByteBuf { ptr: frame.ptr, len: frame.len, cap: frame.cap },0,frame.len);
+    grow_free(frame);
+    term text;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let state: ServerState = test_server();
+    let unmasked: TestExchange = ws_bad_frame(state,ws_wire(1,true,false,"{}"),1002);
+    state = unmasked.server;
+    let continuation: TestExchange = ws_bad_frame(state,ws_wire(0,true,true,"{}"),1002);
+    state = continuation.server;
+    let binary: TestExchange = ws_bad_frame(state,ws_wire(2,true,true,"data"),1003);
+    state = binary.server;
+    let fragmented_ping: TestExchange = ws_bad_frame(state,ws_wire(9,false,true,"ping"),1002);
+    state = fragmented_ping.server;
+    let raw: Int = Malloc#(10) as Int;
+    Store#(raw,1,8); Store#(raw+8,255,1); Store#(raw+9,0,1);
+    let bad_utf8: String = (raw as Data) as String;
+    let utf8: TestExchange = ws_bad_frame(state,ws_wire(1,true,true,bad_utf8),1007);
+    state = utf8.server;
+    Free#(raw as Ptr);
+    let malformed_close: TestExchange = ws_bad_frame(state,ws_wire(8,true,true,"x"),1002);
+    state = malformed_close.server;
+    let good: Bool = unmasked.response == "true" && continuation.response == "true" && binary.response == "true" &&
+        fragmented_ping.response == "true" && utf8.response == "true" && malformed_close.response == "true";
+    println!("websocket_protocol_edges={}",good);
+    model_free(state.model); reactor_close(state.reactor); pg_close(state.conn);
+    when !good { endprogram 1; };
+    tick = 1; endprogram;
+};

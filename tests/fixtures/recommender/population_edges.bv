@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/baseline_population.bv";
+import "std/env.bv";
+
+defn population_expect_error(conn: PgConn, code: String) -> Bool {
+    let result: Result<RatingPopulation,PgResult> = baseline_population(conn);
+    when is_ok(result) { pop_free(unwrap(result)); term false; };
+    let error: PgResult = unwrap_err(result);
+    let recovered: PgResult = pg_simple_query(conn,"SELECT 1");
+    term error.ok == false && error.err_code == code && error.err_msg .^Length > 0 && recovered.ok;
+};
+
+defn population_edges(conn: PgConn) -> Bool {
+    let setup: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_population_edge_gate; SET search_path TO briev_population_edge_gate");
+    let schema: PgResult = store_create_schema(conn);
+    let reset: PgResult = pg_simple_query(conn,"DELETE FROM baseline_ratings; DELETE FROM load_state");
+    when setup.ok == false || schema.ok == false || reset.ok == false { term false; };
+    let missing: Bool = population_expect_error(conn,"");
+    println!("missing_marker_recovers={}",missing);
+    let seeded: PgResult = pg_simple_query(conn,"INSERT INTO load_state(key,done) VALUES ('baseline',FALSE)");
+    let incomplete: Bool = seeded.ok && population_expect_error(conn,"");
+    println!("incomplete_marker_recovers={}",incomplete);
+    let marked: PgResult = pg_simple_query(conn,"UPDATE load_state SET done=TRUE WHERE key='baseline'");
+    let empty: Result<RatingPopulation,PgResult> = baseline_population(conn);
+    when is_err(empty) { term false; };
+    let pop: RatingPopulation = unwrap(empty);
+    let empty_ok: Bool = marked.ok && pop.nnz == 0 && pop.nusers == 943 && pop.nitems == 1682 &&
+        ivec_get(pop.user_off,943) == 0 && ivec_get(pop.item_off,1682) == 0;
+    pop_free(pop);
+    println!("empty_snapshot_well_formed={}",empty_ok);
+    let renamed: PgResult = pg_simple_query(conn,"ALTER TABLE baseline_ratings RENAME TO hidden_baseline_ratings");
+    let sql_error: Bool = renamed.ok && population_expect_error(conn,"42P01");
+    let restored: PgResult = pg_simple_query(conn,"ALTER TABLE hidden_baseline_ratings RENAME TO baseline_ratings");
+    println!("sql_error_preserved_and_recovers={}",sql_error);
+    term missing && incomplete && empty_ok && sql_error && restored.ok;
+};
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let passed: Bool = population_edges(conn);
+    pg_close(conn);
+    when passed == false { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

@@ -1,0 +1,36 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/browser_catalogue.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let movies: List<BrowserMovie> = [
+        BrowserMovie { item_id: 0, title: "Toy Story (1995)" },
+        BrowserMovie { item_id: 1, title: "Les Misérables (1995)" },
+        BrowserMovie { item_id: 2, title: "Alien (1979)" },
+        BrowserMovie { item_id: 3, title: "Star Wars (1977)" },
+        BrowserMovie { item_id: 4, title: "Amélie (2001)" }
+    ];
+    let initial: BrowserMoviePage = browser_catalogue_page(movies,"",0,2);
+    let middle: BrowserMoviePage = browser_catalogue_page(movies,"",2,2);
+    let last: BrowserMoviePage = browser_catalogue_page(movies,"",4,2);
+    let search: BrowserMoviePage = browser_catalogue_page(movies,"MISÉRABLES",0,10);
+    let partial: BrowserMoviePage = browser_catalogue_page(movies,"story",0,10);
+    let empty: BrowserMoviePage = browser_catalogue_page(movies,"not in catalogue",0,10);
+    let passed: Bool = initial.total == 5 && initial.movies .^Length == 2 &&
+        initial.movies[0].item_id == 0 && initial.movies[1].item_id == 1 &&
+        middle.total == 5 && middle.movies .^Length == 2 &&
+        middle.movies[0].item_id == 2 && middle.movies[1].item_id == 3 &&
+        last.total == 5 && last.movies .^Length == 1 && last.movies[0].item_id == 4 &&
+        search.total == 1 && search.movies .^Length == 1 && search.movies[0].item_id == 1 &&
+        partial.total == 1 && partial.movies[0].item_id == 0 &&
+        empty.total == 0 && empty.movies .^Length == 0;
+    println!("browser_catalogue={} browse_pages={} latin1_case_search={} empty_search={}",passed,
+        initial.movies .^Length == 2 && middle.movies .^Length == 2 && last.movies .^Length == 1,
+        search.total == 1 && search.movies[0].item_id == 1,
+        empty.total == 0);
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

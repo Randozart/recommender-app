@@ -1,0 +1,105 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_live.bv";
+
+defn server_http(state: ServerState, slot: Int) -> ServerState {
+    let input: ByteBuf = io_buffer(state.reactor,slot);
+    let size: Int = io_http_size(input);
+    when size == -2 { io_http_reply(state.reactor,slot,400,"{\"error\":\"invalid-request\"}"); term state; };
+    when size == -3 || (size == -1 && input.len == SERVER_INPUT_LIMIT) {
+        io_http_reply(state.reactor,slot,413,"{\"error\":\"request-too-large\"}"); term state;
+    };
+    when size < 0 || size > input.len { term state; };
+    let parsed: HttpParse = http_parse_request(input,input.len);
+    when parsed.status != HTTP_COMPLETE { term state; };
+    io_consume(state.reactor,slot,parsed.consumed);
+    let request: HttpRequest = parsed.request;
+    trace_begin(io_header(request,"X-Recommender-Trace"));
+    when request.method == "POST" { api_trace(request.body,io_header(request,"X-Recommender-Trace")); };
+    let request_started: Int = trace_clock();
+    when api_path(request.path) == "/live" {
+        let upgraded: ServerState = live_upgrade(state,slot,request);
+        when Load#(reactor_row(state.reactor,slot)+16,8) == 1 { term live_frames(upgraded,slot,16); };
+        term upgraded;
+    };
+    when request.method == "GET" && (api_path(request.path) == "/state" || api_path(request.path) == "/recommendations") {
+        let reply: ApiReply = server_cached_state(state,request);
+        trace_stage("cached_get",request_started);
+        io_http_reply(state.reactor,slot,reply.status,reply.body); term state;
+    };
+    when request.method == "POST" && api_path(request.path) == "/operations/status" {
+        term server_operation_status_dispatch(state,slot,request);
+    };
+    when request.method == "POST" && server_operation_action_path(api_path(request.path)) {
+        let action: ServerAdmissionResult = server_operation_action(state,request);
+        io_http_reply(action.state.reactor,slot,action.status,action.body);
+        term action.state;
+    };
+    when request.method == "POST" && (api_path(request.path) == "/login" || api_path(request.path) == "/register") {
+        let kind: String = "login";
+        when api_path(request.path) == "/register" { kind = "register"; };
+        term server_auth_dispatch(state,slot,kind,request);
+    };
+    when request.method == "POST" && api_path(request.path) == "/ratings" {
+        let token: String = api_token(request.path);
+        let owner: Int = session_account(state.sessions,token);
+        when owner <= 0 { io_http_reply(state.reactor,slot,401,"{\"error\":\"auth-failed\"}"); term state; };
+        let command: Result<RatingCommand,String> = protocol_decode_command(request.body);
+        when is_err(command) { io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":"+api_quote(unwrap_err(command))+"}"); term state; };
+        let dispatched: ServerAdmissionResult = server_dispatch_admission(state,owner,token,unwrap(command));
+        io_http_reply(dispatched.state.reactor,slot,dispatched.status,dispatched.body);
+        term dispatched.state;
+    };
+    let runtime: ApiRuntime = ApiRuntime { catalogue: state.catalogue, lambda: state.lambda,
+        timestamp: server_timestamp(), server_epoch: state.server_epoch };
+    let reply: ApiReply = api_dispatch(state.conn,state.sessions,state.model,request,runtime);
+    let updated: ServerState = server_after_reply(state,reply);
+    trace_stage("http_dispatch",request_started);
+    io_http_reply(state.reactor,slot,reply.status,reply.body);
+    term updated;
+};
+
+defn server_advance(state: ServerState, slot: Int) -> ServerState {
+    let row: Int = reactor_row(state.reactor,slot);
+    when Load#(row,8) < 0 { term server_forget_live_session(state,slot); };
+    let events: Int = reactor_events(state.reactor,slot);
+    when (events & 40) != 0 { reactor_remove(state.reactor,slot); term server_forget_live_session(state,slot); };
+    when (events & 17) != 0 && Load#(row+112,8) == 0 && Load#(row+120,8) == 0 {
+        let count: Int = io_read(state.reactor,slot);
+        when count < 0 && count != -90 { term server_forget_live_session(state,slot); };
+    };
+    let updated: ServerState = state;
+    when Load#(row+32,8) > 0 && Load#(row+112,8) == 0 {
+        when Load#(row+16,8) == 0 { updated = server_http(updated,slot); };
+        when Load#(row+16,8) == 1 { updated = live_frames(updated,slot,16); };
+    };
+    when Load#(row,8) < 0 { term server_forget_live_session(updated,slot); };
+    when Load#(row+120,8) != 0 && Load#(row+48,8) == 0 {
+        reactor_remove(state.reactor,slot); term server_forget_live_session(updated,slot);
+    };
+    // A newly queued response may be sent immediately. One syscall per slot
+    // preserves fairness; subsequent partial writes resume from saved progress.
+    io_flush(state.reactor,slot);
+    when Load#(row,8) < 0 { term server_forget_live_session(updated,slot); };
+    term updated;
+};
+
+defn server_step(state: ServerState, timeout: Int) -> ServerState {
+    trace_begin("");
+    let updated: ServerState = state;
+    when state.worker.pid > 0 || state.refresh || server_clock() >= state.next_refresh { updated = server_refresh(state); };
+    updated = server_worker_poll(updated);
+    let ready: Int = reactor_poll(updated.reactor,timeout);
+    when ready < 0 {
+        println!("Socket readiness failed (errno {}); check descriptor limits and restart with a valid MAX_CONNECTIONS.",ready);
+        stdout_flush();
+        let exited: Int = syscall(60,1);
+        term updated;
+    };
+    foreach slot in 0..updated.reactor.capacity { updated = server_advance(updated,slot); };
+    updated = server_worker_poll(updated);
+    trace_begin("");
+    updated = server_refresh_owner(updated);
+    term updated;
+};

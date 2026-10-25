@@ -1,0 +1,148 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_test_support.bv";
+import { cf_predict } from "../../../examples/recommender/cf_engine.bv";
+import { json_finite } from "std/json.bv";
+
+defn test_ws_second_payload(text: String) -> String {
+    let buffer: GrowBuf = put_str(grow_new(text .^Length+1),text);
+    let first: WsMessage = ws_message(ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap },0);
+    when first.status != WS_COMPLETE { grow_free(buffer); term ""; };
+    let second: WsMessage = ws_message(ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap },first.consumed);
+    grow_free(buffer);
+    when second.status != WS_COMPLETE { term ""; };
+    term second.payload;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let server: ServerState = test_server();
+    let alice_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
+    server = alice_register.server;
+    let bob_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"bob\",\"password\":\"bob-secret\"}");
+    server = bob_register.server;
+    let alice_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
+    server = alice_login.server;
+    let alice: String = api_input(test_body(alice_login.response)).token;
+    let alice_login_second: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
+    server = alice_login_second.server;
+    let alice_second: String = api_input(test_body(alice_login_second.response)).token;
+    let bob_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"bob\",\"password\":\"bob-secret\"}");
+    server = bob_login.server;
+    let bob: String = api_input(test_body(bob_login.response)).token;
+    when alice .^Length != 32 || alice_second .^Length != 32 || alice == alice_second || bob .^Length != 32 {
+        println!("login failed alice={} second={} bob={}",alice_login.response,alice_login_second.response,bob_login.response); endprogram 1;
+    };
+    let live_alice: Socket = sock_tcp();
+    let live_bob: Socket = sock_tcp();
+    let live_second: Socket = sock_tcp();
+    let port: Int = test_port(server.reactor.listener);
+    let conn_alice: Int = sock_connect(live_alice,LOOPBACK,port);
+    let conn_bob: Int = sock_connect(live_bob,LOOPBACK,port);
+    let conn_second: Int = sock_connect(live_second,LOOPBACK,port);
+    let sent_alice: Bool = test_upgrade(live_alice,alice);
+    let sent_bob: Bool = test_upgrade(live_bob,bob);
+    let sent_second: Bool = test_upgrade(live_second,alice_second);
+    let nb_alice: Int = sock_set_nonblocking(live_alice);
+    let nb_bob: Int = sock_set_nonblocking(live_bob);
+    let nb_second: Int = sock_set_nonblocking(live_second);
+    server = test_pump(server);
+    let handshake_alice: String = test_read(live_alice);
+    let handshake_bob: String = test_read(live_bob);
+    let handshake_second: String = test_read(live_second);
+    let upgraded: Bool = str_find(handshake_alice,"101 Switching") >= 0 && str_find(handshake_bob,"101 Switching") >= 0 && str_find(handshake_second,"101 Switching") >= 0;
+    upgraded = upgraded && str_find(handshake_alice,"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") >= 0;
+    let delivered: Bool = true;
+    foreach item in 0..5 {
+        let nonce: String = session_random_token();
+        let operation: String = unwrap(protocol_operation_id(server.server_epoch,nonce));
+        let command: RatingCommand = RatingCommand { server_epoch: server.server_epoch,
+            operation_id: operation, item_id: item, rating: 4 };
+        let payload: String = unwrap(protocol_encode_command(command));
+        let first_part: Bool = test_ws(live_alice,1,false,payload[0:10]);
+        server = test_pump(server);
+        let early: String = test_read(live_alice);
+        let last_part: Bool = test_ws(live_alice,0,true,payload[10:payload .^Length]);
+        server = test_pump(server);
+        let own: String = test_read(live_alice);
+        let other_own: String = test_read(live_second);
+        let foreign: String = test_read(live_bob);
+        when !first_part || !last_part || early .^Length != 0 || foreign .^Length != 0 || own != other_own ||
+            str_find(own,"\"type\":\"accepted\"") < 0 || str_find(own,"\"type\":\"recommendations\"") < 0 { delivered = false; };
+        when item < 4 && str_find(own,"\"cold_start\":true") < 0 { delivered = false; };
+        when item == 4 && str_find(own,"\"recommendations\"") < 0 { delivered = false; };
+        when !delivered { println!("live item={} payload={} early={} own={} other={} foreign={}",item,payload,early,own,other_own,foreign); };
+    };
+    let alice_state: TestExchange = test_http(server,"GET","/state?token="+alice,"");
+    server = alice_state.server;
+    let bob_state: TestExchange = test_http(server,"GET","/state?token="+bob,"");
+    server = bob_state.server;
+    let isolated: Bool = str_find(alice_state.response,"recommendations") >= 0 && str_find(bob_state.response,"\"ratings\":[]") >= 0 && str_find(bob_state.response,"cold_start") >= 0;
+    when !isolated { println!("alice_state={} bob_state={}",alice_state.response,bob_state.response); };
+    let ping_sent: Bool = test_ws(live_alice,9,true,"ping");
+    server = test_pump(server);
+    let pong: Bool = test_ws_payload(test_read(live_alice)) == "ping";
+    when !ping_sent || !pong { println!("ping sent={} pong={}",ping_sent,pong); };
+    let http_nonce: String = session_random_token();
+    let http_operation: String = unwrap(protocol_operation_id(server.server_epoch,http_nonce));
+    let http_command: RatingCommand = RatingCommand { server_epoch: server.server_epoch,
+        operation_id: http_operation, item_id: 0, rating: 2 };
+    let http_body: String = "{\"v\":1,\"server_epoch\":"+api_quote(http_command.server_epoch)+
+        ",\"operation_id\":"+api_quote(http_command.operation_id)+",\"item_id\":0,\"rating\":2}";
+    let http_rating: TestExchange = test_http(server,"POST","/v1/ratings?token="+alice,http_body);
+    server = http_rating.server;
+    let http_push: String = test_ws_payload(test_read(live_alice));
+    let second_push: String = test_ws_payload(test_read(live_second));
+    let bob_push: String = test_read(live_bob);
+    let http_live: Bool = str_find(http_rating.response," 202 ") >= 0 && http_push .^Length > 0 && http_push == second_push && bob_push .^Length == 0;
+    when !http_live { println!("http response={} push={} second={} foreign={}",http_rating.response,http_push,second_push,bob_push); };
+    let refresh: TestExchange = test_http(server,"POST","/admin/refresh","");
+    server = test_refresh_complete(refresh.server);
+    let refreshed: Bool = server.model.accounts .^Length == 2 && server.model.population.nnz == 29 && model_account_row(server.model,1,0) == 3 && model_account_row(server.model,2,0) == 4;
+    when !refreshed { println!("refresh response={} accounts={} nnz={} rows={},{}",refresh.response,server.model.accounts .^Length,server.model.population.nnz,model_account_row(server.model,1,0),model_account_row(server.model,2,0)); };
+    let fresh_account: AccountState = account_state(server.conn,server.sessions,alice);
+    let active: ActivePrediction = active_build(server.model,fresh_account);
+    let engine_agrees: Bool = true;
+    foreach item in 5..8 {
+        let cached: Float = clamp15(server.lambda*active_user_prediction(active,item)+(1.0-server.lambda)*active_item_prediction(active,item));
+        let reference: Float = cf_predict(server.model.population,server.model.means,model_account_row(server.model,fresh_account.result.account.id,0),item,server.lambda);
+        when !json_finite(cached) || !json_finite(reference) { engine_agrees = false; };
+        when Abs#(cached-reference) > 0.000001 { engine_agrees = false; };
+    };
+    vec_free(active.similarities);
+    let refresh_push_alice: String = test_read(live_alice);
+    let refresh_push_second: String = test_read(live_second);
+    let logout: TestExchange = test_http(server,"POST","/v1/logout?token="+alice,"");
+    server = logout.server;
+    server = test_pump(server);
+    let alice_logout_wire: String = test_read(live_alice);
+    let alice_close_code: Int = 0;
+    when alice_logout_wire .^Length == 4 && byte_at(alice_logout_wire,0) == 136 && byte_at(alice_logout_wire,1) == 2 {
+        alice_close_code = byte_at(alice_logout_wire,2)*256+byte_at(alice_logout_wire,3);
+    };
+    let second_ping_sent: Bool = test_ws(live_second,9,true,"after-logout");
+    server = test_pump(server);
+    let second_ping_wire: String = test_read(live_second);
+    let second_prior_payload: String = test_ws_payload(second_ping_wire);
+    let second_ping_payload: String = test_ws_second_payload(second_ping_wire);
+    when second_ping_payload .^Length == 0 { second_ping_payload = test_ws_payload(test_read(live_second)); };
+    let second_session_live: Bool = second_ping_payload == "after-logout" || second_prior_payload == "after-logout";
+    let revoked_state: TestExchange = test_http(server,"GET","/v1/state?token="+alice,"");
+    server = revoked_state.server;
+    let other_state: TestExchange = test_http(server,"GET","/v1/state?token="+alice_second,"");
+    server = other_state.server;
+    let logout_isolated: Bool = str_find(logout.response," 200 ") >= 0 && alice_close_code == 1008 &&
+        second_ping_sent && second_session_live && str_find(revoked_state.response," 401 ") >= 0 &&
+        str_find(other_state.response," 200 ") >= 0 && server.live_sessions .^Length == 2;
+    when !logout_isolated { println!("logout response={} alice_wire={} close_code={} second_wire={} second_live={} revoked={} other={} live_sessions={}",logout.response,alice_logout_wire,alice_close_code,second_ping_wire,second_session_live,revoked_state.response,other_state.response,server.live_sessions .^Length); };
+    let close_a: Int = sock_close(live_alice);
+    let close_b: Int = sock_close(live_bob);
+    let close_second: Int = sock_close(live_second);
+    server = test_pump(server);
+    let cleaned: Bool = reactor_free_slot(server.reactor,0) == 0;
+    println!("upgrade={} fragmented_rating_five={} owner_isolation={} ping_pong={} http_rating_push={} refresh_mapping={} cached_engine_agrees={} logout_isolated={} cleanup={}",upgraded,delivered,isolated,ping_sent && pong,http_live,refreshed,engine_agrees,logout_isolated,cleaned);
+    model_free(server.model); reactor_close(server.reactor); pg_close(server.conn);
+    when !upgraded || !delivered || !isolated || !pong || !http_live || !refreshed || !engine_agrees || !logout_isolated || !cleaned { endprogram 1; };
+    tick = 1; endprogram;
+};

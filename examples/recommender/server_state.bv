@@ -1,0 +1,1184 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_api.bv";
+import "./movie_catalogue.bv";
+import "./server_io.bv";
+import "./model_worker.bv";
+import "./sessions.bv";
+import "./admission.bv";
+import "./worker_pool.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+obj OwnerView { owner: Int; recommendations: String; username: String; ratings_json: String; };
+// 2026-10-23: bind each live channel to the exact opaque token used at upgrade.
+// Account IDs alone let a channel survive logout when another tab has a token
+// for the same account; slot+fd also prevents a reused reactor slot inheriting
+// the old binding. Retire this map only when the reactor owns token identity.
+obj LiveSession { slot: Int; fd: Int; token: String; };
+obj ServerWorkers {
+    persistence: WorkerChannel; prediction: WorkerChannel; database_identity: String;
+    persistence_busy: Bool; prediction_busy: Bool; persistence_tag: WorkerTag; prediction_tag: WorkerTag;
+    auth_slot: Int; auth_kind: String; next_job: Int;
+};
+obj ServerState {
+    reactor: Reactor; conn: PgConn; model: ServerModel; catalogue: MovieCatalogue; sessions: SessionStore;
+    server_epoch: String;
+    views: List<OwnerView>; live_sessions: List<LiveSession>; admission: AdmissionState;
+    workers: ServerWorkers; lambda: Float;
+    refresh: Bool; next_refresh: Int; interval: Int; worker: RefreshWorker;
+};
+obj ServerAdmissionResult { state: ServerState; status: Int; body: String; accepted: Bool; };
+
+defn server_time(clock_id: Int) -> Int {
+    let memory: Int = Malloc#(16) as Int;
+    when memory == 0 { term -1; };
+    let result: Int = syscall(228,clock_id,memory);
+    // 2026-10-22: a failed clock call leaves timespec unwritten. Check before
+    // reading it; retain this guard if clock allocation is later centralized.
+    when result < 0 { Free#(memory as Ptr); term -1; };
+    let now: Int = Load#(memory,8)*1000 + Load#(memory+8,8)/1000000;
+    Free#(memory as Ptr);
+    term now;
+};
+
+defn server_clock() -> Int { term server_time(1); };
+defn server_timestamp_from_millis(milliseconds: Int) -> Int {
+    when milliseconds < 0 { term -1; };
+    term milliseconds/1000;
+};
+
+defn server_timestamp() -> Int { term server_timestamp_from_millis(server_time(0)); };
+
+defn server_empty_worker_channel(role: String, epoch: String) -> WorkerChannel {
+    term WorkerChannel { fd: -1, pid: 0, role: role, epoch: epoch, ready: false, partial_read: false,
+        tx: GrowBuf { ptr: 0, len: 0, cap: 0 }, tx_offset: 0,
+        rx: GrowBuf { ptr: 0, len: 0, cap: 0 }, terminal: 0 };
+};
+
+defn server_empty_workers(epoch: String) -> ServerWorkers {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "0", attempt: 0, model_generation: "0" };
+    term ServerWorkers { persistence: server_empty_worker_channel("persistence",epoch),
+        prediction: server_empty_worker_channel("prediction",epoch), database_identity: "",
+        persistence_busy: false, prediction_busy: false, persistence_tag: tag, prediction_tag: tag,
+        auth_slot: -1, auth_kind: "", next_job: 1 };
+};
+
+defn server_with_workers(state: ServerState, workers: ServerWorkers) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: state.sessions,
+        server_epoch: state.server_epoch, views: state.views, live_sessions: state.live_sessions,
+        admission: state.admission, workers: workers, lambda: state.lambda, refresh: state.refresh,
+        next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
+};
+
+defn server_worker_yield() -> Void {
+    let delay: Int = Malloc#(16) as Int;
+    when delay != 0 {
+        Store#(delay,0,8); Store#(delay+8,1000000,8);
+        syscall(SYS_NANOSLEEP,delay,0);
+        Free#(delay as Ptr);
+    };
+    term;
+};
+
+defn server_worker_wait_frame(channel: WorkerChannel, attempts: Int) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || attempts <= 0 { term channel; };
+    let view: ByteBuf = ByteBuf { ptr: channel.rx.ptr, len: channel.rx.len, cap: channel.rx.cap };
+    let size: Int = worker_frame_size(view);
+    when size > 0 && view.len >= size { term channel; };
+    let updated: WorkerChannel = worker_channel_read(channel);
+    when updated.rx.len == channel.rx.len { server_worker_yield(); };
+    term server_worker_wait_frame(updated,attempts-1);
+};
+
+defn server_worker_wait_started(channel: WorkerChannel) -> Result<WorkerChannel,String> {
+    let ready: WorkerChannel = server_worker_wait_frame(channel,100000);
+    when ready.fd < 0 || ready.terminal != 0 || !ready.ready { term Err("Recommender worker did not complete its bounded startup handshake."); };
+    let taken: Result<WorkerReceived,String> = worker_channel_take(ready);
+    when is_err(taken) { term Err(unwrap_err(taken)); };
+    let received: WorkerReceived = unwrap(taken);
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(received.frame.text);
+    when is_err(decoded) { term Err(unwrap_err(decoded)); };
+    when unwrap(decoded).kind != "started" || protocol_text(protocol_member(unwrap(decoded).payload,"role")) != channel.role {
+        term Err("Recommender worker returned the wrong startup role.");
+    };
+    term Ok(received.channel);
+};
+
+defn server_worker_flush(channel: WorkerChannel, attempts: Int) -> WorkerChannel {
+    when channel.fd < 0 || channel.terminal != 0 || attempts <= 0 || channel.tx_offset >= channel.tx.len { term channel; };
+    let updated: WorkerChannel = worker_channel_write(channel);
+    when updated.tx_offset == channel.tx_offset { server_worker_yield(); };
+    term server_worker_flush(updated,attempts-1);
+};
+
+defn server_worker_exchange(channel: WorkerChannel, request: WorkerMessage) -> Result<(WorkerChannel,WorkerMessage),String> {
+    let encoded: Result<String,String> = protocol_encode_worker(request);
+    when is_err(encoded) { term Err(unwrap_err(encoded)); };
+    let queued: Result<WorkerChannel,String> = worker_channel_queue(channel,unwrap(encoded));
+    when is_err(queued) { term Err(unwrap_err(queued)); };
+    let sent: WorkerChannel = server_worker_flush(unwrap(queued),100000);
+    when sent.fd < 0 || sent.terminal != 0 || sent.tx_offset < sent.tx.len { term Err("Worker request could not be delivered."); };
+    let received: WorkerChannel = server_worker_wait_frame(sent,100000);
+    when received.fd < 0 || received.terminal != 0 { term Err("Worker reply channel closed before its response arrived."); };
+    let taken: Result<WorkerReceived,String> = worker_channel_take(received);
+    when is_err(taken) { term Err(unwrap_err(taken)); };
+    let response: WorkerReceived = unwrap(taken);
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(response.frame.text);
+    when is_err(decoded) { term Err(unwrap_err(decoded)); };
+    when !worker_same_tag(request.tag,unwrap(decoded).tag) { term Err("Worker reply did not match the in-flight job tag."); };
+    term Ok((response.channel,unwrap(decoded)));
+};
+
+defn server_model_worker_install(channel: WorkerChannel, model: ServerModel, epoch: String) -> Result<WorkerChannel,String> {
+    let path: String = "/tmp/recommender-worker-"+epoch+".snapshot";
+    when !model_save(model,path) { term Err("Cannot publish the initial prediction worker snapshot."); };
+    let image: Result<String,Int> = read_file(path);
+    when is_err(image) { term Err("Cannot measure the initial prediction worker snapshot."); };
+    let bytes: Int = unwrap(image) .^Length;
+    Free#(((unwrap(image) as Data) as Int) as Ptr);
+    let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "1", attempt: 1, model_generation: "1" };
+    let fields: List<(String,JsonValue)> = [("generation",StrVal("1")),("path",StrVal(path)),
+        ("identity",StrVal(model.revision)),("bytes",IntVal(bytes))];
+    let request: WorkerMessage = WorkerMessage { kind: "install", tag: tag, payload: Object(fields) };
+    let exchanged: Result<(WorkerChannel,WorkerMessage),String> = server_worker_exchange(channel,request);
+    when is_err(exchanged) { term Err(unwrap_err(exchanged)); };
+    let (updated,response): (WorkerChannel,WorkerMessage) = unwrap(exchanged);
+    when response.kind != "ready" { term Err("Prediction worker rejected the initial model generation."); };
+    term Ok(updated);
+};
+
+defn server_workers_start(state: ServerState) -> Result<ServerState,String> {
+    let identity: Result<String,String> = operation_store_database_identity(state.conn,state.server_epoch);
+    when is_err(identity) { term Err(unwrap_err(identity)); };
+    let inherited: List<Int> = [state.reactor.listener,state.conn.sock.fd];
+    let persistence: Result<WorkerChannel,String> = worker_spawn("persistence",state.server_epoch,inherited,1,1,0);
+    when is_err(persistence) { term Err(unwrap_err(persistence)); };
+    let started: Result<WorkerChannel,String> = server_worker_wait_started(unwrap(persistence));
+    when is_err(started) { term Err(unwrap_err(started)); };
+    let prediction_fds: List<Int> = [state.reactor.listener,state.conn.sock.fd,unwrap(started).fd];
+    let prediction: Result<WorkerChannel,String> = worker_spawn("prediction",state.server_epoch,prediction_fds,1,1,0);
+    when is_err(prediction) { term Err(unwrap_err(prediction)); };
+    let prediction_started: Result<WorkerChannel,String> = server_worker_wait_started(unwrap(prediction));
+    when is_err(prediction_started) { term Err(unwrap_err(prediction_started)); };
+    let installed: Result<WorkerChannel,String> = server_model_worker_install(unwrap(prediction_started),state.model,state.server_epoch);
+    when is_err(installed) { term Err(unwrap_err(installed)); };
+    let empty: ServerWorkers = server_empty_workers(state.server_epoch);
+    let workers: ServerWorkers = ServerWorkers { persistence: unwrap(started), prediction: unwrap(installed),
+        database_identity: unwrap(identity), persistence_busy: false, prediction_busy: false,
+        persistence_tag: empty.persistence_tag, prediction_tag: empty.prediction_tag,
+        auth_slot: -1, auth_kind: "", next_job: 2 };
+    term Ok(server_with_workers(state,workers));
+};
+
+defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, catalogue: MovieCatalogue,
+    lambda: Float, interval: Int) -> ServerState {
+    let views: List<OwnerView> = [];
+    let live_sessions: List<LiveSession> = [];
+    // 2026-10-23: one random process identity scopes protocol profile revisions
+    // across account sessions; preserve it across snapshots and state copies.
+    // Undo by removing the field only when the server protocol owns an epoch.
+    let epoch: String = session_random_token();
+    let limits: AdmissionLimits = AdmissionLimits { profiles: 4096, pending_global: 1024,
+        pending_owner: 64, receipt_slots: 65536, retained_bytes: 67108864 };
+    let admission: AdmissionState = profile_empty(epoch,limits);
+    term ServerState { reactor: reactor, conn: conn, model: model, catalogue: catalogue, sessions: sessions_new(),
+        server_epoch: epoch,
+        views: views, live_sessions: live_sessions, admission: admission, workers: server_empty_workers(epoch), lambda: lambda, refresh: false,
+        next_refresh: server_clock()+interval, interval: interval, worker: worker_idle() };
+};
+
+defn server_with(state: ServerState, sessions: SessionStore, views: List<OwnerView>, refresh: Bool) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: sessions,
+        server_epoch: state.server_epoch,
+        views: views, live_sessions: state.live_sessions, admission: state.admission, workers: state.workers, lambda: state.lambda, refresh: refresh,
+        next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
+};
+
+defn server_with_live_sessions(state: ServerState, sessions: List<LiveSession>) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: state.sessions,
+        server_epoch: state.server_epoch, views: state.views, live_sessions: sessions, admission: state.admission,
+        workers: state.workers, lambda: state.lambda,
+        refresh: state.refresh, next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
+};
+
+defn server_track_live_session(state: ServerState, slot: Int, owner: Int, token: String) -> ServerState {
+    let row: Int = reactor_row(state.reactor,slot);
+    let fd: Int = Load#(row,8);
+    when fd < 0 || owner < 1 || token .^Length != 32 { term state; };
+    let session: List<LiveSession> = [LiveSession { slot: slot, fd: fd, token: token }];
+    term server_with_live_sessions(state,state.live_sessions+session);
+};
+
+defn server_live_session_token(state: ServerState, slot: Int, fd: Int, idx: Int) -> String {
+    when idx >= state.live_sessions .^Length { term ""; };
+    let session: LiveSession = state.live_sessions[idx];
+    when session.slot == slot && session.fd == fd && session_account(state.sessions,session.token) > 0 {
+        term session.token;
+    };
+    term server_live_session_token(state,slot,fd,idx+1);
+};
+
+defn server_forget_live_session_at(sessions: List<LiveSession>, slot: Int, idx: Int,
+    remaining: List<LiveSession>) -> List<LiveSession> {
+    when idx >= sessions .^Length { term remaining; };
+    when sessions[idx].slot != slot { remaining <- sessions[idx]; };
+    term server_forget_live_session_at(sessions,slot,idx+1,remaining);
+};
+
+defn server_forget_live_session(state: ServerState, slot: Int) -> ServerState {
+    // 2026-10-25: idle reactor slots have no session to remove. Preserve the
+    // existing state instead of allocating a replacement list every sweep.
+    let found: Bool = false;
+    foreach idx in 0..state.live_sessions .^Length {
+        when state.live_sessions[idx].slot == slot { found = true; };
+    };
+    when !found { term state; };
+    let remaining: List<LiveSession> = [];
+    term server_with_live_sessions(state,server_forget_live_session_at(state.live_sessions,slot,0,remaining));
+};
+
+defn server_revoked_token(old: SessionStore, next: SessionStore, idx: Int) -> String {
+    when idx >= old.entries .^Length { term ""; };
+    let token: String = old.entries[idx].token;
+    when session_account(next,token) == 0 { term token; };
+    term server_revoked_token(old,next,idx+1);
+};
+
+defn server_close_token_channels(state: ServerState, token: String) -> Bool {
+    foreach idx in 0..state.live_sessions .^Length {
+        let live: LiveSession = state.live_sessions[idx];
+        when live.token == token {
+            let row: Int = reactor_row(state.reactor,live.slot);
+            when Load#(row,8) == live.fd && Load#(row+16,8) == 1 && Load#(row+112,8) == 0 {
+                io_ws_close(state.reactor,live.slot,1008);
+            };
+        };
+    };
+    term true;
+};
+
+defn server_owner_view(views: List<OwnerView>, owner: Int) -> String {
+    foreach idx in 0..views .^Length { when views[idx].owner == owner { term views[idx].recommendations; }; };
+    term "";
+};
+
+defn server_owner_state_view(views: List<OwnerView>, owner: Int) -> OwnerView {
+    foreach idx in 0..views .^Length { when views[idx].owner == owner { term views[idx]; }; };
+    term OwnerView { owner: 0, recommendations: "", username: "", ratings_json: "[]" };
+};
+
+defn server_set_view(views: List<OwnerView>, owner: Int, body: String) -> List<OwnerView> {
+    let updated: List<OwnerView> = [];
+    foreach idx in 0..views .^Length {
+        when views[idx].owner != owner {
+            let entry: List<OwnerView> = [views[idx]];
+            updated = updated + entry;
+        };
+    };
+    let added: List<OwnerView> = [OwnerView { owner: owner, recommendations: body, username: "", ratings_json: "[]" }];
+    term updated + added;
+};
+
+defn server_set_account_view(views: List<OwnerView>, account: AccountState, body: String) -> List<OwnerView> {
+    let updated: List<OwnerView> = [];
+    foreach idx in 0..views .^Length { when views[idx].owner != account.result.account.id { updated <- views[idx]; }; };
+    let added: List<OwnerView> = [OwnerView { owner: account.result.account.id, recommendations: body,
+        username: account.result.account.username, ratings_json: api_ratings(account) }];
+    term updated+added;
+};
+
+defn server_owner_token(sessions: SessionStore, owner: Int) -> String {
+    foreach idx in 0..sessions.entries .^Length {
+        when sessions.entries[idx].account_id == owner { term sessions.entries[idx].token; };
+    };
+    term "";
+};
+
+defn server_update_owner(state: ServerState, owner: Int) -> ServerState {
+    let identity_started: Int = trace_clock();
+    let account: AccountState = account_state(state.conn,state.sessions,server_owner_token(state.sessions,owner));
+    trace_stage("prediction_identity_db",identity_started);
+    let body: String = "{\"error\":\"auth-failed\"}";
+    when account.result.ok { body = api_recommendations(state.model,account,state.lambda); };
+    when !account.result.ok && account.result.error != "auth-failed" { body = "{\"error\":\"database\"}"; };
+    when account.result.ok {
+        term server_with(state,state.sessions,server_set_account_view(state.views,account,body),state.refresh);
+    };
+    term server_with(state,state.sessions,server_set_view(state.views,owner,body),state.refresh);
+};
+
+// 2026-10-21: login and rating changes materialize one owner's recommendations.
+// GETs read that result, never rerun similarity construction. Refresh updates
+// all materialized owners only AFTER the replacement model is complete.
+// Replace this per-owner cache only with another population-independent read path.
+defn server_cached_state(state: ServerState, request: HttpRequest) -> ApiReply {
+    let owner: Int = session_account(state.sessions,api_token(request.path));
+    when owner <= 0 { term api_error("auth-failed",state.sessions); };
+    let cached: OwnerView = server_owner_state_view(state.views,owner);
+    let body: String = cached.recommendations;
+    when body .^Length == 0 { term api_error("session",state.sessions); };
+    when api_path(request.path) == "/recommendations" { term api_reply(200,body,state.sessions); };
+    let profile_idx: Int = profile_at(state.admission,owner);
+    let revision: String = "0";
+    let ratings_json: String = cached.ratings_json;
+    when profile_idx >= 0 { revision = state.admission.profiles[profile_idx].version.revision; };
+    when profile_idx >= 0 {
+        let ratings: Result<JsonValue,String> = protocol_ratings_value(state.admission.profiles[profile_idx].ratings);
+        when is_ok(ratings) {
+            let encoded: Result<String,String> = json_stringify(unwrap(ratings));
+            when is_ok(encoded) { ratings_json = unwrap(encoded); };
+        };
+    };
+    let operations: String = server_owner_operation_entries(state,owner,0,"");
+    let state_body: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"state\",\"profile\":{\"server_epoch\":"+
+        api_quote(state.server_epoch)+",\"account_id\":"+owner as String+",\"revision\":"+api_quote(revision)+"},\"username\":"+
+        api_quote(cached.username)+",\"ratings\":"+ratings_json+",\"model_generation\":"+
+        api_quote(state.model.revision)+",\"operations\":["+operations+"],\"next_after_revision\":"+
+        api_quote(revision)+",\"through_revision\":"+api_quote(revision)+",";
+    term api_reply(200,state_body+body[1:body .^Length],state.sessions);
+};
+
+defn server_owner_operation_entries(state: ServerState, owner: Int, start: Int, initial: String) -> String {
+    let entries: String = initial;
+    foreach idx in start..state.admission.operations .^Length {
+        let entry: OperationStatus = state.admission.operations[idx];
+        when entry.accepted.profile.account_id == owner {
+            let separator: String = ",";
+            when entries .^Length == 0 { separator = ""; };
+            entries += separator+server_operation_status_entry(state,owner,entry.accepted.operation_id);
+        };
+    };
+    term entries;
+};
+
+defn server_worker_queue(channel: WorkerChannel, message: WorkerMessage) -> Result<WorkerChannel,String> {
+    let encoded: Result<String,String> = protocol_encode_worker(message);
+    when is_err(encoded) { term Err(unwrap_err(encoded)); };
+    let queued: Result<WorkerChannel,String> = worker_channel_queue(channel,unwrap(encoded));
+    when is_err(queued) { term Err(unwrap_err(queued)); };
+    term Ok(worker_channel_write(unwrap(queued)));
+};
+
+defn server_auth_tag(state: ServerState) -> WorkerTag {
+    term WorkerTag { profile: ProfileVersion { server_epoch: state.server_epoch, account_id: 0, revision: "0" },
+        job_id: state.workers.next_job as String, attempt: 1, model_generation: "0" };
+};
+
+defn server_auth_dispatch(state: ServerState, slot: Int, kind: String, request: HttpRequest) -> ServerState {
+    when state.workers.persistence_busy || !state.workers.persistence.ready {
+        io_http_reply(state.reactor,slot,503,"{\"error\":\"worker-busy\",\"message\":\"Authentication capacity is busy; retry shortly.\"}");
+        term state;
+    };
+    let input: ApiInput = api_input(request.body);
+    when !input.ok {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Send username and password as a JSON object.\"}");
+        term state;
+    };
+    when input.username .^Length == 0 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Enter a username to create your account.\"}");
+        term state;
+    };
+    when input.username .^Length > 128 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Usernames must be 128 characters or fewer.\"}");
+        term state;
+    };
+    when input.password .^Length < 8 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Choose a password with at least 8 characters.\"}");
+        term state;
+    };
+    when input.password .^Length > 1024 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Passwords must be 1024 characters or fewer.\"}");
+        term state;
+    };
+    let tag: WorkerTag = server_auth_tag(state);
+    let fields: List<(String,JsonValue)> = [("username",StrVal(input.username)),("password",StrVal(input.password))];
+    let message: WorkerMessage = WorkerMessage { kind: kind, tag: tag, payload: Object(fields) };
+    let queued: Result<WorkerChannel,String> = server_worker_queue(state.workers.persistence,message);
+    when is_err(queued) {
+        io_http_reply(state.reactor,slot,503,"{\"error\":\"worker-unavailable\",\"message\":\"Authentication worker is unavailable; retry shortly.\"}");
+        term state;
+    };
+    let workers: ServerWorkers = ServerWorkers { persistence: unwrap(queued), prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: true, prediction_busy: state.workers.prediction_busy,
+        persistence_tag: tag, prediction_tag: state.workers.prediction_tag, auth_slot: slot, auth_kind: kind,
+        next_job: state.workers.next_job+1 };
+    Store#(reactor_row(state.reactor,slot)+16,2,8);
+    term server_with_workers(state,workers);
+};
+
+defn server_worker_has_frame(channel: WorkerChannel) -> Bool {
+    when channel.rx.ptr == 0 { term false; };
+    let view: ByteBuf = ByteBuf { ptr: channel.rx.ptr, len: channel.rx.len, cap: channel.rx.cap };
+    let size: Int = worker_frame_size(view);
+    term size > 0 && view.len >= size;
+};
+
+defn server_persistence_channel_state(state: ServerState, channel: WorkerChannel) -> ServerState {
+    let workers: ServerWorkers = ServerWorkers { persistence: channel, prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: state.workers.persistence_busy,
+        prediction_busy: state.workers.prediction_busy, persistence_tag: state.workers.persistence_tag,
+        prediction_tag: state.workers.prediction_tag, auth_slot: state.workers.auth_slot,
+        auth_kind: state.workers.auth_kind, next_job: state.workers.next_job };
+    let updated: ServerState = server_with_workers(state,workers);
+    term updated;
+};
+
+defn server_persistence_frame(state: ServerState, channel: WorkerChannel) -> ServerState {
+    let taken: Result<WorkerReceived,String> = worker_channel_take(channel);
+    when is_err(taken) { term server_persistence_channel_state(state,channel); };
+    let received: WorkerReceived = unwrap(taken);
+    let decoded: Result<WorkerMessage,String> = protocol_decode_worker(received.frame.text);
+    when is_err(decoded) {
+        term server_persistence_channel_state(state,received.channel);
+    };
+    term server_persistence_response(state,received.channel,unwrap(decoded));
+};
+
+defn server_persistence_response(state: ServerState, channel: WorkerChannel,
+    response: WorkerMessage) -> ServerState {
+    let updated: ServerState = server_persistence_channel_state(state,channel);
+    term server_apply_persistence_reply(updated,response);
+};
+
+defn server_auth_reply(state: ServerState, response: WorkerMessage) -> ServerState {
+    let request_kind: String = state.workers.auth_kind;
+    let slot: Int = state.workers.auth_slot;
+    let workers: ServerWorkers = ServerWorkers { persistence: state.workers.persistence,
+        prediction: state.workers.prediction, database_identity: state.workers.database_identity,
+        persistence_busy: false, prediction_busy: state.workers.prediction_busy,
+        persistence_tag: state.workers.persistence_tag, prediction_tag: state.workers.prediction_tag,
+        auth_slot: -1, auth_kind: "", next_job: state.workers.next_job };
+    let updated: ServerState = server_with_workers(state,workers);
+    when slot < 0 || slot >= state.reactor.capacity || Load#(reactor_row(state.reactor,slot),8) < 0 { term updated; };
+    when response.kind == "error" {
+        let code: String = protocol_text(protocol_member(response.payload,"error"));
+        when request_kind == "status" {
+            io_http_reply(state.reactor,slot,503,"{\"error\":\"receipt-query\",\"message\":"+
+                api_quote(protocol_text(protocol_member(response.payload,"message")))+"}");
+            term updated;
+        };
+        let error: ApiReply = api_error(code,state.sessions);
+        io_http_reply(state.reactor,slot,error.status,error.body);
+        term updated;
+    };
+    when request_kind == "status" {
+        when response.kind != "receipts" {
+            io_http_reply(state.reactor,slot,503,"{\"error\":\"worker-protocol\"}");
+            term updated;
+        };
+        let receipts: List<JsonValue> = protocol_array(protocol_member(response.payload,"operations"));
+        updated.admission = server_reconcile_receipt_batch(updated.admission,response.tag.profile.account_id,receipts);
+        let entries: String = server_receipt_status_entries(updated, response.tag.profile.account_id, receipts,0,"");
+        let body: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"operation-status\",\"current_server_epoch\":"+
+            api_quote(state.server_epoch)+",\"operations\":["+entries+"]}";
+        io_http_reply(state.reactor,slot,200,body);
+        term updated;
+    };
+    when response.kind == "registered" {
+        io_http_reply(state.reactor,slot,200,"{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"registered\"}");
+        term updated;
+    };
+    when response.kind != "authenticated" {
+        io_http_reply(state.reactor,slot,503,"{\"error\":\"worker-protocol\"}");
+        term updated;
+    };
+    let owner: Int = protocol_integer(protocol_member(response.payload,"account_id"));
+    let token: String = protocol_text(protocol_member(response.payload,"token"));
+    let username: String = protocol_text(protocol_member(response.payload,"username"));
+    let ratings_result: Result<List<ProfileRating>,String> = protocol_ratings(protocol_member(response.payload,"ratings"));
+    when owner < 1 || !session_token_valid(token) || username .^Length == 0 || is_err(ratings_result) {
+        io_http_reply(state.reactor,slot,503,"{\"error\":\"worker-protocol\"}");
+        term updated;
+    };
+    let adopted: SessionIssue = session_adopt(updated.sessions,owner,token);
+    when !adopted.ok { io_http_reply(state.reactor,slot,503,"{\"error\":\"session\"}"); term updated; };
+    let profile: ProfileVersion = ProfileVersion { server_epoch: state.server_epoch, account_id: owner, revision: "0" };
+    let hydration_tag: WorkerTag = WorkerTag { profile: profile, job_id: response.tag.job_id,
+        attempt: 1, model_generation: "1" };
+    let hydrated: HydratedProfile = HydratedProfile { tag: hydration_tag, username: username, ratings: unwrap(ratings_result) };
+    let update: Result<ProfileUpdate,AdmissionError> = profile_hydrate(state.admission,hydrated);
+    when is_err(update) { io_http_reply(state.reactor,slot,503,"{\"error\":\"profile-capacity\"}"); term updated; };
+    let current: ServerState = server_with(updated,adopted.sessions,updated.views,updated.refresh);
+    Store#(reactor_row(state.reactor,slot)+16,0,8);
+    current.admission = unwrap(update).state;
+    let profile_json: Result<JsonValue,String> = protocol_ratings_value(unwrap(ratings_result));
+    let encoded: Result<String,String> = json_stringify(unwrap(profile_json));
+    let recs: String = "{\"recommendations\":[],\"cold_start\":true}";
+    let view: OwnerView = OwnerView { owner: owner, recommendations: recs, username: username,
+        ratings_json: unwrap(encoded) };
+    let views: List<OwnerView> = server_view_replace(current.views,view);
+    current.views = views;
+    let body: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"authenticated\",\"token\":"+
+        api_quote(token)+",\"server_epoch\":"+api_quote(state.server_epoch)+",\"account_id\":"+
+        owner as String+",\"username\":"+api_quote(username)+"}";
+    io_http_reply(state.reactor,slot,200,body);
+    term current;
+};
+
+defn server_receipt_status_entries(state: ServerState, owner: Int, receipts: List<JsonValue>, idx: Int,
+    initial: String) -> String {
+    let entries: String = initial;
+    foreach current in idx..receipts .^Length {
+        let receipt: JsonValue = receipts[current];
+        let operation_id: String = protocol_text(protocol_member(receipt,"operation_id"));
+        let status: String = protocol_text(protocol_member(receipt,"status"));
+        let retryable: Bool = false;
+        let message: String = "";
+        when status == "unknown" && profile_operation_at(state.admission,owner,operation_id) >= 0 {
+            status = "failed";
+            retryable = true;
+            message = "The database confirmed this operation did not commit; retry or discard it.";
+        };
+        let separator: String = ",";
+        when entries .^Length == 0 { separator = ""; };
+        let entry: String = "{\"operation_id\":"+api_quote(operation_id)+",\"status\":"+api_quote(status)+
+            ",\"revision\":"+api_quote(protocol_text(protocol_member(receipt,"revision")))+
+            ",\"item_id\":"+protocol_integer(protocol_member(receipt,"item_id")) as String+
+            ",\"rating\":"+protocol_integer(protocol_member(receipt,"rating")) as String+
+            ",\"retryable\":"+retryable as String+",\"message\":"+api_quote(message)+"}";
+        when status == "unknown" {
+            entry = "{\"operation_id\":"+api_quote(operation_id)+",\"status\":\"unknown\",\"revision\":\"0\",\"retryable\":true,\"message\":\"No durable receipt exists for this operation.\"}";
+        };
+        entries += separator+entry;
+    };
+    term entries;
+};
+
+defn server_reconcile_receipt_batch(admission: AdmissionState, owner: Int,
+    receipts: List<JsonValue>) -> AdmissionState {
+    let updated: AdmissionState = admission;
+    foreach idx in 0..receipts .^Length {
+        updated = server_reconcile_receipt(updated,owner,receipts[idx]);
+    };
+    term updated;
+};
+
+defn server_reconcile_receipt(admission: AdmissionState, owner: Int, receipt: JsonValue) -> AdmissionState {
+    let operation_id: String = protocol_text(protocol_member(receipt,"operation_id"));
+    let index: Int = profile_operation_at(admission,owner,operation_id);
+    when index < 0 { term admission; };
+    let prior: OperationStatus = admission.operations[index];
+    when protocol_head_released(prior.phase) { term admission; };
+    let status: String = protocol_text(protocol_member(receipt,"status"));
+    let phase: PersistencePhase = PersistFailed();
+    when status == "saved" { phase = PersistSaved(); };
+    when status == "discarded" { phase = PersistDiscarded(); };
+    let operation: OperationStatus = OperationStatus { accepted: prior.accepted, phase: phase,
+        timestamp: prior.timestamp, job: NoOperationJob(), reservation: NoAdmissionReservation(),
+        error: "" };
+    let operations: List<OperationStatus> = profile_operation_replace(admission.operations,index,operation);
+    let profiles: List<ProfileSnapshot> = admission.profiles;
+    let profile_idx: Int = profile_at(admission,owner);
+    when profile_idx >= 0 && status == "saved" {
+        let prior_profile: ProfileSnapshot = admission.profiles[profile_idx];
+        let committed: List<ProfileRating> = profile_upsert_rating(prior_profile.committed,prior.accepted.delta);
+        let profile: ProfileSnapshot = ProfileSnapshot { version: prior_profile.version, ratings: prior_profile.ratings,
+            committed: committed, model_generation: prior_profile.model_generation,
+            prediction_running: prior_profile.prediction_running, prediction_pending: prior_profile.prediction_pending,
+            last_active: prior_profile.last_active };
+        profiles = profile_snapshot_replace(profiles,profile_idx,profile);
+    };
+    when profile_idx >= 0 && status == "discarded" {
+        let prior_profile: ProfileSnapshot = admission.profiles[profile_idx];
+        let intermediate: AdmissionState = AdmissionState { clock: admission.clock, limits: admission.limits,
+            profiles: profiles, operations: operations };
+        let ratings: List<ProfileRating> = profile_rebuild_without(intermediate,owner,operation_id);
+        let profile: ProfileSnapshot = ProfileSnapshot { version: prior_profile.version, ratings: ratings,
+            committed: prior_profile.committed, model_generation: prior_profile.model_generation,
+            prediction_running: prior_profile.prediction_running, prediction_pending: prior_profile.prediction_pending,
+            last_active: prior_profile.last_active };
+        profiles = profile_snapshot_replace(profiles,profile_idx,profile);
+    };
+    term AdmissionState { clock: admission.clock, limits: admission.limits, profiles: profiles, operations: operations };
+};
+
+defn server_operation_status_dispatch(state: ServerState, slot: Int, request: HttpRequest) -> ServerState {
+    let owner: Int = session_account(state.sessions,api_token(request.path));
+    when owner <= 0 {
+        io_http_reply(state.reactor,slot,401,"{\"error\":\"auth-failed\"}");
+        term state;
+    };
+    when !server_worker_idle(state.workers.persistence,state.workers.persistence_busy) {
+        let cached: ApiReply = server_operation_status(state,request);
+        io_http_reply(state.reactor,slot,cached.status,cached.body);
+        term state;
+    };
+    let parsed: Result<JsonValue,String> = protocol_document(request.body);
+    when is_err(parsed) { io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\"}"); term state; };
+    let ids: JsonValue = protocol_member(unwrap(parsed),"operation_ids");
+    let entries: List<JsonValue> = protocol_array(ids);
+    when !protocol_is_array(ids) || entries .^Length < 1 || entries .^Length > 64 ||
+        protocol_integer(protocol_member(unwrap(parsed),"v")) != RECOMMENDER_PROTOCOL {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\"}");
+        term state;
+    };
+    foreach idx in 0..entries .^Length {
+        when !protocol_hex(protocol_text(entries[idx]),64) {
+            io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\"}");
+            term state;
+        };
+    };
+    let profile_idx: Int = profile_at(state.admission,owner);
+    let revision: String = "0";
+    when profile_idx >= 0 { revision = state.admission.profiles[profile_idx].version.revision; };
+    let profile: ProfileVersion = ProfileVersion { server_epoch: state.server_epoch, account_id: owner, revision: revision };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: state.workers.next_job as String,
+        attempt: 1, model_generation: "0" };
+    let fields: List<(String,JsonValue)> = [("operation_ids",ids),
+        ("database_identity",StrVal(state.workers.database_identity))];
+    let message: WorkerMessage = WorkerMessage { kind: "receipt", tag: tag, payload: Object(fields) };
+    let queued: Result<WorkerChannel,String> = server_worker_queue(state.workers.persistence,message);
+    when is_err(queued) {
+        let cached: ApiReply = server_operation_status(state,request);
+        io_http_reply(state.reactor,slot,cached.status,cached.body);
+        term state;
+    };
+    let workers: ServerWorkers = ServerWorkers { persistence: unwrap(queued), prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: true, prediction_busy: state.workers.prediction_busy,
+        persistence_tag: tag, prediction_tag: state.workers.prediction_tag, auth_slot: slot, auth_kind: "status",
+        next_job: state.workers.next_job+1 };
+    Store#(reactor_row(state.reactor,slot)+16,2,8);
+    term server_with_workers(state,workers);
+};
+
+defn server_view_replace(views: List<OwnerView>, entry: OwnerView) -> List<OwnerView> {
+    let updated: List<OwnerView> = [];
+    foreach idx in 0..views .^Length { when views[idx].owner != entry.owner { updated <- views[idx]; }; };
+    let added: List<OwnerView> = [entry];
+    term updated+added;
+};
+
+defn server_worker_idle(channel: WorkerChannel, busy: Bool) -> Bool {
+    term channel.fd >= 0 && channel.ready && channel.terminal == 0 && !busy &&
+        channel.tx_offset >= channel.tx.len && channel.rx.len == 0;
+};
+
+defn server_prediction_message(tag: WorkerTag, ratings: List<ProfileRating>, lambda_milli: Int) -> Result<WorkerMessage,String> {
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(ratings);
+    when is_err(encoded) { term Err(unwrap_err(encoded)); };
+    let fields: List<(String,JsonValue)> = [("ratings",unwrap(encoded)),("lambda_milli",IntVal(lambda_milli))];
+    term Ok(WorkerMessage { kind: "predict", tag: tag, payload: Object(fields) });
+};
+
+defn server_persistence_message(tag: WorkerTag, command: RatingCommand, timestamp: String,
+    database_identity: String) -> Result<WorkerMessage,String> {
+    let operation: JsonValue = Object(protocol_command_fields(command));
+    let fields: List<(String,JsonValue)> = [("operation",operation),("timestamp",StrVal(timestamp)),
+        ("database_identity",StrVal(database_identity))];
+    term Ok(WorkerMessage { kind: "persist", tag: tag, payload: Object(fields) });
+};
+
+defn server_encode_accepted(accepted: RatingAccepted) -> String {
+    let encoded: Result<String,String> = protocol_encode_event(AcceptedRating(accepted));
+    when is_err(encoded) { term "{\"error\":\"encode\"}"; };
+    term unwrap(encoded);
+};
+
+defn server_publish_owner(state: ServerState, owner: Int, text: String) -> Bool {
+    foreach idx in 0..state.live_sessions .^Length {
+        let live: LiveSession = state.live_sessions[idx];
+        when session_account(state.sessions,live.token) == owner {
+            let row: Int = reactor_row(state.reactor,live.slot);
+            when Load#(row,8) == live.fd && Load#(row+16,8) == 1 && Load#(row+112,8) == 0 {
+                io_queue(state.reactor,live.slot,ws_encode_text(text));
+            };
+        };
+    };
+    term true;
+};
+
+defn server_dispatch_admission(state: ServerState, owner: Int, token: String,
+    command: RatingCommand) -> ServerAdmissionResult {
+    let invalid: ServerAdmissionResult = ServerAdmissionResult { state: state, status: 400,
+        body: "{\"error\":\"validation\"}", accepted: false };
+    when !protocol_command_valid(command) || command.server_epoch != state.server_epoch ||
+        command.item_id >= state.model.population.nitems { term invalid; };
+    // Idempotent retries must resolve before the one-slot worker capacity
+    // check: an already accepted operation needs no worker reservation.
+    let known_idx: Int = profile_operation_at(state.admission,owner,command.operation_id);
+    when known_idx >= 0 {
+        let known: OperationStatus = state.admission.operations[known_idx];
+        when known.accepted.delta.item_id == command.item_id && known.accepted.delta.rating == command.rating {
+            term ServerAdmissionResult { state: state, status: 202,
+                body: server_encode_accepted(known.accepted), accepted: true };
+        };
+        term ServerAdmissionResult { state: state, status: 409,
+            body: "{\"error\":\"operation-conflict\",\"message\":\"This operation ID was already used for a different rating.\"}", accepted: false };
+    };
+    when profile_pending_for(state.admission,owner) > 0 {
+        term ServerAdmissionResult { state: state, status: 409,
+            body: "{\"error\":\"operation-pending\",\"message\":\"Resolve the earlier save before submitting another rating.\"}", accepted: false };
+    };
+    when !server_worker_idle(state.workers.prediction,state.workers.prediction_busy) ||
+        !server_worker_idle(state.workers.persistence,state.workers.persistence_busy) ||
+        state.workers.database_identity .^Length == 0 {
+        term ServerAdmissionResult { state: state, status: 503,
+            body: "{\"error\":\"worker-busy\",\"message\":\"Rating capacity is busy; retry shortly.\"}", accepted: false };
+    };
+    let timestamp: String = server_timestamp() as String;
+    let reservation_id: String = command.operation_id;
+    let reservation: QueueReservation = QueueReservation { id: reservation_id, owner: owner,
+        profile_bytes: 4096, operation_bytes: admission_required_operation_bytes(command),
+        prediction_slot: true, persistence_slot: true };
+    let context: AdmissionContext = AdmissionContext { owner: owner, session_generation: token,
+        timestamp: timestamp, database_identity: state.workers.database_identity,
+        reservation: ReservedAdmission(reservation) };
+    let decision: AdmissionDecision = profile_admit(state.admission,context,command);
+    match decision.outcome {
+        AdmissionRejected(error) => {
+            let status: Int = 400;
+            when error.retryable { status = 503; };
+            term ServerAdmissionResult { state: state, status: status,
+                body: "{\"error\":"+api_quote(error.code)+",\"message\":"+api_quote(error.message)+"}", accepted: false };
+        },
+        KnownAdmission(operation) => {
+            term ServerAdmissionResult { state: state, status: 202,
+                body: server_encode_accepted(operation.accepted), accepted: true };
+        },
+        NewAdmission(accepted) => server_dispatch_new_admission(state,decision.update.state,accepted,command,timestamp),
+    };
+};
+
+defn server_dispatch_new_admission(state: ServerState, admitted: AdmissionState, accepted: RatingAccepted,
+    command: RatingCommand, timestamp: String) -> ServerAdmissionResult {
+    let profile_idx: Int = profile_at(admitted,accepted.profile.account_id);
+    when profile_idx < 0 { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"profile\"}", accepted: false }; };
+    let job: String = state.workers.next_job as String;
+    let prediction_tag: WorkerTag = WorkerTag { profile: accepted.profile, job_id: job, attempt: 1, model_generation: "1" };
+    let persistence_tag: WorkerTag = WorkerTag { profile: accepted.profile, job_id: (state.workers.next_job+1) as String,
+        attempt: 1, model_generation: "0" };
+    let prediction_request: Result<WorkerMessage,String> = server_prediction_message(prediction_tag,
+        admitted.profiles[profile_idx].ratings,(state.lambda*1000.0) as Int);
+    let persistence_request: Result<WorkerMessage,String> = server_persistence_message(persistence_tag,command,timestamp,
+        state.workers.database_identity);
+    when is_err(prediction_request) || is_err(persistence_request) {
+        term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"worker-encode\"}", accepted: false };
+    };
+    let pred_encoded: Result<String,String> = protocol_encode_worker(unwrap(prediction_request));
+    let persist_encoded: Result<String,String> = protocol_encode_worker(unwrap(persistence_request));
+    when is_err(pred_encoded) || is_err(persist_encoded) {
+        term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"worker-encode\"}", accepted: false };
+    };
+    let pred_queued: Result<WorkerChannel,String> = worker_channel_queue(state.workers.prediction,unwrap(pred_encoded));
+    when is_err(pred_queued) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"prediction-busy\"}", accepted: false }; };
+    let persist_queued: Result<WorkerChannel,String> = worker_channel_queue(state.workers.persistence,unwrap(persist_encoded));
+    when is_err(persist_queued) {
+        // WorkerChannel is an immutable value; pred_queued has not been
+        // installed in ServerState or written to the worker yet, so dropping
+        // that candidate leaves the live channel untouched.
+        term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"persistence-busy\"}", accepted: false };
+    };
+    let prediction: WorkerChannel = worker_channel_write(unwrap(pred_queued));
+    let persistence: WorkerChannel = worker_channel_write(unwrap(persist_queued));
+    let started: Result<ProfileUpdate,AdmissionError> = profile_prediction_start(admitted,
+        PredictionTag { profile: accepted.profile, model_generation: "1", job_id: job, attempt: 1 });
+    when is_err(started) {
+        term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"prediction-state\"}", accepted: false };
+    };
+    let saved: RatingSaved = RatingSaved { profile: accepted.profile, operation_id: accepted.operation_id };
+    let dispatched: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(unwrap(started).state,saved,
+        DispatchPersist(),timestamp);
+    when is_err(dispatched) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"persistence-state\"}", accepted: false }; };
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(unwrap(dispatched).state,saved,persistence_tag);
+    when is_err(bound) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"persistence-tag\"}", accepted: false }; };
+    let workers: ServerWorkers = ServerWorkers { persistence: persistence, prediction: prediction,
+        database_identity: state.workers.database_identity, persistence_busy: true, prediction_busy: true,
+        persistence_tag: persistence_tag, prediction_tag: prediction_tag, auth_slot: -1, auth_kind: "",
+        next_job: state.workers.next_job+2 };
+    let updated: ServerState = server_with_workers(state,workers);
+    updated.admission = unwrap(bound).state;
+    let event: String = server_encode_accepted(accepted);
+    server_publish_owner(updated,accepted.profile.account_id,event);
+    term ServerAdmissionResult { state: updated, status: 202, body: event, accepted: true };
+};
+
+defn server_apply_persistence_reply(state: ServerState, response: WorkerMessage) -> ServerState {
+    when !state.workers.persistence_busy || !worker_same_tag(response.tag,state.workers.persistence_tag) { term state; };
+    when state.workers.auth_slot >= 0 { term server_auth_reply(state,response); };
+    let released: ServerState = server_persistence_channel_released(state);
+    when response.kind == "error" { term server_persistence_error(released,response); };
+    let payload: Result<String,String> = json_stringify(response.payload);
+    when is_err(payload) { term released; };
+    let event: Result<RatingEvent,String> = protocol_decode_event(unwrap(payload));
+    when is_err(event) { term released; };
+    term server_apply_persistence_event(released,response.tag,unwrap(event),unwrap(payload));
+};
+
+defn server_persistence_error(state: ServerState, response: WorkerMessage) -> ServerState {
+    let tag: WorkerTag = response.tag;
+    let index: Int = server_operation_for_tag(state.admission,tag);
+    when index < 0 { term state; };
+    let entry: OperationStatus = state.admission.operations[index];
+    let saved: RatingSaved = RatingSaved { profile: entry.accepted.profile, operation_id: entry.accepted.operation_id };
+    let message: String = protocol_text(protocol_member(response.payload,"message"));
+    // 2026-10-23: a worker transport error cannot prove PostgreSQL rolled back.
+    // Keep it uncertain and send a typed event so the browser offers receipt
+    // reconciliation instead of treating the operation as safely retryable.
+    // Undo when workers return a protocol-level commit outcome for every exit.
+    let update: Result<ProfileUpdate,AdmissionError> = profile_save_transition(state.admission,saved,tag,LosePersist(),message);
+    when is_err(update) { term state; };
+    state.admission = unwrap(update).state;
+    when message .^Length == 0 { message = "The database outcome is unknown. Check save status before retrying."; };
+    let failure: RatingSaveFailed = RatingSaveFailed { profile: saved.profile,
+        operation_id: saved.operation_id, error: "commit-uncertain", message: message, retryable: false };
+    let encoded: Result<String,String> = protocol_encode_event(FailedRating(failure));
+    when is_ok(encoded) { server_publish_owner(state,saved.profile.account_id,unwrap(encoded)); };
+    term state;
+};
+
+defn server_operation_for_tag(admission: AdmissionState, tag: WorkerTag) -> Int {
+    foreach idx in 0..admission.operations .^Length {
+        let entry: OperationStatus = admission.operations[idx];
+        when protocol_same_profile(entry.accepted.profile,tag.profile) && profile_persistence_tag_matches(entry.job,tag) { term idx; };
+    };
+    term -1;
+};
+
+defn server_persistence_channel_released(state: ServerState) -> ServerState {
+    let workers: ServerWorkers = ServerWorkers { persistence: state.workers.persistence, prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: false,
+        prediction_busy: state.workers.prediction_busy, persistence_tag: state.workers.persistence_tag,
+        prediction_tag: state.workers.prediction_tag, auth_slot: -1, auth_kind: "", next_job: state.workers.next_job };
+    term server_with_workers(state,workers);
+};
+
+defn server_apply_persistence_event(state: ServerState, tag: WorkerTag, event: RatingEvent, wire: String) -> ServerState {
+    term match event {
+        SavedRating(saved) => {
+            let op_idx: Int = profile_operation_at(state.admission,saved.profile.account_id,saved.operation_id);
+            let discard: Bool = false;
+            when op_idx >= 0 { discard = state.admission.operations[op_idx].phase == PersistDiscardRunning(); };
+            let signal: PersistenceSignal = CommitPersist();
+            when discard { signal = CommitDiscard(); };
+            let update: Result<ProfileUpdate,AdmissionError> = profile_save_transition(state.admission,saved,tag,signal,"");
+            when is_err(update) { term state; };
+            state.admission = unwrap(update).state;
+            when discard {
+                let profile_idx: Int = profile_at(state.admission,saved.profile.account_id);
+                when profile_idx >= 0 {
+                    let profile: ProfileSnapshot = state.admission.profiles[profile_idx];
+                    let result: RatingDiscarded = RatingDiscarded { original: saved,
+                        profile_revision: profile.version.revision, ratings: profile.ratings };
+                    let encoded: Result<String,String> = protocol_encode_event(DiscardedRating(result));
+                    when is_ok(encoded) { server_publish_owner(state,saved.profile.account_id,unwrap(encoded)); };
+                };
+            };
+            when !discard { server_publish_owner(state,saved.profile.account_id,wire); };
+            state
+        },
+        FailedRating(failed) => {
+            let saved: RatingSaved = RatingSaved { profile: failed.profile, operation_id: failed.operation_id };
+            let update: Result<ProfileUpdate,AdmissionError> = profile_save_transition(state.admission,saved,tag,FailPersist(),failed.error);
+            when is_err(update) { term state; };
+            state.admission = unwrap(update).state;
+            server_publish_owner(state,failed.profile.account_id,wire);
+            state
+        },
+        _ => state,
+    };
+};
+
+defn server_prediction_channel_released(state: ServerState) -> ServerState {
+    let workers: ServerWorkers = ServerWorkers { persistence: state.workers.persistence, prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: state.workers.persistence_busy,
+        prediction_busy: false, persistence_tag: state.workers.persistence_tag,
+        prediction_tag: state.workers.prediction_tag, auth_slot: state.workers.auth_slot,
+        auth_kind: state.workers.auth_kind, next_job: state.workers.next_job };
+    term server_with_workers(state,workers);
+};
+
+defn server_prediction_reply(state: ServerState, response: WorkerMessage) -> ServerState {
+    when !state.workers.prediction_busy || !worker_same_tag(response.tag,state.workers.prediction_tag) { term state; };
+    let released: ServerState = server_prediction_channel_released(state);
+    when response.kind == "error" {
+        let tag: WorkerTag = response.tag;
+        let prediction: PredictionTag = PredictionTag { profile: tag.profile, model_generation: tag.model_generation,
+            job_id: tag.job_id, attempt: tag.attempt };
+        let update: ProfileUpdate = profile_prediction_abandon(released.admission,prediction);
+        released.admission = update.state;
+        let reason: String = protocol_text(protocol_member(response.payload,"message"));
+        let event: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"recommendation-error\",\"server_epoch\":"+
+            api_quote(tag.profile.server_epoch)+",\"account_id\":"+tag.profile.account_id as String+",\"revision\":"+
+            api_quote(tag.profile.revision)+",\"job_id\":"+api_quote(tag.job_id)+",\"message\":"+api_quote(reason)+"}";
+        server_publish_owner(released,tag.profile.account_id,event);
+        term released;
+    };
+    when response.kind != "result" { term released; };
+    let payload: Result<String,String> = json_stringify(response.payload);
+    when is_err(payload) { term released; };
+    let event: Result<RatingEvent,String> = protocol_decode_event(unwrap(payload));
+    when is_err(event) { term released; };
+    term match unwrap(event) {
+        PredictedRatings(result) => {
+            let update: ProfileUpdate = profile_prediction_complete(released.admission,result);
+            released.admission = update.state;
+            let profile_idx: Int = profile_at(released.admission,result.tag.profile.account_id);
+            when profile_idx < 0 { term released; };
+            let ratings_result: Result<JsonValue,String> = protocol_ratings_value(released.admission.profiles[profile_idx].ratings);
+            when is_ok(ratings_result) {
+                let ratings_json: Result<String,String> = json_stringify(unwrap(ratings_result));
+                when is_ok(ratings_json) {
+                    let prior: OwnerView = server_owner_state_view(released.views,result.tag.profile.account_id);
+                    let movies: Result<JsonValue,String> = protocol_movies_value(result.items);
+                    when is_ok(movies) {
+                        let recommendation: String = "{\"recommendations\":";
+                        when result.cold_start { recommendation += "[],\"cold_start\":true}"; };
+                        when !result.cold_start { recommendation += unwrap(json_stringify(unwrap(movies)))+"}"; };
+                        let view: OwnerView = OwnerView { owner: result.tag.profile.account_id,
+                            recommendations: recommendation, username: prior.username, ratings_json: unwrap(ratings_json) };
+                        released.views = server_view_replace(released.views,view);
+                    };
+                };
+            };
+            server_publish_owner(released,result.tag.profile.account_id,unwrap(payload));
+            released
+        },
+        _ => released,
+    };
+};
+
+defn server_worker_poll(state: ServerState) -> ServerState {
+    let current: ServerState = state;
+    when state.workers.persistence.fd >= 0 {
+        let channel: WorkerChannel = state.workers.persistence;
+        when channel.tx_offset < channel.tx.len { channel = worker_channel_write(channel); };
+        when !server_worker_has_frame(channel) { channel = worker_channel_read(channel); };
+        // 2026-10-23: a completed persistence reply can replace the entire
+        // coordinator snapshot (auth clears its slot; rating saves advance
+        // admission). Return it directly so prediction polling cannot rebuild
+        // the snapshot from the pre-reply object. Undo when both worker replies
+        // merge through one explicit coordinator transition. The other worker
+        // is polled on the next reactor sweep.
+        when server_worker_has_frame(channel) { term server_persistence_frame(state,channel); };
+        when !server_worker_has_frame(channel) { current = server_persistence_channel_state(state,channel); };
+    };
+    when current.workers.prediction.fd >= 0 {
+        let channel: WorkerChannel = current.workers.prediction;
+        when channel.tx_offset < channel.tx.len { channel = worker_channel_write(channel); };
+        when !server_worker_has_frame(channel) { channel = worker_channel_read(channel); };
+        let workers: ServerWorkers = ServerWorkers { persistence: current.workers.persistence, prediction: channel,
+            database_identity: current.workers.database_identity, persistence_busy: current.workers.persistence_busy,
+            prediction_busy: current.workers.prediction_busy, persistence_tag: current.workers.persistence_tag,
+            prediction_tag: current.workers.prediction_tag, auth_slot: current.workers.auth_slot,
+            auth_kind: current.workers.auth_kind, next_job: current.workers.next_job };
+        current = server_with_workers(current,workers);
+        when server_worker_has_frame(channel) {
+            let taken: Result<WorkerReceived,String> = worker_channel_take(channel);
+            when is_ok(taken) {
+                let received: WorkerReceived = unwrap(taken);
+                let decoded: Result<WorkerMessage,String> = protocol_decode_worker(received.frame.text);
+                let replacement: ServerWorkers = ServerWorkers { persistence: current.workers.persistence,
+                    prediction: received.channel, database_identity: current.workers.database_identity,
+                    persistence_busy: current.workers.persistence_busy, prediction_busy: current.workers.prediction_busy,
+                    persistence_tag: current.workers.persistence_tag, prediction_tag: current.workers.prediction_tag,
+                    auth_slot: current.workers.auth_slot, auth_kind: current.workers.auth_kind, next_job: current.workers.next_job };
+                current = server_with_workers(current,replacement);
+                when is_ok(decoded) { current = server_prediction_reply(current,unwrap(decoded)); };
+            };
+        };
+    };
+    term current;
+};
+
+defn server_operation_status_name(phase: PersistencePhase) -> String {
+    term match phase {
+        PersistFailed() => "failed",
+        PersistUncertain() => "uncertain",
+        PersistSaved() => "saved",
+        PersistDiscardFailed() => "discard-failed",
+        PersistDiscardUncertain() => "discard-uncertain",
+        PersistDiscarded() => "discarded",
+        _ => "accepted",
+    };
+};
+
+defn server_operation_status_entry(state: ServerState, owner: Int, operation_id: String) -> String {
+    let index: Int = profile_operation_at(state.admission,owner,operation_id);
+    when index < 0 {
+        term "{\"operation_id\":"+api_quote(operation_id)+",\"status\":\"unknown\",\"revision\":\"0\",\"retryable\":true,\"message\":\"No operation receipt is retained for this ID.\"}";
+    };
+    let entry: OperationStatus = state.admission.operations[index];
+    let status: String = server_operation_status_name(entry.phase);
+    let retryable: Bool = status == "failed" || status == "discard-failed";
+    let accepted: RatingAccepted = entry.accepted;
+    let message: String = entry.error;
+    term "{\"operation_id\":"+api_quote(accepted.operation_id)+",\"status\":"+api_quote(status)+
+        ",\"item_id\":"+accepted.delta.item_id as String+",\"rating\":"+accepted.delta.rating as String+
+        ",\"revision\":"+api_quote(accepted.profile.revision)+",\"retryable\":"+retryable as String+
+        ",\"message\":"+api_quote(message)+"}";
+};
+
+defn server_operation_status_entries(state: ServerState, owner: Int, ids: List<JsonValue>, idx: Int, text: String) -> String {
+    when idx >= ids .^Length { term text; };
+    let operation_id: String = protocol_text(ids[idx]);
+    when !protocol_hex(operation_id,64) { term ""; };
+    let separator: String = ",";
+    when idx == 0 { separator = ""; };
+    term server_operation_status_entries(state,owner,ids,idx+1,text+separator+
+        server_operation_status_entry(state,owner,operation_id));
+};
+
+defn server_operation_status(state: ServerState, request: HttpRequest) -> ApiReply {
+    let owner: Int = session_account(state.sessions,api_token(request.path));
+    when owner <= 0 { term api_error("auth-failed",state.sessions); };
+    let parsed: Result<JsonValue,String> = protocol_document(request.body);
+    when is_err(parsed) { term api_error("validation",state.sessions); };
+    let value: JsonValue = unwrap(parsed);
+    let ids_value: JsonValue = protocol_member(value,"operation_ids");
+    let ids: List<JsonValue> = protocol_array(ids_value);
+    when protocol_integer(protocol_member(value,"v")) != RECOMMENDER_PROTOCOL || !protocol_is_array(ids_value) || ids .^Length > 64 {
+        term api_error("validation",state.sessions);
+    };
+    let entries: String = server_operation_status_entries(state,owner,ids,0,"");
+    when entries .^Length == 0 && ids .^Length > 0 { term api_error("validation",state.sessions); };
+    let body: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"operation-status\",\"current_server_epoch\":"+
+        api_quote(state.server_epoch)+",\"operations\":["+entries+"]}";
+    term api_reply(200,body,state.sessions);
+};
+
+defn server_operation_action_path(path: String) -> Bool {
+    term path .^Length == 82 && path[0:12] == "/operations/" && path[76:82] == "/retry" ||
+        path .^Length == 84 && path[0:12] == "/operations/" && path[76:84] == "/discard";
+};
+
+defn server_operation_action(state: ServerState, request: HttpRequest) -> ServerAdmissionResult {
+    let path: String = api_path(request.path);
+    let owner: Int = session_account(state.sessions,api_token(request.path));
+    when owner <= 0 { term ServerAdmissionResult { state: state, status: 401, body: "{\"error\":\"auth-failed\"}", accepted: false }; };
+    when !server_worker_idle(state.workers.persistence,state.workers.persistence_busy) {
+        term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"worker-busy\"}", accepted: false };
+    };
+    let operation_id: String = path[12:76];
+    when !protocol_hex(operation_id,64) { term ServerAdmissionResult { state: state, status: 404, body: "{\"error\":\"unknown-operation\"}", accepted: false }; };
+    let index: Int = profile_operation_at(state.admission,owner,operation_id);
+    when index < 0 { term ServerAdmissionResult { state: state, status: 404, body: "{\"error\":\"unknown-operation\"}", accepted: false }; };
+    let existing: OperationStatus = state.admission.operations[index];
+    let saved: RatingSaved = RatingSaved { profile: existing.accepted.profile, operation_id: operation_id };
+    let timestamp: String = server_timestamp() as String;
+    let discard: Bool = path[76:84] == "/discard";
+    let changed: Result<ProfileUpdate,AdmissionError> = Err(profile_error("invalid-action","Choose retry or discard.",false));
+    when discard {
+        let requested: Result<ProfileUpdate,AdmissionError> = profile_discard_failed_head(state.admission,owner,operation_id);
+        when is_err(requested) { term ServerAdmissionResult { state: state, status: 409,
+            body: "{\"error\":\"operation-not-discardable\",\"message\":"+api_quote(unwrap_err(requested).message)+"}", accepted: false }; };
+        changed = profile_persistence_signal(unwrap(requested).state,saved,DispatchPersist(),timestamp);
+    };
+    when !discard {
+        let retried: Result<ProfileUpdate,AdmissionError> = profile_persistence_signal(state.admission,saved,RetryPersist(),timestamp);
+        when is_err(retried) { term ServerAdmissionResult { state: state, status: 409,
+            body: "{\"error\":\"operation-not-retryable\",\"message\":"+api_quote(unwrap_err(retried).message)+"}", accepted: false }; };
+        changed = profile_persistence_signal(unwrap(retried).state,saved,DispatchPersist(),timestamp);
+    };
+    when is_err(changed) { term ServerAdmissionResult { state: state, status: 409,
+        body: "{\"error\":\"operation-not-resolvable\",\"message\":"+api_quote(unwrap_err(changed).message)+"}", accepted: false }; };
+    let updated_admission: AdmissionState = unwrap(changed).state;
+    let tag: WorkerTag = WorkerTag { profile: saved.profile, job_id: state.workers.next_job as String,
+        attempt: 1, model_generation: "0" };
+    let bound: Result<ProfileUpdate,AdmissionError> = profile_persistence_bind_job(updated_admission,saved,tag);
+    when is_err(bound) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"operation-state\"}", accepted: false }; };
+    let command: RatingCommand = RatingCommand { server_epoch: saved.profile.server_epoch, operation_id: operation_id,
+        item_id: existing.accepted.delta.item_id, rating: existing.accepted.delta.rating };
+    let fields: List<(String,JsonValue)> = [("operation",Object(protocol_command_fields(command))),
+        ("operation_id",StrVal(operation_id)),("timestamp",StrVal(timestamp)),("database_identity",StrVal(state.workers.database_identity))];
+    let kind: String = "persist";
+    when discard { kind = "discard"; };
+    let message: WorkerMessage = WorkerMessage { kind: kind, tag: tag, payload: Object(fields) };
+    let encoded: Result<String,String> = protocol_encode_worker(message);
+    when is_err(encoded) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"worker-encode\"}", accepted: false }; };
+    let queued: Result<WorkerChannel,String> = worker_channel_queue(state.workers.persistence,unwrap(encoded));
+    when is_err(queued) { term ServerAdmissionResult { state: state, status: 503, body: "{\"error\":\"worker-busy\"}", accepted: false }; };
+    let workers: ServerWorkers = ServerWorkers { persistence: worker_channel_write(unwrap(queued)), prediction: state.workers.prediction,
+        database_identity: state.workers.database_identity, persistence_busy: true, prediction_busy: state.workers.prediction_busy,
+        persistence_tag: tag, prediction_tag: state.workers.prediction_tag, auth_slot: -1, auth_kind: "", next_job: state.workers.next_job+1 };
+    let next: ServerState = server_with_workers(state,workers);
+    next.admission = unwrap(bound).state;
+    term ServerAdmissionResult { state: next, status: 202,
+        body: "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"operation-status\",\"operation_id\":"+
+            api_quote(operation_id)+",\"status\":\"accepted\"}", accepted: true };
+};
+
+defn server_channel_owned(row: Int, owner: Int) -> Bool {
+    term owner > 0 && Load#(row,8) >= 0 && Load#(row+16,8) == 1 && Load#(row+24,8) == owner && Load#(row+112,8) == 0;
+};
+
+defn server_push(state: ServerState, owner: Int) -> Bool {
+    let push_started: Int = trace_clock();
+    let body: String = server_owner_view(state.views,owner);
+    foreach slot in 0..state.reactor.capacity {
+        let row: Int = reactor_row(state.reactor,slot);
+        when server_channel_owned(row,owner) {
+            io_queue(state.reactor,slot,ws_encode_text(body));
+        };
+    };
+    trace_stage("push_queue",push_started);
+    term true;
+};
+
+defn server_refresh(state: ServerState) -> ServerState {
+    when state.worker.pid > 0 { term server_finish_refresh(state); };
+    when state.worker.owners .^Length > 0 { term state; };
+    let worker: RefreshWorker = worker_start(state.conn,state.reactor,state.model.baseline_users,state.model.population.nitems);
+    let updated: ServerState = server_snapshot_state(state,state.model,worker,false,server_clock()+state.interval);
+    when worker.pid == 0 { println!("Cannot start snapshot refresh; check database access and CACHE_PATH. Serving the previous snapshot."); stdout_flush(); };
+    term updated;
+};
+
+defn server_snapshot_state(state: ServerState, model: ServerModel, worker: RefreshWorker, queued: Bool, deadline: Int) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: model, catalogue: state.catalogue, sessions: state.sessions,
+        server_epoch: state.server_epoch,
+        views: state.views, live_sessions: state.live_sessions, admission: state.admission, workers: state.workers, lambda: state.lambda,
+        refresh: queued, next_refresh: deadline, interval: state.interval, worker: worker };
+};
+
+// 2026-10-21: only a reaped, successful worker can install its complete model.
+// Newer requests/sessions survive the swap. Refresh requests during a build
+// remain queued; failure retains the old model. Rebuild owner views one per
+// sweep rather than holding the event loop for all logged-in owners at once.
+defn server_finish_refresh(state: ServerState) -> ServerState {
+    let status: Int = worker_poll(state.worker);
+    when status == 0 { term state; };
+    let updated: ServerState = server_snapshot_state(state,state.model,worker_idle(),state.refresh,server_clock()+state.interval);
+    let loaded: Result<ServerModel,PgResult> = Err(store_error("Snapshot worker failed; retry refresh."));
+    when status == 1 { loaded = model_restore(state.worker.path,"",state.model.baseline_users,state.model.population.nitems); };
+    remove_file(state.worker.path);
+    remove_file(state.worker.path+".tmp."+state.worker.pid as String);
+    when is_err(loaded) {
+        println!("Snapshot refresh failed; check database access and CACHE_PATH, then retry /admin/refresh. Serving the previous snapshot.");
+        stdout_flush(); term updated;
+    };
+    updated.model = unwrap(loaded);
+    let owners: List<Int> = [];
+    foreach idx in 0..state.views .^Length { let entry: List<Int> = [state.views[idx].owner]; owners = owners+entry; };
+    updated.worker = RefreshWorker { pid: 0, path: "", owners: owners };
+    model_free(state.model);
+    term updated;
+};
+
+defn server_refresh_owner(state: ServerState) -> ServerState {
+    let pending: List<Int> = state.worker.owners;
+    when pending .^Length == 0 { term state; };
+    let updated: ServerState = server_update_owner(state,pending[0]);
+    server_push(updated,pending[0]);
+    let remaining: List<Int> = [];
+    foreach idx in 1..pending .^Length { let entry: List<Int> = [pending[idx]]; remaining = remaining+entry; };
+    updated.worker = RefreshWorker { pid: state.worker.pid, path: state.worker.path, owners: remaining };
+    term updated;
+};
+
+defn server_after_reply(state: ServerState, reply: ApiReply) -> ServerState {
+    let updated: ServerState = server_with(state,reply.sessions,state.views,state.refresh || reply.refresh);
+    let revoked: String = server_revoked_token(state.sessions,reply.sessions,0);
+    when revoked .^Length > 0 { server_close_token_channels(updated,revoked); };
+    when reply.sessions.entries .^Length > state.sessions.entries .^Length {
+        let last: Int = reply.sessions.entries .^Length - 1;
+        updated = server_update_owner(updated,reply.sessions.entries[last].account_id);
+    };
+    when reply.changed_owner > 0 {
+        updated = server_update_owner(updated,reply.changed_owner);
+        server_push(updated,reply.changed_owner);
+    };
+    term updated;
+};

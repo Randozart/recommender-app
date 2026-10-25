@@ -1,0 +1,112 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/os/fs.bv";
+
+obj AccountSession { token: String; account_id: Int; };
+obj SessionStore { entries: List<AccountSession>; };
+obj SessionIssue { ok: Bool; token: String; sessions: SessionStore; };
+
+defn sessions_new() -> SessionStore {
+    let empty: List<AccountSession> = [];
+    term SessionStore { entries: empty };
+};
+
+defn session_find(store: SessionStore, token: String, idx: Int) -> Int {
+    when token .^Length == 0 || idx >= store.entries .^Length { term 0; };
+    let entry: AccountSession = store.entries[idx];
+    when entry.token == token { term entry.account_id; };
+    term session_find(store, token, idx + 1);
+};
+
+defn session_account(store: SessionStore, token: String) -> Int {
+    term session_find(store, token, 0);
+};
+
+defn session_revoke_entries(entries: List<AccountSession>, token: String, idx: Int,
+    remaining: List<AccountSession>) -> List<AccountSession> {
+    when idx >= entries .^Length { term remaining; };
+    when entries[idx].token != token { remaining <- entries[idx]; };
+    term session_revoke_entries(entries,token,idx+1,remaining);
+};
+
+defn session_revoke(store: SessionStore, token: String) -> SessionStore {
+    when token .^Length != 32 || session_account(store,token) == 0 { term store; };
+    let remaining: List<AccountSession> = [];
+    term SessionStore { entries: session_revoke_entries(store.entries,token,0,remaining) };
+};
+
+// 2026-10-21: use existing pure-Briev file/syscall wrappers for entropy.
+// Partial reads and EINTR must not publish an uninitialized token suffix.
+// Every acquired descriptor/allocation is closed/freed on both success/failure.
+// Replace the device bridge with a stdlib entropy API when one is available.
+defn session_read_random(fd: Int, address: Int, offset: Int) -> Bool {
+    when offset >= 16 { term true; };
+    let count: Int = fs_read(fd, address + offset, 16 - offset);
+    when count == -4 { term session_read_random(fd, address, offset); };
+    when count <= 0 || count > 16 - offset { term false; };
+    term session_read_random(fd, address, offset + count);
+};
+
+defn session_hex(address: Int, idx: Int, text: String) -> String {
+    when idx >= 16 { term text; };
+    let digits: String = "0123456789abcdef";
+    let byte: Int = Load#(address + idx, 1);
+    let high: Int = byte / 16;
+    let low: Int = byte % 16;
+    term session_hex(address, idx + 1, text + digits[high:high+1] + digits[low:low+1]);
+};
+
+defn session_random_token() -> String {
+    let path: Int = to_c_string("/dev/urandom");
+    let fd: Int = fs_open(path, 0, 0);
+    Free#(path as Ptr);
+    when fd < 0 { term ""; };
+    let address: Int = Malloc#(16) as Int;
+    let read: Bool = session_read_random(fd, address, 0);
+    let closed: Int = fs_close(fd);
+    when !read || closed < 0 { Free#(address as Ptr); term ""; };
+    let token: String = session_hex(address, 0, "");
+    Free#(address as Ptr);
+    term token;
+};
+
+// 2026-10-21: the server owns this value and captures the returned store.
+// Tokens live for this process's store lifetime; a restart starts an empty
+// store. Identity is resolved from this table, never decoded from a token.
+// A collision retries without replacing another account's binding. Bounded
+// retry failure leaves the original store untouched, as does entropy failure.
+defn session_issue(store: SessionStore, account_id: Int, attempts: Int) -> SessionIssue {
+    when account_id < 1 || account_id > 2147483647 || attempts >= 8 {
+        term SessionIssue { ok: false, token: "", sessions: store };
+    };
+    let token: String = session_random_token();
+    when token .^Length != 32 { term SessionIssue { ok: false, token: "", sessions: store }; };
+    when session_account(store, token) != 0 { term session_issue(store, account_id, attempts + 1); };
+    let entry: AccountSession = AccountSession { token: token, account_id: account_id };
+    let added: List<AccountSession> = [entry];
+    term SessionIssue { ok: true, token: token,
+        sessions: SessionStore { entries: store.entries + added } };
+};
+
+// 2026-10-23: a persistence child may authenticate credentials off-reactor and
+// return the freshly generated opaque token with its owner identity. The parent
+// adopts that exact token only after the worker reply is validated. Retire this
+// bridge when session ownership moves into a dedicated coordinator service.
+defn session_adopt(store: SessionStore, account_id: Int, token: String) -> SessionIssue {
+    when account_id < 1 || account_id > 2147483647 || !session_token_valid(token) || session_account(store,token) != 0 {
+        term SessionIssue { ok: false, token: "", sessions: store };
+    };
+    let entry: AccountSession = AccountSession { token: token, account_id: account_id };
+    let added: List<AccountSession> = [entry];
+    term SessionIssue { ok: true, token: token, sessions: SessionStore { entries: store.entries + added } };
+};
+
+defn session_token_valid(token: String) -> Bool {
+    when token .^Length != 32 { term false; };
+    foreach idx in 0..token .^Length {
+        let byte: Int = byte_at(token,idx);
+        when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { term false; };
+    };
+    term true;
+};

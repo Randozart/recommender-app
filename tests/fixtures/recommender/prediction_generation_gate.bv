@@ -1,0 +1,59 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/model_generations.bv";
+
+defn generation_descriptor(generation: String) -> ModelDescriptor {
+    term ModelDescriptor { generation: generation, path: "/tmp/model-"+generation,
+        identity: "identity-"+generation, bytes: 80 };
+};
+
+defn generation_gate_run() -> Bool {
+    let initial: PredictionGenerations = prediction_generations_new();
+    let first: PredictionGenerationInstall = prediction_generations_install(initial,generation_descriptor("1"));
+    when !first.installed { println!("generation_fail=first:{}",first.error); term false; };
+    let registered: Result<PredictionGenerations,String> = prediction_generation_register_worker(first.state,11);
+    when is_err(registered) { println!("generation_fail=register:{}",unwrap_err(registered)); term false; };
+    let acknowledged: Result<PredictionGenerations,String> = prediction_generation_worker_ack(unwrap(registered),11,"1");
+    when is_err(acknowledged) { println!("generation_fail=ack:{}",unwrap_err(acknowledged)); term false; };
+    let duplicate_ack: Result<PredictionGenerations,String> = prediction_generation_worker_ack(unwrap(acknowledged),11,"1");
+    when is_err(duplicate_ack) { term false; };
+    let ack_idempotent: Bool = model_reader_count(unwrap(duplicate_ack).models,"1") == 1;
+    let job: Result<PredictionGenerationLease,String> = prediction_generation_job_acquire(unwrap(duplicate_ack),"1");
+    when is_err(job) { println!("generation_fail=job:{}",unwrap_err(job)); term false; };
+    let second: PredictionGenerationInstall = prediction_generations_install(unwrap(job).acquired,generation_descriptor("2"));
+    when !second.installed { println!("generation_fail=second:{}",second.error); term false; };
+    let registered_two: Result<PredictionGenerations,String> = prediction_generation_register_worker(second.state,12);
+    when is_err(registered_two) { term false; };
+    let ack_two: Result<PredictionGenerations,String> = prediction_generation_worker_ack(unwrap(registered_two),12,"2");
+    when is_err(ack_two) { term false; };
+    let third: PredictionGenerationInstall = prediction_generations_install(unwrap(ack_two),generation_descriptor("3"));
+    let registered_three: Result<PredictionGenerations,String> = prediction_generation_register_worker(third.state,13);
+    when is_err(registered_three) { term false; };
+    let ack_three: Result<PredictionGenerations,String> = prediction_generation_worker_ack(unwrap(registered_three),13,"3");
+    when is_err(ack_three) { term false; };
+    let fourth: PredictionGenerationInstall = prediction_generations_install(unwrap(ack_three),generation_descriptor("4"));
+    when !third.installed || !fourth.installed { println!("generation_fail=install:{}:{}",third.error,fourth.error); term false; };
+    let refused: PredictionGenerationInstall = prediction_generations_install(fourth.state,generation_descriptor("5"));
+    let capacity_refused: Bool = !refused.installed && refused.error == "model-reader-capacity";
+    let released_job: Result<PredictionGenerations,String> = prediction_generation_job_release(fourth.state,unwrap(job));
+    when is_err(released_job) { println!("generation_fail=release:{}",unwrap_err(released_job)); term false; };
+    let moved: Result<PredictionGenerations,String> = prediction_generation_worker_ack(unwrap(released_job),11,"4");
+    when is_err(moved) { println!("generation_fail=move:{} readers1={} readers4={}",unwrap_err(moved),
+        fourth.state.models.slots[0].readers,fourth.state.models.slots[3].readers); term false; };
+    let reclaimed: PredictionGenerationInstall = prediction_generations_install(unwrap(moved),generation_descriptor("5"));
+    let removed_two: Result<PredictionGenerations,String> = prediction_generation_unregister_worker(unwrap(moved),12);
+    let removed_three: Result<PredictionGenerations,String> = prediction_generation_unregister_worker(unwrap(removed_two),13);
+    let removed: Result<PredictionGenerations,String> = prediction_generation_unregister_worker(unwrap(removed_three),11);
+    println!("generation_reader_blocks_reclaim={} worker_swap_acquire_first={} slot_reused_after_release={} unregister_releases={}",
+        capacity_refused,unwrap(moved).workers[0].generation == "4",reclaimed.installed,is_ok(removed));
+    term capacity_refused && ack_idempotent && unwrap(moved).workers[0].generation == "4" && reclaimed.installed && is_ok(removed);
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let passed: Bool = generation_gate_run();
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

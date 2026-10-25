@@ -1,0 +1,107 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import { Ok, Err, is_err, unwrap, unwrap_err } from "std/result.bv";
+import { int_to_char, char_to_string } from "std/char.bv";
+import "std/os/fs.bv";
+
+obj CatalogueMovie { item_id: Int; title: String; };
+obj MovieCatalogue { ok: Bool; movies: List<CatalogueMovie>; error: String; };
+
+defn catalogue_failure(message: String) -> MovieCatalogue {
+    let empty: List<CatalogueMovie> = [];
+    term MovieCatalogue { ok: false, movies: empty, error: message };
+};
+
+defn catalogue_find_byte(text: String, byte: Int, idx: Int) -> Int {
+    when idx >= text .^Length { term -1; };
+    when byte_at(text,idx) == byte { term idx; };
+    term catalogue_find_byte(text,byte,idx+1);
+};
+
+defn catalogue_decimal(text: String, idx: Int, acc: Int) -> Int {
+    when idx >= text .^Length { term acc; };
+    let digit: Int = byte_at(text,idx)-48;
+    when digit < 0 || digit > 9 { term -1; };
+    when acc > 922337203685477580 ||
+        (acc == 922337203685477580 && digit > 7) { term -1; };
+    term catalogue_decimal(text,idx+1,acc*10+digit);
+};
+
+// MovieLens-100k u.item is ISO-8859-1. Treat each input byte as its Unicode
+// codepoint and let Char/String conversion encode it as UTF-8 for JSON/browser
+// text. The supplied catalog is BMP-only; this conversion is exact for every
+// possible Latin-1 byte, including accented film titles.
+defn catalogue_utf8_latin1(text: String, idx: Int, output: String) -> String {
+    when idx >= text .^Length { term output; };
+    let code: Int = byte_at(text,idx);
+    when code >= 0 && code <= 255 { output += char_to_string(int_to_char(code)); };
+    term catalogue_utf8_latin1(text,idx+1,output);
+};
+
+defn catalogue_row(line: String, expected_id: Int) -> Result<CatalogueMovie,String> {
+    let id_end: Int = catalogue_find_byte(line,124,0);
+    when id_end <= 0 { term Err("Movie catalogue row is missing its ID/title separator."); };
+    let title_end: Int = catalogue_find_byte(line,124,id_end+1);
+    when title_end <= id_end+1 { term Err("Movie catalogue row has an empty title or missing title separator."); };
+    let item_id: Int = catalogue_decimal(line[0:id_end],0,0);
+    when item_id != expected_id {
+        term Err("Movie catalogue IDs must be unique, complete, and ordered from 1 through the catalog size.");
+    };
+    let title: String = catalogue_utf8_latin1(line[id_end+1:title_end],0,"");
+    term Ok(CatalogueMovie { item_id: item_id-1, title: title });
+};
+
+defn catalogue_add_line(line: String, expected_id: Int,
+    movies: List<CatalogueMovie>) -> MovieCatalogue {
+    let parsed: Result<CatalogueMovie,String> = catalogue_row(line,expected_id);
+    when is_err(parsed) { term catalogue_failure(unwrap_err(parsed)); };
+    term MovieCatalogue { ok: true, movies: movies+[unwrap(parsed)], error: "" };
+};
+
+defn catalogue_scan(text: String, idx: Int, start: Int, expected_id: Int,
+    expected_count: Int, movies: List<CatalogueMovie>) -> MovieCatalogue {
+    when idx >= text .^Length {
+        when start < idx {
+            let end: Int = idx;
+            when byte_at(text,idx-1) == 13 { end = idx-1; };
+            let next: MovieCatalogue = catalogue_add_line(text[start:end],expected_id,movies);
+            when !next.ok { term next; };
+            when next.movies .^Length != expected_count {
+                term catalogue_failure("Movie catalogue row count does not match the configured item count.");
+            };
+            term next;
+        };
+        when movies .^Length != expected_count {
+            term catalogue_failure("Movie catalogue row count does not match the configured item count.");
+        };
+        term MovieCatalogue { ok: true, movies: movies, error: "" };
+    };
+    when byte_at(text,idx) == 10 {
+        when idx == start { term catalogue_failure("Movie catalogue contains an empty row."); };
+        let end: Int = idx;
+        when byte_at(text,idx-1) == 13 { end = idx-1; };
+        when end <= start { term catalogue_failure("Movie catalogue contains an empty row."); };
+        let next: MovieCatalogue = catalogue_add_line(text[start:end],expected_id,movies);
+        when !next.ok { term next; };
+        term catalogue_scan(text,idx+1,idx+1,expected_id+1,expected_count,next.movies);
+    };
+    term catalogue_scan(text,idx+1,start,expected_id,expected_count,movies);
+};
+
+defn catalogue_parse(text: String, expected_count: Int) -> MovieCatalogue {
+    let empty: List<CatalogueMovie> = [];
+    when expected_count <= 0 || text .^Length == 0 {
+        term catalogue_failure("Movie catalogue must be nonempty and have a positive expected item count.");
+    };
+    term catalogue_scan(text,0,0,1,expected_count,empty);
+};
+
+defn catalogue_load(path: String, expected_count: Int) -> MovieCatalogue {
+    let file: Result<String,Int> = read_file(path);
+    when is_err(file) {
+        term catalogue_failure("Cannot read the MovieLens u.item title catalogue at '"+path+
+            "' (errno "+(unwrap_err(file) as String)+"); set UITEM_PATH to a readable u.item file.");
+    };
+    term catalogue_parse(unwrap(file),expected_count);
+};

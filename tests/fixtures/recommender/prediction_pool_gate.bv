@@ -1,0 +1,103 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/prediction_worker.bv";
+
+defn prediction_test_tag(owner: Int, revision: String, job: String, attempt: Int) -> WorkerTag {
+    let profile: ProfileVersion = ProfileVersion { server_epoch: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        account_id: owner, revision: revision };
+    term WorkerTag { profile: profile, job_id: job, attempt: attempt, model_generation: "1" };
+};
+
+defn prediction_test_request(owner: Int, revision: String, job: String, attempt: Int) -> PredictionRequest {
+    let ratings: List<ProfileRating> = [];
+    term PredictionRequest { tag: prediction_test_tag(owner,revision,job,attempt), ratings: ratings };
+};
+
+defn prediction_pool_gate_run() -> Bool {
+    let pool: PredictionPool = unwrap(prediction_pool_new(2,4));
+    let first: PredictionPool = unwrap(prediction_pool_offer(pool,prediction_test_request(10,"1","1",1)));
+    let second: PredictionPool = unwrap(prediction_pool_offer(first,prediction_test_request(20,"1","2",1)));
+    let stale_epoch: Result<PredictionPool,String> = prediction_pool_offer(second,prediction_test_epoch_request());
+    let epoch_rejected: Bool = is_err(stale_epoch);
+    let workers: List<PredictionWorkerReady> = [];
+    workers <- PredictionWorkerReady { worker_id: 101, generation: "1", ready: true, busy: false };
+    workers <- PredictionWorkerReady { worker_id: 102, generation: "1", ready: true, busy: false };
+    let dispatch_a: PredictionDispatch = prediction_pool_schedule(second,workers);
+    when !dispatch_a.dispatched { term false; };
+    let next: PredictionPool = unwrap(prediction_pool_offer(dispatch_a.pool,prediction_test_request(10,"2","3",1)));
+    let dispatch_b: PredictionDispatch = prediction_pool_schedule(next,workers);
+    let lost_pending: PredictionWorkerLoss = prediction_pool_worker_died(next,dispatch_a.worker_id);
+    let latest_survives_loss: Bool = !lost_pending.retry_queued && !lost_pending.exhausted &&
+        lost_pending.pool.in_flight == 0 && prediction_pending_generation(lost_pending.pool.owners[0].pending,"1");
+    let fair: Bool = dispatch_b.dispatched && dispatch_b.request.tag.profile.account_id == 20 &&
+        dispatch_b.request.tag.job_id == "2" && dispatch_b.worker_id != dispatch_a.worker_id;
+    let stale_message: WorkerMessage = prediction_test_result(dispatch_a.request.tag);
+    let stale_completion: PredictionCompletion = prediction_pool_complete(dispatch_b.pool,dispatch_a.worker_id,stale_message);
+    let stale_dropped: Bool = stale_completion.accepted && !stale_completion.deliver;
+    let pending_dispatch: PredictionDispatch = prediction_pool_schedule(stale_completion.pool,workers);
+    let latest: Bool = pending_dispatch.dispatched && pending_dispatch.request.tag.profile.account_id == 10 &&
+        pending_dispatch.request.tag.job_id == "3" && pending_dispatch.request.tag.profile.revision == "2";
+    let current_completion: PredictionCompletion = prediction_pool_complete(stale_completion.pool,dispatch_b.worker_id,
+        prediction_test_result(dispatch_b.request.tag));
+    let current_delivers: Bool = current_completion.accepted && current_completion.deliver;
+    let retry_pool: PredictionPool = unwrap(prediction_pool_offer(current_completion.pool,
+        prediction_test_request(30,"1","4",1)));
+    let retry_dispatch: PredictionDispatch = prediction_pool_schedule(retry_pool,workers);
+    let retry: PredictionWorkerLoss = prediction_pool_worker_died(retry_dispatch.pool,retry_dispatch.worker_id);
+    let retry_ok: Bool = retry.retry_queued && !retry.exhausted && retry.tag.attempt == 2;
+    let error_pool: PredictionPool = unwrap(prediction_pool_offer(unwrap(prediction_pool_new(1,2)),
+        prediction_test_request(40,"1","8",1)));
+    let error_workers: List<PredictionWorkerReady> = [];
+    error_workers <- PredictionWorkerReady { worker_id: 103, generation: "1", ready: true, busy: false };
+    let error_dispatch: PredictionDispatch = prediction_pool_schedule(error_pool,error_workers);
+    let error_completion: PredictionCompletion = prediction_pool_complete(error_dispatch.pool,error_dispatch.worker_id,
+        prediction_test_error(error_dispatch.request.tag));
+    let error_unblocks: Bool = error_completion.accepted && error_completion.deliver && error_completion.pool.in_flight == 0;
+    let bounded_pool: PredictionPool = unwrap(prediction_pool_new(1,1));
+    let bounded_owner: PredictionPool = unwrap(prediction_pool_offer(bounded_pool,prediction_test_request(50,"1","10",1)));
+    let excess_owner: Result<PredictionPool,String> = prediction_pool_offer(bounded_owner,prediction_test_request(51,"1","11",1));
+    let owner_capacity: Bool = is_err(excess_owner);
+    let bounded_workers: List<PredictionWorkerReady> = [];
+    bounded_workers <- PredictionWorkerReady { worker_id: 104, generation: "1", ready: true, busy: false };
+    let bounded_dispatch: PredictionDispatch = prediction_pool_schedule(bounded_owner,bounded_workers);
+    let bounded_done: PredictionCompletion = prediction_pool_complete(bounded_dispatch.pool,bounded_dispatch.worker_id,
+        prediction_test_result(bounded_dispatch.request.tag));
+    let removed_owner: Result<PredictionPool,String> = prediction_pool_remove_owner(bounded_done.pool,50);
+    let capacity_reused: Bool = is_ok(removed_owner) &&
+        is_ok(prediction_pool_offer(unwrap(removed_owner),prediction_test_request(51,"2","11",1)));
+    println!("prediction_fair={} stale_dropped={} latest_pending={} current_delivers={} retry_bounded={} epoch_rejected={} error_unblocks={} owner_capacity={} capacity_reused={}",
+        fair,stale_dropped,latest,current_delivers,retry_ok,epoch_rejected,error_unblocks,owner_capacity,capacity_reused);
+    term fair && stale_dropped && latest && latest_survives_loss && current_delivers && retry_ok && epoch_rejected && error_unblocks && owner_capacity && capacity_reused;
+};
+
+defn prediction_test_epoch_request() -> PredictionRequest {
+    let ratings: List<ProfileRating> = [];
+    let profile: ProfileVersion = ProfileVersion { server_epoch: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        account_id: 99, revision: "1" };
+    let tag: WorkerTag = WorkerTag { profile: profile, job_id: "9", attempt: 1, model_generation: "1" };
+    term PredictionRequest { tag: tag, ratings: ratings };
+};
+
+defn prediction_test_error(tag: WorkerTag) -> WorkerMessage {
+    let fields: List<(String,JsonValue)> = [("error",StrVal("prediction-failed")),
+        ("message",StrVal("The prediction failed.")),("retryable",BoolVal(false))];
+    term WorkerMessage { kind: "error", tag: tag, payload: Object(fields) };
+};
+
+defn prediction_test_result(tag: WorkerTag) -> WorkerMessage {
+    let items: List<RankedMovie> = [];
+    let result: RecommendationResult = RecommendationResult { tag: PredictionTag { profile: tag.profile,
+        model_generation: tag.model_generation, job_id: tag.job_id, attempt: tag.attempt }, cold_start: true, items: items };
+    let encoded: Result<String,String> = protocol_encode_event(PredictedRatings(result));
+    let payload: JsonValue = unwrap(protocol_document(unwrap(encoded)));
+    term WorkerMessage { kind: "result", tag: tag, payload: payload };
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let passed: Bool = prediction_pool_gate_run();
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

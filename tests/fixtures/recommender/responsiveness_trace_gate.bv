@@ -1,0 +1,20 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_state.bv";
+
+let tick: Int = 0;
+node verify [tick < 1][tick == 1] {
+    when !trace_begin("browser_123-ABC") { endprogram 1; };
+    when trace_operation != "browser_123-ABC" { endprogram 1; };
+    when trace_begin("credential\nforged-log") { endprogram 1; };
+    when trace_operation != "" { endprogram 1; };
+    when trace_begin("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklm") { endprogram 1; };
+    let started: Int = trace_clock();
+    when started < 0 || !trace_stage("fixture",started) { endprogram 1; };
+    when server_time(-1) != -1 { endprogram 1; };
+    when server_timestamp_from_millis(-1) != -1 || server_timestamp_from_millis(999) != 0 ||
+        server_timestamp_from_millis(1000) != 1 { endprogram 1; };
+    println!("responsiveness trace gate passed");
+    tick = 1; endprogram;
+};

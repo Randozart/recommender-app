@@ -1,0 +1,73 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/reactor.bv";
+import "std/net/socket.bv";
+import "std/net/bytes.bv";
+import { syscall } from "std/posix/syscall.bv";
+
+// Ask the kernel for the ephemeral port, avoiding collisions between test runs.
+defn reactor_test_port(fd: Int) -> Int {
+    let address: Int = Malloc#(16) as Int;
+    let length: Int = Malloc#(4) as Int;
+    Store#(length, 16, 4);
+    let result: Int = syscall(51, fd, address, length);
+    let port: Int = Load#(address + 2, 1) * 256 + Load#(address + 3, 1);
+    Free#(address as Ptr);
+    Free#(length as Ptr);
+    when result < 0 { term -1; };
+    term port;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let reactor: Reactor = reactor_open(0, 2);
+    when reactor.listener < 0 { println!("listener failed: {}", reactor.listener); endprogram 1; };
+    let port: Int = reactor_test_port(reactor.listener);
+    when port < 1 { reactor_close(reactor); endprogram 1; };
+    let first: Socket = sock_tcp();
+    let second: Socket = sock_tcp();
+    let first_connect: Int = sock_connect(first, LOOPBACK, port);
+    let second_connect: Int = sock_connect(second, LOOPBACK, port);
+    let first_sweep: Int = reactor_poll(reactor, 1000);
+    let second_sweep: Int = reactor_poll(reactor, 1000);
+    let first_fd: Int = Load#(reactor_row(reactor, 0), 8);
+    let second_fd: Int = Load#(reactor_row(reactor, 1), 8);
+    let accepted: Bool = first_connect == 0 && second_connect == 0 && first_sweep > 0 && second_sweep > 0 &&
+        first_fd >= 0 && second_fd >= 0 && first_fd != second_fd && reactor_find(reactor, second_fd, 0) == 1;
+    let third: Socket = sock_tcp();
+    let third_connect: Int = sock_connect(third, LOOPBACK, port);
+    let full: Bool = reactor_free_slot(reactor, 0) == -1 && reactor_poll(reactor, 0) == 0;
+    let flags: Int = syscall(72, first_fd, 3, 0);
+    let nonblocking: Bool = flags >= 0 && (flags & 2048) != 0;
+    let payload: ByteBuf = buf_new(1).put_u8(65);
+    let sent: Int = sock_send(first, payload, 1);
+    let readable: Int = reactor_poll(reactor, 1000);
+    let ready: Bool = sent == 1 && readable > 0 && (reactor_events(reactor, 0) & 1) == 1 && reactor_events(reactor, 1) == 0;
+    let row: Int = reactor_row(reactor, 0);
+    Store#(row + 8, 17, 8);
+    Store#(row + 24, 17, 8);
+    reactor_remove(reactor, 0);
+    let third_sweep: Int = reactor_poll(reactor, 1000);
+    let reused: Bool = third_connect == 0 && third_sweep > 0 && Load#(row, 8) >= 0 &&
+        Load#(row + 8, 8) == 0 && Load#(row + 24, 8) == 0 && Load#(row + 32, 8) == 0;
+    reactor_remove(reactor, 0);
+    reactor_remove(reactor, 0);
+    let removed: Bool = Load#(row, 8) == -1 && reactor_free_slot(reactor, 0) == 0;
+    let close_first: Int = sock_close(first);
+    let close_second: Int = sock_close(second);
+    let close_third: Int = sock_close(third);
+    Free#(payload.ptr as Ptr);
+    reactor_close(reactor);
+    let invalid: Reactor = reactor_open(0, 0);
+    let rejected: Bool = invalid.listener == -22;
+    let broken: Reactor = reactor_open(0,1);
+    let close_listener: Int = sock_close(Socket { fd: broken.listener });
+    let invalid_lookup: Bool = reactor_find(broken,-1,0) == -1 && reactor_free_slot(broken,-1) == -1;
+    let listener_error: Bool = reactor_poll(broken,0) == -9;
+    reactor_close(broken);
+    println!("accept={} capacity={} nonblocking={} readiness={} reuse_clears_owner={} removal={} invalid_config={} invalid_lookup={} listener_error={}", accepted, full, nonblocking, ready, reused, removed, rejected,invalid_lookup,listener_error);
+    when !accepted || !full || !nonblocking || !ready || !reused || !removed || !rejected || !invalid_lookup || !listener_error { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

@@ -1,0 +1,40 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/bootstrap.bv";
+import "std/env.bv";
+defn batch_original(conn: PgConn) -> Bool {
+    let rows: PgResult = pg_simple_query(conn,"SELECT count(*),sum(rating),max(ts),(SELECT done::text FROM load_state WHERE key='baseline') FROM baseline_ratings");
+    term rows.ok && rows.nrows == 1 && pg_row_int(rows,0,0) == 1 && pg_row_int(rows,0,1) == 4 &&
+        pg_row_int(rows,0,2) == 77 && pg_row_text(rows,0,3) == "false";
+};
+defn batch_gate(conn: PgConn) -> Bool {
+    let setup: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_batch_gate; SET search_path TO briev_batch_gate");
+    let schema: PgResult = store_create_schema(conn);
+    let reset: PgResult = pg_simple_query(conn,"TRUNCATE baseline_ratings,load_state; INSERT INTO load_state VALUES ('baseline',FALSE); INSERT INTO baseline_ratings VALUES (0,0,4,77)");
+    when setup.ok == false || schema.ok == false || reset.ok == false { term false; };
+    let empty: BaselineLoad = baseline_bootstrap(conn,"tests/fixtures/recommender/empty.udata");
+    let empty_ok: Bool = !empty.ok && batch_original(conn);
+    println!("empty_source_preserves_incomplete_population={}",empty_ok);
+    let constraint: PgResult = pg_simple_query(conn,"ALTER TABLE baseline_ratings ADD CONSTRAINT batch_reject CHECK(user_idx < 900)");
+    let failed: BaselineLoad = baseline_bootstrap(conn,"tests/fixtures/recommender/batch_failure.udata");
+    let rollback_ok: Bool = constraint.ok && !failed.ok && failed.err_code == "23514" && failed.accepted == 65 && batch_original(conn);
+    println!("late_batch_failure_rolls_back_all={}",rollback_ok);
+    let removed: PgResult = pg_simple_query(conn,"ALTER TABLE baseline_ratings DROP CONSTRAINT batch_reject");
+    let loaded: BaselineLoad = baseline_bootstrap(conn,"tests/fixtures/recommender/batch_duplicates.udata");
+    let rows: PgResult = pg_simple_query(conn,"SELECT count(*),sum(rating),max(ts) FROM baseline_ratings");
+    let duplicate_ok: Bool = removed.ok && loaded.ok && loaded.accepted == 65 && loaded.discarded == 0 &&
+        rows.ok && pg_row_int(rows,0,0) == 64 && pg_row_int(rows,0,1) == 194 && pg_row_int(rows,0,2) == 999;
+    println!("cross_batch_last_duplicate_wins={}",duplicate_ok);
+    term empty_ok && rollback_ok && duplicate_ok;
+};
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let passed: Bool = batch_gate(conn);
+    pg_close(conn);
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

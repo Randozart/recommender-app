@@ -1,0 +1,135 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/db/pg.bv";
+
+// 2026-10-21: Task 10.3b separates dataset identities from login accounts.
+// Baseline indices are 0..942; only real accounts own ratings.account_id.
+// Population snapshots append accounts beyond those 943 baseline rows.
+// Merge these tables only with an explicit identity model preserving isolation.
+defn store_accounts_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS accounts (" +
+        "id SERIAL PRIMARY KEY CHECK (id > 0), " +
+        "username TEXT UNIQUE NOT NULL, password TEXT NOT NULL)";
+};
+
+defn store_ratings_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS ratings (" +
+        "account_id INTEGER NOT NULL REFERENCES accounts(id), " +
+        "item_id INTEGER NOT NULL CHECK (item_id BETWEEN 0 AND 1681), " +
+        "rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5), " +
+        "ts BIGINT NOT NULL CHECK (ts >= 0), " +
+        "PRIMARY KEY (account_id, item_id))";
+};
+
+defn store_baseline_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS baseline_ratings (" +
+        "user_idx INTEGER NOT NULL CHECK (user_idx BETWEEN 0 AND 942), " +
+        "item_id INTEGER NOT NULL CHECK (item_id BETWEEN 0 AND 1681), " +
+        "rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5), " +
+        "ts BIGINT NOT NULL CHECK (ts >= 0), " +
+        "PRIMARY KEY (user_idx, item_id))";
+};
+
+defn store_load_state_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS load_state (" +
+        "key TEXT PRIMARY KEY, done BOOLEAN NOT NULL)";
+};
+
+// 2026-10-21: statement triggers serialize population revisions with their
+// writes, including updates/deletes/TRUNCATE and account identity changes.
+// Epoch distinguishes a recreated revision table. Replace only with another
+// transactional identity that detects same-count edits and rolled-back writes.
+defn store_revision_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS model_revision (id BOOLEAN PRIMARY KEY CHECK(id), " +
+        "epoch TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text), revision BIGINT NOT NULL DEFAULT 0); " +
+        "INSERT INTO model_revision(id) VALUES(TRUE) ON CONFLICT DO NOTHING; " +
+        "CREATE OR REPLACE FUNCTION bump_model_revision() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN " +
+        "EXECUTE format('UPDATE %I.model_revision SET revision=revision+1 WHERE id',TG_TABLE_SCHEMA); RETURN NULL; END $$; " +
+        "DROP TRIGGER IF EXISTS model_changed ON accounts; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON accounts FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision(); " +
+        "DROP TRIGGER IF EXISTS model_changed ON ratings; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ratings FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision(); " +
+        "DROP TRIGGER IF EXISTS model_changed ON baseline_ratings; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON baseline_ratings FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision()";
+};
+
+// 2026-10-21: DDL is atomic, including reruns. A failed multi-statement
+// Simple Query leaves the transaction aborted, so explicitly roll it back
+// before returning the ORIGINAL error. Caller supplies an idle connection;
+// this function owns its transaction and must not run inside another one.
+// Future migrations must be explicit: IF NOT EXISTS does not upgrade tables.
+defn store_create_schema(conn: PgConn) -> PgResult {
+    let sql: String = "BEGIN; " + store_accounts_ddl() + "; " +
+        store_ratings_ddl() + "; " + store_baseline_ddl() + "; " +
+        store_load_state_ddl() + "; " + store_revision_ddl() + "; COMMIT;";
+    let result: PgResult = pg_simple_query(conn, sql);
+    when result.ok == false {
+        term store_abort(conn, result);
+    };
+    term result;
+};
+
+// 2026-10-21: preserve the failing operation's SQLSTATE/message when ending
+// an owned transaction. A successful ROLLBACK must never hide the load error.
+// Shared by schema creation and baseline loading; callers do not reuse a
+// connection after a transport failure (the commit outcome may be unknown).
+defn store_abort(conn: PgConn, failure: PgResult) -> PgResult {
+    pg_simple_query(conn, "ROLLBACK");
+    term failure;
+};
+
+defn store_error(message: String) -> PgResult {
+    let empty: List<String> = [];
+    term PgResult {
+        ok: false, ncols: 0, nrows: 0, fields: empty,
+        err_code: "", err_msg: message
+    };
+};
+
+// 2026-10-21: the bootstrap guard must be locked BEFORE inspecting done.
+// Creating the row and then SELECT FOR UPDATE serializes simultaneous startup
+// loaders, including the first startup when no marker exists. READ COMMITTED
+// gives the SELECT its own snapshot after any conflicting INSERT finishes.
+// On success the caller OWNS an open transaction and the marker's row lock;
+// it must commit or roll back. The result is exactly one boolean text field
+// ('t' or 'f'). Only the eventual successful loader may set done=true.
+// On failure this function rolls back before returning the original error.
+// Caller supplies an idle connection and an already-created schema. Do not
+// replace this with SELECT-then-INSERT: concurrent loaders could both proceed.
+defn store_baseline_begin(conn: PgConn) -> PgResult {
+    let started: PgResult = pg_simple_query(conn, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    when started.ok == false { term store_abort(conn, started); };
+    let seeded: PgResult = pg_simple_query(conn,
+        "INSERT INTO load_state (key, done) VALUES ('baseline', FALSE) " +
+        "ON CONFLICT (key) DO NOTHING");
+    when seeded.ok == false { term store_abort(conn, seeded); };
+    let locked: PgResult = pg_simple_query(conn,
+        "SELECT done FROM load_state WHERE key = 'baseline' FOR UPDATE");
+    when locked.ok == false { term store_abort(conn, locked); };
+    when locked.nrows != 1 || locked.ncols != 1 {
+        term store_abort(conn, store_error("Expected one baseline load marker; retry on a fresh connection."));
+    };
+    let done: String = pg_row_text(locked, 0, 0);
+    when done != "t" && done != "f" {
+        term store_abort(conn, store_error("Expected a boolean baseline load marker; check the database schema."));
+    };
+    term locked;
+};
+
+// 2026-10-21: Task 10.6 takes the account identity from the authenticated caller,
+// never from an item or baseline user index. One parameterized statement atomically
+// replaces both rating and timestamp only at this account/item key. No implicit
+// transaction boundary: an idle connection autocommits; an existing transaction
+// remains owned by the caller. Keep identity resolution in the account service.
+defn store_rating_upsert(conn: PgConn, account_id: Int, item_id: Int, rating: Int, timestamp: Int) -> PgResult {
+    when account_id < 1 || account_id > 2147483647 {
+        term store_error("Account ID must identify an existing account in the positive PostgreSQL INTEGER range.");
+    };
+    when item_id < 0 || item_id >= 1682 || rating < 1 || rating > 5 || timestamp < 0 {
+        term store_error("Rating requires an item index from 0 through 1681, a value from 1 through 5, and a nonnegative timestamp.");
+    };
+    let params: List<String> = [account_id as String, item_id as String, rating as String, timestamp as String];
+    term pg_exec(conn,
+        "INSERT INTO ratings (account_id, item_id, rating, ts) " +
+        "VALUES ($1::integer, $2::integer, $3::smallint, $4::bigint) " +
+        "ON CONFLICT (account_id, item_id) DO UPDATE " +
+        "SET rating = EXCLUDED.rating, ts = EXCLUDED.ts", params);
+};

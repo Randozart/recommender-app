@@ -1,0 +1,27 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/bootstrap.bv";
+import "std/env.bv";
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let selected: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_concurrent_gate; SET search_path TO briev_concurrent_gate");
+    when !selected.ok { pg_close(conn); endprogram 1; };
+    when get_env_int("PREPARE_GATE") == 1 {
+        let schema: PgResult = store_create_schema(conn);
+        let cleared: PgResult = pg_simple_query(conn,"TRUNCATE baseline_ratings,load_state");
+        pg_close(conn);
+        when !schema.ok || !cleared.ok { endprogram 1; };
+        endprogram 0;
+    };
+    let result: BaselineLoad = baseline_bootstrap(conn,"tests/fixtures/recommender/batch_duplicates.udata");
+    let rows: PgResult = pg_simple_query(conn,"SELECT count(*),sum(rating) FROM baseline_ratings");
+    let passed: Bool = result.ok && rows.ok && pg_row_int(rows,0,0) == 64 && pg_row_int(rows,0,1) == 194;
+    println!("concurrent_snapshot={} loaded={} accepted={}",passed,result.loaded,result.accepted);
+    pg_close(conn);
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

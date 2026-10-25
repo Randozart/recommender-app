@@ -1,0 +1,271 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_model.bv";
+import "./movie_catalogue.bv";
+import { JsonValue, ParseFrame, Object, Null, StrVal, IntVal, parse_value, skip_ws } from "std/json.bv";
+import "std/net/http.bv";
+
+import "./trace.bv";
+// 2026-10-22: share exact typed JSON extraction with browser/protocol consumers;
+// aliases preserve the existing API while duplicate-key rejection stays strict.
+import { api_member: protocol_member, api_string: protocol_text,
+    api_integer: protocol_integer, api_object: protocol_object, RECOMMENDER_PROTOCOL }
+    from "./protocol_values.bv";
+
+obj ApiInput { ok: Bool; username: String; password: String; token: String; item: Int; rating: Int; };
+obj ApiReply { status: Int; body: String; sessions: SessionStore; changed_owner: Int; refresh: Bool; };
+obj ApiRuntime { catalogue: MovieCatalogue; lambda: Float; timestamp: Int; server_epoch: String; };
+
+defn api_rating_valid(input: ApiInput, nitems: Int) -> Bool {
+    term input.ok && input.item >= 0 && input.item < nitems && input.rating >= 1 && input.rating <= 5;
+};
+
+defn api_cold_start(count: Int) -> Bool { term count < 5; };
+
+defn api_quote(text: String) -> String {
+    let escaped: String = "\"";
+    let hex: String = "0123456789abcdef";
+    foreach idx in 0..text .^Length {
+        let byte: Int = byte_at(text,idx);
+        when byte == 34 || byte == 92 { escaped = escaped + "\\"; };
+        when byte >= 32 { escaped = escaped + text[idx:idx+1]; };
+        when byte < 32 { escaped = escaped + "\\u00" + hex[byte/16:byte/16+1] + hex[byte%16:byte%16+1]; };
+    };
+    term escaped + "\"";
+};
+
+defn api_input(body: String) -> ApiInput {
+    let invalid: ApiInput = ApiInput { ok: false, username: "", password: "", token: "", item: -1, rating: -1 };
+    let parsed: Result<ParseFrame,String> = parse_value(body,0);
+    when is_err(parsed) { term invalid; };
+    let frame: ParseFrame = unwrap(parsed);
+    when !api_object(frame.value) || skip_ws(body,frame.pos) != body .^Length { term invalid; };
+    term ApiInput { ok: true,
+        username: api_string(api_member(frame.value,"username")), password: api_string(api_member(frame.value,"password")),
+        token: api_string(api_member(frame.value,"token")), item: api_integer(api_member(frame.value,"item_id")),
+        rating: api_integer(api_member(frame.value,"rating")) };
+};
+
+defn api_trace(body: String, fallback: String) -> Bool {
+    trace_begin(fallback);
+    when !trace_enabled { term true; };
+    let parsed: Result<ParseFrame,String> = parse_value(body,0);
+    when is_err(parsed) { term false; };
+    let operation: String = api_string(api_member(unwrap(parsed).value,"trace_id"));
+    when operation .^Length == 0 { term true; };
+    term trace_begin(operation);
+};
+
+defn api_reply(status: Int, body: String, sessions: SessionStore) -> ApiReply {
+    term ApiReply { status: status, body: body, sessions: sessions, changed_owner: 0, refresh: false };
+};
+
+defn api_error(error: String, sessions: SessionStore) -> ApiReply {
+    let status: Int = 400;
+    let message: String = "Supply a JSON object with the required fields.";
+    when error == "validation" { message = "Use nonblank credentials, or an integer item index and a rating from 1 through 5."; };
+    when error == "auth-failed" { message = "Log in with matching credentials and use the returned session token."; };
+    when error == "account-exists" { message = "Choose another username or log in to the existing account."; };
+    when error == "database" || error == "session" { message = "The service cannot complete this request; retry after checking database availability."; };
+    when error == "auth-failed" { status = 401; };
+    when error == "account-exists" { status = 409; };
+    when error == "database" || error == "session" { status = 503; };
+    term api_reply(status,"{\"error\":" + api_quote(error) + ",\"message\":" + api_quote(message) + "}",sessions);
+};
+
+defn api_rated(state: AccountState, item: Int) -> Bool {
+    foreach idx in 0..state.ratings .^Length { when state.ratings[idx].item_id == item { term true; }; };
+    term false;
+};
+
+defn api_best_item(scores: Vector, picked: IntVec) -> Int {
+    let best: Int = -1;
+    let score: Float = -1.0;
+    foreach item in 0..scores.len {
+        when ivec_get(picked,item) == 0 && vec_get(scores,item) > score { best = item; score = vec_get(scores,item); };
+    };
+    term best;
+};
+
+defn api_add_recommendation(text: String, item: Int, score: Float) -> String {
+    let prefix: String = text;
+    when text .^Length > 0 { prefix = prefix+","; };
+    term prefix+"{\"item_id\":"+item as String+",\"score\":"+score as String+"}";
+};
+
+defn api_recommendations(model: ServerModel, state: AccountState, lambda: Float) -> String {
+    when api_cold_start(state.ratings .^Length) { term "{\"cold_start\":true}"; };
+    let build_started: Int = trace_clock();
+    let active: ActivePrediction = active_build(model,state);
+    trace_stage("active_build",build_started);
+    let predict_started: Int = trace_clock();
+    let scores: Vector = vec_new(model.population.nitems);
+    let picked: IntVec = ivec_new(model.population.nitems);
+    foreach item in 0..model.population.nitems {
+        ivec_set(picked,item,0);
+        when api_rated(state,item) { ivec_set(picked,item,1); };
+        let score: Float = clamp15(lambda * active_user_prediction(active,item) + (1.0-lambda) * active_item_prediction(active,item));
+        vec_set(scores,item,score);
+    };
+    trace_stage("prediction_scan",predict_started);
+    let rank_started: Int = trace_clock();
+    let text: String = "";
+    foreach rank in 0..TOP_N {
+        let best: Int = api_best_item(scores,picked);
+        when best >= 0 {
+            text = api_add_recommendation(text,best,vec_get(scores,best));
+            ivec_set(picked,best,1);
+        };
+    };
+    vec_free(active.similarities); vec_free(scores); ivec_free(picked);
+    trace_stage("rank_and_release",rank_started);
+    term "{\"recommendations\":[" + text + "]}";
+};
+
+defn api_ratings(state: AccountState) -> String {
+    let text: String = "";
+    foreach idx in 0..state.ratings .^Length {
+        when idx > 0 { text = text + ","; };
+        let row: AccountRating = state.ratings[idx];
+        text = text + "{\"item_id\":" + row.item_id as String + ",\"rating\":" + row.rating as String + "}";
+    };
+    term "[" + text + "]";
+};
+
+defn api_token(path: String) -> String {
+    let query: Int = str_find(path,"?token=");
+    when query < 0 { term ""; };
+    let token: String = path[query+7:path .^Length];
+    when token .^Length != 32 { term ""; };
+    term token;
+};
+
+defn api_path(path: String) -> String {
+    let query: Int = str_find(path,"?");
+    let route: String = path;
+    when query >= 0 { route = path[0:query]; };
+    // 2026-10-23: the browser client uses /v1 while older API clients use
+    // unversioned paths; normalize once at routing so both share one contract.
+    // Undo by removing this prefix strip only after all callers use one version.
+    when route .^Length >= 4 && route[0:4] == "/v1/" { term route[3:route .^Length]; };
+    term route;
+};
+
+defn api_movies(catalogue: MovieCatalogue) -> String {
+    // 2026-10-25: repeated immutable concatenation retained hundreds of MB
+    // per catalogue request. Own one growing buffer and release it after the
+    // final String copy; keep this until String builders own temporary storage.
+    let text: GrowBuf = put_str(grow_new(256),"{\"movies\":[");
+    foreach idx in 0..catalogue.movies .^Length {
+        let movie: CatalogueMovie = catalogue.movies[idx];
+        when movie.item_id != idx || movie.title .^Length == 0 { grow_free(text); term ""; };
+        when idx > 0 { text = put_str(text,","); };
+        text = put_str(text,"{\"item_id\":" + movie.item_id as String +
+            ",\"title\":" + api_quote(movie.title) + "}");
+    };
+    text = put_str(text,"]}");
+    let result: String = buf_slice_string(ByteBuf { ptr: text.ptr, len: text.len, cap: text.cap },0,text.len);
+    grow_free(text);
+    term result;
+};
+
+defn api_movies_reply(catalogue: MovieCatalogue, item_count: Int,
+    sessions: SessionStore) -> ApiReply {
+    when !catalogue.ok || catalogue.movies .^Length != item_count {
+        term api_reply(503,"{\"error\":\"catalogue-unavailable\",\"message\":\"The movie title catalogue is unavailable; check UITEM_PATH and its item IDs.\"}",sessions);
+    };
+    let body: String = api_movies(catalogue);
+    when body .^Length == 0 {
+        term api_reply(503,"{\"error\":\"catalogue-unavailable\",\"message\":\"The movie title catalogue contains invalid IDs or empty titles.\"}",sessions);
+    };
+    term api_reply(200,body,sessions);
+};
+
+defn api_credentials(conn: PgConn, sessions: SessionStore, input: ApiInput, path: String,
+    server_epoch: String) -> ApiReply {
+    when path == "/register" {
+        let result: AccountResult = register(conn,input.username,input.password);
+        when !result.ok { term api_error(result.error,sessions); };
+        term api_reply(200,"{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"registered\",\"ok\":true}",sessions);
+    };
+    let result: LoginResult = login(conn,sessions,input.username,input.password);
+    when !result.result.ok { term api_error(result.result.error,sessions); };
+    let account_id: Int = result.result.account.id;
+    let account_name: String = result.result.account.username;
+    let body: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"authenticated\",\"ok\":true,"+
+        "\"token\":"+api_quote(result.token)+",\"server_epoch\":"+api_quote(server_epoch)+","+
+        "\"account_id\":"+account_id as String+",\"username\":"+api_quote(account_name)+"}";
+    term api_reply(200,body,result.sessions);
+};
+
+defn api_rate(conn: PgConn, sessions: SessionStore, input: ApiInput, nitems: Int, timestamp: Int) -> ApiReply {
+    when !api_rating_valid(input,nitems) {
+        term api_error("validation",sessions);
+    };
+    let identity_started: Int = trace_clock();
+    let state: AccountState = account_state(conn,sessions,input.token);
+    trace_stage("rating_identity_db",identity_started);
+    when !state.result.ok { term api_error(state.result.error,sessions); };
+    let write_started: Int = trace_clock();
+    let saved: PgResult = store_rating_upsert(conn,state.result.account.id,input.item,input.rating,timestamp);
+    trace_stage("rating_write_db",write_started);
+    when !saved.ok { term api_error("database",sessions); };
+    term ApiReply { status: 200, body: "{\"ok\":true}", sessions: sessions,
+        changed_owner: state.result.account.id, refresh: false };
+};
+
+defn api_protocol_state(account: AccountState, epoch: String, model: ServerModel,
+    recommendations: String) -> String {
+    let envelope: String = "{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"state\",\"profile\":{"+
+        "\"server_epoch\":"+api_quote(epoch)+",\"account_id\":"+account.result.account.id as String+","+
+        "\"revision\":\"0\"},\"username\":"+api_quote(account.result.account.username)+","+
+        "\"account\":{\"id\":"+account.result.account.id as String+",\"username\":"+
+        api_quote(account.result.account.username)+"},"+
+        "\"model_generation\":"+api_quote(model.revision)+",\"ratings\":"+api_ratings(account)+",";
+    term envelope+recommendations[1:recommendations .^Length];
+};
+
+defn api_state(conn: PgConn, sessions: SessionStore, model: ServerModel, request: HttpRequest,
+    lambda: Float, server_epoch: String) -> ApiReply {
+    let state: AccountState = account_state(conn,sessions,api_token(request.path));
+    when !state.result.ok { term api_error(state.result.error,sessions); };
+    let recommendations: String = api_recommendations(model,state,lambda);
+    when api_path(request.path) == "/recommendations" { term api_reply(200,recommendations,sessions); };
+    let body: String = api_protocol_state(state,server_epoch,model,recommendations);
+    term api_reply(200,body,sessions);
+};
+
+defn api_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel,
+    request: HttpRequest, runtime: ApiRuntime) -> ApiReply {
+    let path: String = api_path(request.path);
+    when request.method == "OPTIONS" { term api_reply(200,"{}",sessions); };
+    when request.method == "GET" && path == "/movies" {
+        term api_movies_reply(runtime.catalogue,model.population.nitems,sessions);
+    };
+    when request.method == "GET" && (path == "/state" || path == "/recommendations") {
+        term api_state(conn,sessions,model,request,runtime.lambda,runtime.server_epoch);
+    };
+    when request.method == "POST" && path == "/admin/refresh" {
+        term ApiReply { status: 200, body: "{\"ok\":true}", sessions: sessions, changed_owner: 0, refresh: true };
+    };
+    // 2026-10-23: I11 logout is an in-memory session revocation. The caller
+    // authenticates by the established token query convention; pending work
+    // remains account-owned. Remove this branch only when an equivalent
+    // coordinator-owned revocation path handles every HTTP and live session.
+    when request.method == "POST" && path == "/logout" {
+        let token: String = api_token(request.path);
+        when session_account(sessions,token) == 0 { term api_error("auth-failed",sessions); };
+        term api_reply(200,"{\"v\":"+RECOMMENDER_PROTOCOL as String+",\"type\":\"logged-out\"}",
+            session_revoke(sessions,token));
+    };
+    when request.method == "POST" {
+        let input: ApiInput = api_input(request.body);
+        when !input.ok { term api_error("validation",sessions); };
+        when path == "/register" || path == "/login" {
+            term api_credentials(conn,sessions,input,path,runtime.server_epoch);
+        };
+        when path == "/rating" { term api_rate(conn,sessions,input,model.population.nitems,runtime.timestamp); };
+    };
+    term api_reply(404,"{\"error\":\"not-found\"}",sessions);
+};

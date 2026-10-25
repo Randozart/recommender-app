@@ -1,0 +1,49 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/movie_catalogue.bv";
+import "../../../examples/recommender/server_api.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let sample: MovieCatalogue = catalogue_parse(
+        "1|Toy Story (1995)|date\n2|A Movie (1996)|date\n",2);
+    let first: CatalogueMovie = sample.movies[0];
+    let last: CatalogueMovie = sample.movies[1];
+    let missing_id: MovieCatalogue = catalogue_parse("1|One|x\n3|Three|x\n",2);
+    let missing_title: MovieCatalogue = catalogue_parse("1||x\n",1);
+    let missing_row: MovieCatalogue = catalogue_parse("1|One|x\n",2);
+    let malformed_id: MovieCatalogue = catalogue_parse("x|One|x\n",1);
+    let rejected_response: ApiReply = api_movies_reply(missing_id,2,sessions_new());
+    let source_path: String = get_env("UITEM_PATH");
+    let full_ok: Bool = true;
+    let accent: Bool = true;
+    let json_title: Bool = true;
+    when source_path .^Length > 0 {
+        let full: MovieCatalogue = catalogue_load(source_path,1682);
+        full_ok = full.ok && full.movies .^Length == 1682 &&
+            full.movies[0].item_id == 0 && full.movies[1681].item_id == 1681;
+        when full_ok {
+            accent = byte_at(full.movies[542].title,3) == 195 &&
+                byte_at(full.movies[542].title,4) == 169;
+            let response: ApiReply = api_movies_reply(full,1682,sessions_new());
+            json_title = response.status == 200 &&
+                str_find(response.body,"\"item_id\":542,\"title\":\"Misérables, Les (1995)\"") >= 0 &&
+                str_find(response.body,"\"item_id\":0,\"title\":\"Toy Story (1995)\"") >= 0 &&
+                str_find(response.body,"\"item_id\":1681") >= 0;
+        };
+    };
+    let passed: Bool = sample.ok && sample.movies .^Length == 2 &&
+        first.item_id == 0 && first.title == "Toy Story (1995)" &&
+        last.item_id == 1 && last.title == "A Movie (1996)" &&
+        !missing_id.ok && !missing_title.ok && !missing_row.ok && !malformed_id.ok &&
+        rejected_response.status == 503 &&
+        full_ok && accent && json_title;
+    println!("catalogue_parser={} ordered_ids={} rejects_malformed={} full_catalogue={} latin1_utf8={} json_titles={}",passed,
+        first.item_id == 0 && last.item_id == 1,
+        !missing_id.ok && !missing_title.ok && !missing_row.ok && !malformed_id.ok,
+        full_ok,accent,json_title);
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

@@ -1,0 +1,107 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./store.bv";
+import "std/rating_population.bv";
+import { Ok, Err, is_ok, is_err, unwrap, unwrap_err } from "std/result.bv";
+
+obj BaselineArrays {
+    users: IntVec;
+    items: IntVec;
+    ratings: Vector;
+    count: Int;
+};
+
+defn baseline_arrays_new(count: Int) [count >= 0 && count <= 1586126][true] -> BaselineArrays {
+    // One spare slot makes an empty population representable by primitives
+    // whose allocation precondition requires a positive length.
+    term BaselineArrays {
+        users: ivec_new(count + 1), items: ivec_new(count + 1),
+        ratings: vec_new(count + 1), count: count
+    };
+};
+
+defn baseline_arrays_free(arrays: BaselineArrays) -> Void {
+    ivec_free(arrays.users);
+    ivec_free(arrays.items);
+    vec_free(arrays.ratings);
+    term;
+};
+
+// 2026-10-21: reconstruct the engine's dual-orientation population from the
+// persisted source, including the done=true startup path. Read count and pages
+// in ONE read-only repeatable-read snapshot. Keyset paging bounds PgResult
+// storage and fixes row order independently of physical table order. All 943
+// baseline user rows exist in the result, including users with no observations.
+// The caller owns a successful RatingPopulation and must pop_free it. Scratch
+// arrays are always freed; errors roll back without returning partial data.
+// Requires an idle connection; bootstrap must have completed successfully.
+defn baseline_population(conn: PgConn) -> Result<RatingPopulation, PgResult> {
+    let started: PgResult = pg_simple_query(conn, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    when started.ok == false { term Err(store_abort(conn, started)); };
+    let marker: PgResult = pg_simple_query(conn, "SELECT done FROM load_state WHERE key = 'baseline'");
+    when marker.ok == false { term Err(store_abort(conn, marker)); };
+    when marker.nrows != 1 || marker.ncols != 1 {
+        term Err(store_abort(conn, store_error("Baseline is not loaded; complete baseline bootstrap first.")));
+    };
+    when pg_row_text(marker, 0, 0) != "t" {
+        term Err(store_abort(conn, store_error("Baseline is incomplete; complete baseline bootstrap first.")));
+    };
+    let counted: PgResult = pg_simple_query(conn, "SELECT count(*) FROM baseline_ratings");
+    when counted.ok == false { term Err(store_abort(conn, counted)); };
+    when counted.nrows != 1 || counted.ncols != 1 {
+        term Err(store_abort(conn, store_error("Cannot count baseline ratings; check the database schema.")));
+    };
+    let count: Int = pg_row_int(counted, 0, 0);
+    when count < 0 || count > 1586126 {
+        term Err(store_abort(conn, store_error("Baseline count exceeds the MovieLens index space; check the database schema.")));
+    };
+    let arrays: BaselineArrays = baseline_arrays_new(count);
+    let read: PgResult = baseline_population_pages(conn, arrays, 0, -1, -1);
+    when read.ok == false {
+        baseline_arrays_free(arrays);
+        term Err(store_abort(conn, read));
+    };
+    let committed: PgResult = pg_simple_query(conn, "COMMIT");
+    when committed.ok == false {
+        baseline_arrays_free(arrays);
+        term Err(committed);
+    };
+    let population: RatingPopulation = pop_build(arrays.users, arrays.items, arrays.ratings, count, 943, 1682);
+    baseline_arrays_free(arrays);
+    term Ok(population);
+};
+
+defn baseline_population_pages(conn: PgConn, arrays: BaselineArrays, offset: Int, last_user: Int, last_item: Int)
+    -> PgResult
+{
+    when offset >= arrays.count { term pg_result_empty(); };
+    let params: List<String> = [last_user as String, last_item as String];
+    let rows: PgResult = pg_exec(conn,
+        "SELECT user_idx, item_id, rating FROM baseline_ratings " +
+        "WHERE (user_idx, item_id) > ($1::integer, $2::integer) " +
+        "ORDER BY user_idx, item_id LIMIT 64", params);
+    when rows.ok == false { term rows; };
+    when rows.ncols != 3 || rows.nrows < 1 || rows.nrows > arrays.count - offset {
+        term store_error("Baseline rows do not match their snapshot count; check the database schema.");
+    };
+    let filled: PgResult = baseline_population_fill(rows, arrays, offset, 0);
+    when filled.ok == false { term filled; };
+    let last: Int = rows.nrows - 1;
+    term baseline_population_pages(conn, arrays, offset + rows.nrows,
+        pg_row_int(rows, last, 0), pg_row_int(rows, last, 1));
+};
+
+defn baseline_population_fill(rows: PgResult, arrays: BaselineArrays, offset: Int, idx: Int) -> PgResult {
+    when idx >= rows.nrows { term pg_result_empty(); };
+    let user_idx: Int = pg_row_int(rows, idx, 0);
+    let item_idx: Int = pg_row_int(rows, idx, 1);
+    let rating: Int = pg_row_int(rows, idx, 2);
+    when user_idx < 0 || user_idx >= 943 || item_idx < 0 || item_idx >= 1682 || rating < 1 || rating > 5 {
+        term store_error("Baseline contains an out-of-range rating; check the database constraints.");
+    };
+    ivec_set(arrays.users, offset + idx, user_idx);
+    ivec_set(arrays.items, offset + idx, item_idx);
+    vec_set(arrays.ratings, offset + idx, rating as Float);
+    term baseline_population_fill(rows, arrays, offset, idx + 1);
+};

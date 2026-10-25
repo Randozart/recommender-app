@@ -1,0 +1,87 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_api.bv";
+import "std/env.bv";
+
+const API_GATE_EPOCH: String = "0123456789abcdef0123456789abcdef";
+
+defn api_gate_catalogue_rows(idx: Int, movies: List<CatalogueMovie>) -> MovieCatalogue {
+    when idx >= 8 { term MovieCatalogue { ok: true, movies: movies, error: "" }; };
+    let title: String = "Gate movie "+(idx as String);
+    when idx == 0 { title = "Misérables, Les (1995)"; };
+    let movie: CatalogueMovie = CatalogueMovie { item_id: idx, title: title };
+    term api_gate_catalogue_rows(idx+1,movies+[movie]);
+};
+
+defn api_gate_catalogue() -> MovieCatalogue {
+    let empty: List<CatalogueMovie> = [];
+    term api_gate_catalogue_rows(0,empty);
+};
+
+defn api_gate_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel,
+    request: HttpRequest, lambda: Float, timestamp: Int, epoch: String) -> ApiReply {
+    let runtime: ApiRuntime = ApiRuntime { catalogue: api_gate_catalogue(), lambda: lambda,
+        timestamp: timestamp, server_epoch: epoch };
+    term api_dispatch(conn,sessions,model,request,runtime);
+};
+
+defn api_gate_request(method: String, path: String, body: String) -> HttpRequest {
+    term HttpRequest { method: method, path: path, headers: "", body: body };
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.pid < 0 { endprogram 1; };
+    let schema: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_server_api_gate; SET search_path TO briev_server_api_gate");
+    let created: PgResult = store_create_schema(conn);
+    let seeded: PgResult = pg_simple_query(conn,"TRUNCATE ratings,accounts,baseline_ratings RESTART IDENTITY; INSERT INTO baseline_ratings SELECT usr,itm,1+(usr+itm)%5,1 FROM generate_series(0,2) usr CROSS JOIN generate_series(0,7) itm");
+    when !schema.ok || !created.ok || !seeded.ok { endprogram 1; };
+    let loaded: Result<ServerModel,PgResult> = model_load(conn,3,8);
+    when is_err(loaded) { println!("model failure={}",unwrap_err(loaded).err_msg); endprogram 1; };
+    let model: ServerModel = unwrap(loaded);
+    let sessions: SessionStore = sessions_new();
+    let movies: ApiReply = api_gate_dispatch(conn,sessions,model,
+        api_gate_request("GET","/movies",""),0.5,1,API_GATE_EPOCH);
+    let registered: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("POST","/v1/register","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
+    let signed_in: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("POST","/v1/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
+    let token: String = api_input(signed_in.body).token;
+    sessions = signed_in.sessions;
+    let signed_in_second: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("POST","/v1/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
+    let second_token: String = api_input(signed_in_second.body).token;
+    sessions = signed_in_second.sessions;
+    let auth_contract: Bool = str_find(registered.body,"\"type\":\"registered\"") >= 0 &&
+        str_find(signed_in.body,"\"type\":\"authenticated\"") >= 0 &&
+        str_find(signed_in.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
+        str_find(signed_in.body,"\"account_id\":1") >= 0;
+    let cold: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let rated: Bool = true;
+    foreach item in 0..5 {
+        let reply: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("POST","/rating","{\"token\":"+api_quote(token)+",\"item_id\":"+item as String+",\"rating\":4}"),0.5,1,API_GATE_EPOCH);
+        when reply.status != 200 { rated = false; };
+    };
+    let recs: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let state: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let logout: ApiReply = api_gate_dispatch(conn,sessions,model,api_gate_request("POST","/v1/logout?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let after_logout: ApiReply = api_gate_dispatch(conn,logout.sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let other_session: ApiReply = api_gate_dispatch(conn,logout.sessions,model,api_gate_request("GET","/v1/state?token="+second_token,""),0.5,1,API_GATE_EPOCH);
+    let repeated_logout: ApiReply = api_gate_dispatch(conn,logout.sessions,model,api_gate_request("POST","/v1/logout?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let malformed: Bool = !api_input("{\"rating\":3} junk").ok && !api_input("{\"rating\":3,\"rating\":4}").ok && api_input("{\"rating\":3.5}").rating == -1;
+    let state_contract: Bool = str_find(state.body,"\"type\":\"state\"") >= 0 &&
+        str_find(state.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
+        str_find(state.body,"\"username\":\"alice\"") >= 0 && str_find(state.body,"\"ratings\":") >= 0;
+    let logout_contract: Bool = logout.status == 200 && str_find(logout.body,"\"type\":\"logged-out\"") >= 0 &&
+        after_logout.status == 401 && repeated_logout.status == 401 && other_session.status == 200 &&
+        session_account(logout.sessions,token) == 0 && session_account(logout.sessions,second_token) == 1;
+    let valid: Bool = registered.status == 200 && signed_in.status == 200 && signed_in_second.status == 200 &&
+        token .^Length == 32 && second_token .^Length == 32 && token != second_token &&
+        auth_contract && movies.status == 200 && str_find(movies.body,"\"title\":\"Misérables, Les (1995)\"") >= 0 &&
+        str_find(movies.body,"\"item_id\":7,\"title\":\"Gate movie 7\"") >= 0 &&
+        cold.body == "{\"cold_start\":true}" && rated &&
+        str_find(recs.body,"recommendations") >= 0 && state_contract && malformed && logout_contract;
+    println!("api_gate={} auth_contract={} state_contract={} logout_contract={} recs={}",valid,auth_contract,state_contract,logout_contract,recs.body);
+    model_free(model); pg_close(conn);
+    when !valid { endprogram 1; };
+    tick = 1; endprogram;
+};

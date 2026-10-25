@@ -1,0 +1,91 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/account_state.bv";
+import "std/env.bv";
+
+// First six entries are blank; remaining entries preserve meaningful content.
+// Includes NBSP, em space, ideographic space, Unicode text, and SQL punctuation.
+defn credential_unicode_blanks(points: List<Int>, idx: Int, builder: StringBuilder) -> String {
+    when idx >= points .^Length { term builder.buffer; };
+    term credential_unicode_blanks(points,idx + 1,append_char(builder,points[idx] as Char));
+};
+
+defn credential_cases(inputs: List<String>, idx: Int) -> Bool {
+    when idx >= 144 { term true; };
+    let user_idx: Int = idx / 12;
+    let pass_idx: Int = idx % 12;
+    let expected: Bool = user_idx >= 6 && pass_idx >= 6;
+    when credentials_valid(inputs[user_idx], inputs[pass_idx]) != expected {
+        println!("validation_case_failed={} user_idx={} pass_idx={} user_bytes={} pass_bytes={}",idx,user_idx,pass_idx,inputs[user_idx] .^Length,inputs[pass_idx] .^Length);
+        term false;
+    };
+    term credential_cases(inputs, idx + 1);
+};
+
+defn registration_gate(conn: PgConn) -> Bool {
+    let selected: PgResult = pg_simple_query(conn,
+        "CREATE SCHEMA IF NOT EXISTS briev_accounts_gate; SET search_path TO briev_accounts_gate");
+    when !selected.ok { term false; };
+    let schema: PgResult = store_create_schema(conn);
+    let cleared: PgResult = pg_simple_query(conn,"TRUNCATE ratings,accounts RESTART IDENTITY");
+    when !schema.ok || !cleared.ok { term false; };
+    let first: AccountResult = register(conn,"alice ' quote"," p'ass ");
+    let duplicate: AccountResult = register(conn,"alice ' quote","different");
+    let distinct: AccountResult = register(conn,"Alice ' quote","other");
+    let invalid: AccountResult = register(conn," \t", "valid");
+    let blank_pass: AccountResult = register(conn,"valid", "　");
+    let rows: PgResult = pg_simple_query(conn,"SELECT count(*),min(password) FROM accounts");
+    let params: List<String> = ["alice ' quote"];
+    let stored: PgResult = pg_exec(conn,"SELECT password FROM accounts WHERE username=$1",params);
+    let created: Bool = first.ok && first.account.id > 0 && first.account.username == "alice ' quote" && distinct.ok && distinct.account.id != first.account.id;
+    let duplicates: Bool = !duplicate.ok && duplicate.error == "account-exists";
+    let rejected: Bool = !invalid.ok && invalid.error == "validation" && !blank_pass.ok && blank_pass.error == "validation";
+    let persisted: Bool = rows.ok && pg_row_int(rows,0,0) == 2 && stored.ok && stored.nrows == 1 &&
+        pg_row_text(stored,0,0) == credential_hash(" p'ass ") && pg_row_text(stored,0,0) != " p'ass ";
+    println!("registration_identity={} duplicate={} validation={} persisted_hash={}",created,duplicates,rejected,persisted);
+    term created && duplicates && rejected && persisted;
+};
+
+defn login_gate(conn: PgConn) -> Bool {
+    let initial: SessionStore = sessions_new();
+    let first: LoginResult = login(conn,initial,"alice ' quote"," p'ass ");
+    let second: LoginResult = login(conn,first.sessions,"Alice ' quote","other");
+    let wrong: LoginResult = login(conn,second.sessions,"alice ' quote","wrong");
+    let missing: LoginResult = login(conn,second.sessions,"missing","other");
+    let empty: LoginResult = login(conn,second.sessions,"alice ' quote","");
+    let injection: LoginResult = login(conn,second.sessions,"' OR TRUE --","other");
+    let again: LoginResult = login(conn,second.sessions,"alice ' quote"," p'ass ");
+    let good: Bool = first.result.ok && second.result.ok && again.result.ok && first.result.account.id != second.result.account.id &&
+        first.token != second.token && first.token != again.token && session_account(again.sessions,first.token) == first.result.account.id &&
+        session_account(again.sessions,second.token) == second.result.account.id && session_account(again.sessions,again.token) == first.result.account.id;
+    let failed: Bool = !wrong.result.ok && wrong.result.error == "auth-failed" && !missing.result.ok && missing.result.error == "auth-failed" &&
+        !empty.result.ok && empty.result.error == "auth-failed" && !injection.result.ok && injection.result.error == "auth-failed" &&
+        wrong.token .^Length == 0 && wrong.sessions.entries .^Length == 2 && missing.sessions.entries .^Length == 2 &&
+        initial.entries .^Length == 0 && again.sessions.entries .^Length == 3;
+    println!("login_and_owner_tokens={} failed_auth_preserves_sessions={}",good,failed);
+    term good && failed;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let controls: StringBuilder = new_builder();
+    controls = append_char(controls,12 as Char);
+    controls = append_char(controls,11 as Char);
+    let points: List<Int> = [133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288];
+    let blanks: String = credential_unicode_blanks(points,0,new_builder());
+    let inputs: List<String> = ["", " ", "\t\r\n" + controls.buffer, " ", " ", blanks, "a", " a ", "é", "' OR TRUE --", "0", "mixed\ttext"];
+    let validation: Bool = credential_cases(inputs,0);
+    let vectors: Bool = credential_hash("") == "fnv1a32:2166136261" &&
+        credential_hash("a") == "fnv1a32:3826002220" && credential_hash("hello") == "fnv1a32:1335831723";
+    println!("credential_validation_144_cases={} fnv_vectors={}",validation,vectors);
+    when !validation || !vectors { endprogram 1; };
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.sock.fd < 0 || conn.pid < 0 { endprogram 1; };
+    let registered: Bool = registration_gate(conn);
+    let passed: Bool = registered && login_gate(conn);
+    pg_close(conn);
+    when !passed { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

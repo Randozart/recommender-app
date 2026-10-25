@@ -1,0 +1,139 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// 2026-10-22: I04 centralizes sorted profile updates and bounded state helpers
+// to prevent HTTP/live paths from diverging on owner state. The targeted pattern
+// is per-adapter rating-list mutation; retire this module only if one equivalent
+// pure state service replaces every caller and its behavioral gate.
+import "./admission_contract.bv";
+
+defn profile_empty(epoch: String, limits: AdmissionLimits) -> AdmissionState {
+    let profiles: List<ProfileSnapshot> = [];
+    let operations: List<OperationStatus> = [];
+    term AdmissionState { clock: RevisionClock { server_epoch: epoch, revision: "0" }, limits: limits, profiles: profiles, operations: operations };
+};
+
+defn profile_at(state: AdmissionState, owner: Int) -> Int {
+    foreach idx in 0..state.profiles .^Length { when state.profiles[idx].version.account_id == owner { term idx; }; };
+    term -1;
+};
+
+defn profile_operation_at(state: AdmissionState, owner: Int, operation: String) -> Int {
+    foreach idx in 0..state.operations .^Length {
+        let accepted: RatingAccepted = state.operations[idx].accepted;
+        when accepted.profile.account_id == owner && accepted.operation_id == operation { term idx; };
+    };
+    term -1;
+};
+
+defn profile_owner_has_operations(state: AdmissionState, owner: Int) -> Bool {
+    foreach idx in 0..state.operations .^Length {
+        when state.operations[idx].accepted.profile.account_id == owner { term true; };
+    };
+    term false;
+};
+
+defn profile_rating_at(ratings: List<ProfileRating>, item: Int) -> Int {
+    foreach idx in 0..ratings .^Length { when ratings[idx].item_id == item { term idx; }; };
+    term -1;
+};
+
+defn profile_upsert_rating(ratings: List<ProfileRating>, rating: ProfileRating) -> List<ProfileRating> {
+    let updated: List<ProfileRating> = [];
+    let inserted: Bool = false;
+    foreach idx in 0..ratings .^Length {
+        let copy_tail: Bool = inserted;
+        when ratings[idx].item_id == rating.item_id {
+            updated <- rating;
+            inserted = true;
+        };
+        when ratings[idx].item_id > rating.item_id && !inserted {
+            updated <- rating;
+            updated <- ratings[idx];
+            inserted = true;
+        };
+        when ratings[idx].item_id != rating.item_id && (ratings[idx].item_id < rating.item_id || copy_tail) { updated <- ratings[idx]; };
+    };
+    when inserted { term updated; };
+    let appended: List<ProfileRating> = [rating];
+    term updated + appended;
+};
+
+defn profile_operation_replace(operations: List<OperationStatus>, target: Int, entry: OperationStatus) -> List<OperationStatus> {
+    let updated: List<OperationStatus> = [];
+    foreach idx in 0..operations .^Length {
+        when idx == target { updated <- entry; };
+        when idx != target { updated <- operations[idx]; };
+    };
+    term updated;
+};
+
+defn profile_snapshot_replace(profiles: List<ProfileSnapshot>, target: Int, entry: ProfileSnapshot) -> List<ProfileSnapshot> {
+    let updated: List<ProfileSnapshot> = [];
+    foreach idx in 0..profiles .^Length {
+        when idx == target { updated <- entry; };
+        when idx != target { updated <- profiles[idx]; };
+    };
+    term updated;
+};
+
+defn profile_pending_for(state: AdmissionState, owner: Int) -> Int {
+    let count: Int = 0;
+    foreach idx in 0..state.operations .^Length {
+        let entry: OperationStatus = state.operations[idx];
+        when entry.accepted.profile.account_id == owner && !protocol_head_released(entry.phase) { count = count + 1; };
+    };
+    term count;
+};
+
+defn profile_pending_total(state: AdmissionState) -> Int {
+    let count: Int = 0;
+    foreach idx in 0..state.operations .^Length { when !protocol_head_released(state.operations[idx].phase) { count = count + 1; }; };
+    term count;
+};
+
+defn profile_stored_bytes(state: AdmissionState) -> Int {
+    let bytes: Int = 0;
+    foreach idx in 0..state.operations .^Length {
+        bytes = bytes + state.operations[idx].accepted.operation_id .^Length + 96 + state.operations[idx].error .^Length;
+    };
+    foreach idx in 0..state.profiles .^Length { bytes = bytes + 32 + state.profiles[idx].ratings .^Length * 16; };
+    term bytes;
+};
+
+defn profile_reserved_bytes(state: AdmissionState) -> Int {
+    let bytes: Int = profile_stored_bytes(state);
+    foreach idx in 0..state.operations .^Length {
+        let operation: OperationStatus = state.operations[idx];
+        when !protocol_head_released(operation.phase) && admission_reservation_is_held(operation.reservation) {
+            bytes = bytes + admission_reservation_bytes(operation.reservation);
+        };
+    };
+    term bytes;
+};
+
+defn admission_reservation_is_held(reservation: AdmissionReservation) -> Bool {
+    match reservation { ReservedAdmission(value) => true, _ => false, }
+};
+
+defn admission_reservation_bytes(reservation: AdmissionReservation) -> Int {
+    match reservation {
+        ReservedAdmission(value) => value.profile_bytes + value.operation_bytes,
+        _ => 0,
+    }
+};
+
+defn profile_error(code: String, message: String, retryable: Bool) -> AdmissionError {
+    term AdmissionError { code: code, message: message, retryable: retryable };
+};
+
+defn profile_rejected(state: AdmissionState, code: String, message: String, retryable: Bool) -> AdmissionDecision {
+    let actions: List<ProfileAction> = [];
+    term AdmissionDecision { update: ProfileUpdate { state: state, actions: actions }, outcome: AdmissionRejected(profile_error(code,message,retryable)) };
+};
+
+defn profile_no_actions() -> List<ProfileAction> {
+    let actions: List<ProfileAction> = [];
+    term actions;
+};
+

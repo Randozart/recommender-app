@@ -1,0 +1,80 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/bootstrap.bv";
+import "std/env.bv";
+
+// The harness owns only the dedicated briev_bootstrap_gate schema. Production
+// public.baseline_ratings and public.load_state are never reset by this gate.
+defn bootstrap_gate_empty(conn: PgConn) -> Bool {
+    let result: PgResult = pg_simple_query(conn,
+        "SELECT (SELECT count(*) FROM baseline_ratings), (SELECT count(*) FROM load_state)");
+    when result.ok == false || result.nrows != 1 || result.ncols != 2 { term false; };
+    term pg_row_int(result, 0, 0) == 0 && pg_row_int(result, 0, 1) == 0;
+};
+
+defn bootstrap_gate_contents(conn: PgConn) -> Bool {
+    let result: PgResult = pg_simple_query(conn,
+        "SELECT count(*), sum(rating), max(user_idx), max(item_id), max(ts) FROM baseline_ratings");
+    when result.ok == false || result.nrows != 1 || result.ncols != 5 { term false; };
+    term pg_row_int(result, 0, 0) == 3 && pg_row_int(result, 0, 1) == 8 &&
+        pg_row_int(result, 0, 2) == 942 && pg_row_int(result, 0, 3) == 1681 &&
+        pg_row_int(result, 0, 4) == 103;
+};
+
+defn bootstrap_gate_run(conn: PgConn) -> Bool {
+    let scope: PgResult = pg_simple_query(conn,
+        "CREATE SCHEMA IF NOT EXISTS briev_bootstrap_gate; SET search_path TO briev_bootstrap_gate");
+    when scope.ok == false { println!("gate_schema=false message={}", scope.err_msg); term false; };
+    let schema: PgResult = store_create_schema(conn);
+    when schema.ok == false { println!("gate_tables=false message={}", schema.err_msg); term false; };
+    let reset: PgResult = pg_simple_query(conn, "TRUNCATE baseline_ratings, load_state");
+    when reset.ok == false { term false; };
+    let missing: BaselineLoad = baseline_bootstrap(conn, "tests/fixtures/recommender/bootstrap_gate_missing.udata");
+    let missing_ok: Bool = missing.ok == false && bootstrap_gate_empty(conn);
+    println!("missing_file_rolls_back={}", missing_ok);
+    when missing_ok == false { term false; };
+    let constraint: PgResult = pg_simple_query(conn,
+        "ALTER TABLE baseline_ratings ADD CONSTRAINT bootstrap_gate_reject CHECK (user_idx < 900)");
+    when constraint.ok == false { term false; };
+    let rejected: BaselineLoad = baseline_bootstrap(conn, "tests/fixtures/recommender/bootstrap_gate.udata");
+    let rejected_ok: Bool = rejected.ok == false && rejected.err_code == "23514" && bootstrap_gate_empty(conn);
+    println!("database_error_rolls_back={} code={} message={}", rejected_ok, rejected.err_code, rejected.err_msg);
+    let removed: PgResult = pg_simple_query(conn,
+        "ALTER TABLE baseline_ratings DROP CONSTRAINT bootstrap_gate_reject");
+    when rejected_ok == false || removed.ok == false { term false; };
+    let loaded: BaselineLoad = baseline_bootstrap(conn, "tests/fixtures/recommender/bootstrap_gate.udata");
+    let loaded_ok: Bool = loaded.ok && loaded.loaded && loaded.accepted == 4 && loaded.discarded == 1;
+    println!("baseline_loaded={} accepted={} discarded={} code={} message={}",
+        loaded_ok, loaded.accepted, loaded.discarded, loaded.err_code, loaded.err_msg);
+    when loaded_ok == false { term false; };
+    let contents_ok: Bool = bootstrap_gate_contents(conn);
+    println!("persisted_indices_values_and_last_duplicate={}", contents_ok);
+    let skipped: BaselineLoad = baseline_bootstrap(conn, "tests/fixtures/recommender/bootstrap_gate_missing.udata");
+    let skipped_ok: Bool = skipped.ok && skipped.loaded == false && skipped.accepted == 0;
+    println!("second_load_skips_missing_source={}", skipped_ok);
+    let unchanged: Bool = bootstrap_gate_contents(conn);
+    println!("second_load_preserves_population={}", unchanged);
+    term contents_ok && skipped_ok && unchanged;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let role: String = get_env("PGUSER");
+    let database: String = get_env("PGDATABASE");
+    when role .^Length == 0 || database .^Length == 0 {
+        println!("Set PGUSER and PGDATABASE to the dedicated test database.");
+        endprogram 1;
+    };
+    let conn: PgConn = pg_connect(2130706433, 5432, role, database, "");
+    when conn.sock.fd < 0 || conn.pid < 0 {
+        println!("connect=false fd={} pid={}", conn.sock.fd, conn.pid);
+        when conn.sock.fd >= 0 { sock_close(conn.sock); };
+        endprogram 1;
+    };
+    let passed: Bool = bootstrap_gate_run(conn);
+    pg_close(conn);
+    when passed == false { endprogram 1; };
+    tick = 1;
+    endprogram;
+};

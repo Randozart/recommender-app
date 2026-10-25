@@ -1,0 +1,13 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import { stdout_flush } from "std/cast_lanes.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    foreach item in 0..2 {
+        when item >= 0 { println!("nested-print={}",item); };
+    };
+    stdout_flush();
+    tick = 1; endprogram;
+};

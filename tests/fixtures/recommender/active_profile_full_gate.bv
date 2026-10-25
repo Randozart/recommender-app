@@ -1,0 +1,35 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./active_profile_support.bv";
+import "./active_profile_components.bv";
+import "./active_profile_scratch_ab.bv";
+import "std/env.bv";
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let restored: Result<ServerModel,PgResult> = model_restore(get_env("CACHE_PATH"),"",943,1682);
+    when is_err(restored) { println!("full model rejected"); endprogram 1; };
+    let model: ServerModel = unwrap(restored);
+    when !active_gate_components(model,5) || !active_gate_components(model,100) { endprogram 1; };
+    let started: Int = trace_clock();
+    let built: Result<ActiveProfileEngine,String> = active_engine_new(model,"1",134217728);
+    when is_err(built) { println!("engine rejected={}",unwrap_err(built)); endprogram 1; };
+    let engine: ActiveProfileEngine = unwrap(built);
+    println!("active_profile_prepare users={} items={} nnz={} bytes={} prepare_us={}",model.population.nusers,
+        model.population.nitems,model.population.nnz,engine.scratch.bytes,trace_clock()-started);
+    when !active_gate_scratch_ab(engine) { endprogram 1; };
+    let counts: List<Int> = [0,4,5,20,100];
+    let valid: Bool = true;
+    foreach repeat in 0..3 {
+        foreach idx in 0..counts .^Length { valid = active_gate_compare(engine,2147483000,counts[idx],repeat) && valid; };
+    };
+    let owner_ids: List<Int> = [42];
+    let mapped: ServerModel = model; mapped.accounts = owner_ids; mapped.baseline_users = model.population.nusers-1;
+    let same_storage: ActiveProfileEngine = engine; same_storage.model = mapped;
+    valid = active_gate_compare(same_storage,42,20,0) && valid;
+    active_engine_free(engine); model_free(model);
+    println!("active_profile_full_gate={}",valid);
+    when !valid { endprogram 1; };
+    tick = 1; endprogram;
+};

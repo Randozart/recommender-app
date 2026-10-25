@@ -1,0 +1,18 @@
+# Build products
+/target/
+*.ll
+*.wasm
+*.o
+*.so
+*.a
+*.log
+
+# Local MovieLens data and database snapshots
+u.data
+u.item
+*.snapshot.bin*
+
+# Local environment files
+.env
+.env.*
+!.env.example

@@ -1,0 +1,55 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import { means_build, means_free, simcache_build, simcache_free } from "../../../examples/recommender/cf_engine.bv";
+import { simcache_build_prepared } from "../../../examples/recommender/cf_prepared.bv";
+
+import "std/rating_population.bv";
+import "std/matrix.bv";
+
+defn prepared_equal(pop: RatingPopulation) -> Bool {
+    let means: Means = means_build(pop);
+    let direct: SimCache = simcache_build(pop,means,7);
+    let reused: SimCache = simcache_build_prepared(pop,means,7);
+    let equal: Bool = true;
+    foreach a in 0..pop.nusers {
+        foreach b in 0..pop.nusers {
+            when !(Fabs#(mat_get(direct.user_sim,a,b)-mat_get(reused.user_sim,a,b)) <= 0.000001) { equal = false; };
+        };
+    };
+    foreach a in 0..pop.nitems {
+        foreach b in 0..pop.nitems {
+            when !(Fabs#(mat_get(direct.item_sim,a,b)-mat_get(reused.item_sim,a,b)) <= 0.000001) { equal = false; };
+        };
+    };
+    simcache_free(direct); simcache_free(reused); means_free(means); pop_free(pop);
+    term equal;
+};
+
+defn prepared_sparse(size: Int) -> RatingPopulation {
+    let users: IntVec = ivec_new(size*size);
+    let items: IntVec = ivec_new(size*size);
+    let values: Vector = vec_new(size*size);
+    let count: Int = 0;
+    foreach user in 0..size {
+        foreach item in 0..size {
+            when (user*7+item*11)%13 < 3 {
+                ivec_set(users,count,user); ivec_set(items,count,item);
+                vec_set(values,count,(1+(user+item)%5) as Float); count = count+1;
+            };
+        };
+    };
+    let pop: RatingPopulation = pop_build(users,items,values,count,size+1,size+2);
+    ivec_free(users); ivec_free(items); vec_free(values);
+    term pop;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let fixture: Bool = prepared_equal(prepared_sparse(4));
+    let changed: Bool = prepared_equal(prepared_sparse(7));
+    let sparse: Bool = prepared_equal(prepared_sparse(17));
+    println!("prepared_fixture={} prepared_changed={} sparse_empty_constant_rows={}",fixture,changed,sparse);
+    when !fixture || !changed || !sparse { endprogram 1; };
+    tick = 1; endprogram;
+};

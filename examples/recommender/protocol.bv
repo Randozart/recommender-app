@@ -1,0 +1,6 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// Portable version-1 contract surface. Native transport adds worker_framing.bv;
+// browser consumers must not import POSIX/process/database modules through it.
+import "./worker_messages.bv";

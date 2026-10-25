@@ -1,0 +1,107 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/active_profile.bv";
+import "../../../examples/recommender/server_model.bv";
+import "../../../examples/recommender/trace.bv";
+import { simcache_build_prepared } from "../../../examples/recommender/cf_prepared.bv";
+
+defn active_gate_ratings(count: Int, edit: Int) -> List<ProfileRating> {
+    let ratings: List<ProfileRating> = [];
+    foreach item in 0..count { ratings <- ProfileRating { item_id: item, rating: 1+(item+edit)%5 }; };
+    term ratings;
+};
+
+defn active_gate_state(owner: Int, ratings: List<ProfileRating>) -> AccountState {
+    let rows: List<AccountRating> = [];
+    foreach idx in 0..ratings .^Length {
+        rows <- AccountRating { item_id: ratings[idx].item_id, rating: ratings[idx].rating, timestamp: 1 };
+    };
+    term AccountState { result: AccountResult { ok: true, error: "",
+        account: Account { id: owner, username: "i06-fixture" }, detail: pg_result_empty() }, ratings: rows };
+};
+
+defn active_gate_model(users: Int, items: Int, mode: Int) -> ServerModel {
+    let row: IntVec = ivec_new(users*items+1);
+    let col: IntVec = ivec_new(users*items+1);
+    let values: Vector = vec_new(users*items+1);
+    let count: Int = 0;
+    foreach user in 0..users {
+        foreach item in 0..items {
+            when mode != 0 && user % 11 != 0 && (user+item)%3 != 0 {
+                ivec_set(row,count,user); ivec_set(col,count,item);
+                let value: Float = 3.0;
+                when mode == 2 { value = (1+(user*3+item*2)%5) as Float; };
+                vec_set(values,count,value); count = count+1;
+            };
+        };
+    };
+    let pop: RatingPopulation = pop_build(row,col,values,count,users,items);
+    ivec_free(row); ivec_free(col); vec_free(values);
+    let means: Means = means_build(pop);
+    let accounts: List<Int> = [42];
+    term ServerModel { population: pop, means: means, cache: simcache_build_prepared(pop,means,0),
+        accounts: accounts, baseline_users: users-1, revision: "i06" };
+};
+
+defn active_gate_reference_rank(scores: Vector, ratings: List<ProfileRating>) -> List<Int> {
+    let picked: IntVec = ivec_new(scores.len);
+    foreach item in 0..scores.len { ivec_set(picked,item,0); };
+    foreach idx in 0..ratings .^Length { ivec_set(picked,ratings[idx].item_id,1); };
+    let ids: List<Int> = [];
+    foreach rank in 0..TOP_N {
+        let best: Int = -1;
+        foreach item in 0..scores.len {
+            when ivec_get(picked,item) == 0 && (best < 0 || vec_get(scores,item) > vec_get(scores,best)) { best = item; };
+        };
+        when best >= 0 { ids <- best; ivec_set(picked,best,1); };
+    };
+    ivec_free(picked);
+    term ids;
+};
+
+defn active_gate_compare(engine: ActiveProfileEngine, owner: Int, count: Int, edit: Int) -> Bool {
+    let ratings: List<ProfileRating> = active_gate_ratings(count,edit);
+    let state: AccountState = active_gate_state(owner,ratings);
+    let reference_started: Int = trace_clock();
+    let reference: ActivePrediction = active_build(engine.model,state);
+    let reference_scores: Vector = vec_new(engine.model.population.nitems);
+    foreach item in 0..reference_scores.len {
+        vec_set(reference_scores,item,clamp15(0.5*active_user_prediction(reference,item)+0.5*active_item_prediction(reference,item)));
+    };
+    let reference_us: Int = trace_clock()-reference_started;
+    let view_started: Int = trace_clock();
+    let prepared: Result<ActiveProfileEngine,String> = active_profile_prepare(engine,owner,ratings);
+    when is_err(prepared) { println!("profile rejected={}",unwrap_err(prepared)); term false; };
+    let profile: ActiveProfileEngine = unwrap(prepared);
+    active_profile_build(profile);
+    let finite: Bool = active_profile_scores(profile,0.5);
+    let view_us: Int = trace_clock()-view_started;
+    let equivalent: Bool = finite;
+    let largest: Float = 0.0;
+    let similarity_error: Float = 0.0;
+    foreach user in 0..engine.model.population.nusers {
+        let error: Float = Fabs#(vec_get(reference.similarities,user)-vec_get(engine.scratch.similarities,user));
+        when !json_finite(error) || error > 0.000001 { equivalent = false; };
+        when error > largest { largest = error; };
+        when error > similarity_error { similarity_error = error; };
+    };
+    foreach item in 0..reference_scores.len {
+        let error: Float = Fabs#(vec_get(reference_scores,item)-vec_get(engine.scratch.scores,item));
+        // FP32 normalized weighted sums amplify tiny PCC rounding differences.
+        // The mixed 1e-6 absolute / 1e-5 relative budget is below the standard
+        // gamma_943 summation bound (~1.1e-4). IDs/order remain exact below.
+        let tolerance: Float = 0.000001+0.00001*Fabs#(vec_get(reference_scores,item));
+        when !json_finite(error) || error > tolerance { equivalent = false; };
+        when error > largest { largest = error; };
+    };
+    let expected: List<Int> = active_gate_reference_rank(reference_scores,ratings);
+    let actual: List<RankedMovie> = active_profile_rank(engine.scratch);
+    let ids_match: Bool = expected .^Length == actual .^Length;
+    foreach idx in 0..expected .^Length { when idx >= actual .^Length || expected[idx] != actual[idx].item_id { ids_match = false; }; };
+    equivalent = equivalent && ids_match;
+    println!("active_profile users={} items={} owner={} ratings={} edit={} equivalent={} ids_match={} max_error={} similarity_error={} reference_us={} view_us={}",
+        engine.model.population.nusers,reference_scores.len,owner,count,edit,equivalent,ids_match,largest,similarity_error,reference_us,view_us);
+    vec_free(reference.similarities); vec_free(reference_scores);
+    term equivalent;
+};

@@ -1,0 +1,74 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/worker_framing.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+defn contract_frame_prefixes(buffer: GrowBuf, text: String) -> Bool {
+    foreach length in 0..buffer.len {
+        let prefix: ByteBuf = ByteBuf { ptr: buffer.ptr, len: length, cap: buffer.cap };
+        when length < 8 && worker_frame_size(prefix) != 0 { term false; };
+        when length >= 8 && worker_frame_size(prefix) != buffer.len { term false; };
+        when is_ok(worker_frame_decode(prefix)) { term false; };
+    };
+    let full: ByteBuf = ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap };
+    let decoded: Result<WorkerFrame,String> = worker_frame_decode(full);
+    when is_err(decoded) { term false; };
+    term unwrap(decoded).text == text && unwrap(decoded).consumed == buffer.len;
+};
+defn contract_adjacent_frames(first: GrowBuf) -> Bool {
+    let second: GrowBuf = unwrap(worker_frame_encode("{\"next\":true}"));
+    let joined: GrowBuf = grow_new(first.len+second.len).put_bytes(first.ptr,first.len).put_bytes(second.ptr,second.len);
+    let buffer: ByteBuf = ByteBuf { ptr: joined.ptr, len: joined.len, cap: joined.cap };
+    let decoded: Result<WorkerFrame,String> = worker_frame_decode(buffer);
+    when is_err(decoded) { grow_free(second); grow_free(joined); term false; };
+    let used: Int = unwrap(decoded).consumed;
+    let tail: ByteBuf = ByteBuf { ptr: joined.ptr+used, len: joined.len-used, cap: joined.cap-used };
+    let next: Result<WorkerFrame,String> = worker_frame_decode(tail);
+    let valid: Bool = is_ok(next) && unwrap(next).text == "{\"next\":true}" && unwrap(next).consumed == second.len;
+    grow_free(second); grow_free(joined);
+    term valid;
+};
+defn contract_frame_bounds() -> Bool {
+    let raw: ByteBuf = buf_new(65537);
+    when raw.ptr == 0 { term false; };
+    Fill#(raw.ptr,97,65537);
+    let filled: ByteBuf = buf_received(raw,65537);
+    let exact: String = buf_slice_string(filled,0,65536);
+    let too_large: String = buf_slice_string(filled,0,65537);
+    let encoded: Result<GrowBuf,String> = worker_frame_encode(exact);
+    when is_err(encoded) { buf_free(filled); term false; };
+    let frame: GrowBuf = unwrap(encoded);
+    let valid: Bool = frame.len == 65544 && contract_frame_prefixes(frame,exact) && is_err(worker_frame_encode(too_large));
+    grow_free(frame); buf_free(filled);
+    Free#((exact as Data) as Ptr); Free#((too_large as Data) as Ptr);
+    term valid;
+};
+defn contract_bad_headers() -> Bool {
+    let sizes: List<Int> = [0,65537,4294967295];
+    foreach idx in 0..sizes .^Length {
+        let header: GrowBuf = grow_new(8).put_u32_be(WORKER_FRAME_MAGIC).put_u32_be(sizes[idx]);
+        let view: ByteBuf = ByteBuf { ptr: header.ptr, len: header.len, cap: header.cap };
+        let invalid: Bool = worker_frame_size(view) == -1 && is_err(worker_frame_decode(view));
+        grow_free(header);
+        when !invalid { term false; };
+    };
+    let bad_magic: GrowBuf = grow_new(8).put_u32_be(0).put_u32_be(2);
+    let invalid: Bool = worker_frame_size(ByteBuf { ptr: bad_magic.ptr, len: 8, cap: 8 }) == -1;
+    grow_free(bad_magic);
+    term invalid && worker_frame_size(ByteBuf { ptr: 0, len: 8, cap: 8 }) == -1 &&
+        worker_frame_size(ByteBuf { ptr: 0, len: 0, cap: 0 }) == 0 && is_err(worker_frame_encode(""));
+};
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let text: String = "{\"text\":\"雪\"}";
+    let frame: GrowBuf = unwrap(worker_frame_encode(text));
+    let prefixes: Bool = contract_frame_prefixes(frame,text);
+    let adjacent: Bool = contract_adjacent_frames(frame);
+    let bounds: Bool = contract_frame_bounds();
+    let invalid: Bool = contract_bad_headers();
+    grow_free(frame);
+    println!("frame prefixes={} adjacent={} bounds={} invalid={}",prefixes,adjacent,bounds,invalid); stdout_flush();
+    when !prefixes || !adjacent || !bounds || !invalid { endprogram 1; };
+    tick = 1; endprogram;
+};

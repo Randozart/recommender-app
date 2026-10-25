@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./active_profile_support.bv";
+import "std/env.bv";
+import { str_find } from "std/net/http.bv";
+
+defn active_reuse_rss_pages() -> Int {
+    let read: Result<String,Int> = read_file("/proc/self/statm");
+    when is_err(read) { term -1; };
+    let text: String = unwrap(read);
+    let start: Int = str_find(text," ")+1;
+    let tail: String = text[start:text .^Length];
+    let resident: String = tail[0:str_find(tail," ")];
+    let pages: Int = resident as Int;
+    Free#(((resident as Data) as Int) as Ptr);
+    Free#(((tail as Data) as Int) as Ptr);
+    Free#(((text as Data) as Int) as Ptr);
+    term pages;
+};
+
+defn active_reuse_run(profile: ActiveProfileEngine, repeats: Int) -> Float {
+    let sum: Float = 0.0;
+    foreach idx in 0..repeats {
+        active_profile_build(profile);
+        when !active_profile_scores(profile,0.5) { term -1.0; };
+        sum = sum+vec_get(profile.scratch.scores,idx % profile.model.population.nitems);
+    };
+    term sum;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let restored: Result<ServerModel,PgResult> = model_restore(get_env("CACHE_PATH"),"",943,1682);
+    when is_err(restored) { endprogram 1; };
+    let model: ServerModel = unwrap(restored);
+    let engine: ActiveProfileEngine = unwrap(active_engine_new(model,"1",134217728));
+    let profile: ActiveProfileEngine = unwrap(active_profile_prepare(engine,42,active_gate_ratings(100,0)));
+    let warm: Float = active_reuse_run(profile,10);
+    let before: Int = active_reuse_rss_pages();
+    let checksum: Float = active_reuse_run(profile,100);
+    let after: Int = active_reuse_rss_pages();
+    let bounded: Bool = before > 0 && after <= before+256 && warm >= 0.0 && checksum >= 0.0;
+    println!("active_profile_reuse before_pages={} after_pages={} extra_pages={} bounded={} checksum={}",before,after,after-before,bounded,checksum);
+    active_engine_free(engine); model_free(model);
+    when !bounded { endprogram 1; };
+    tick = 1; endprogram;
+};

@@ -1,0 +1,124 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./worker_lifecycle.bv";
+
+obj PredictionWorkerModel { worker_id: Int; generation: String; };
+obj PredictionGenerations { models: ModelRegistry; workers: List<PredictionWorkerModel>; };
+obj PredictionGenerationInstall { state: PredictionGenerations; installed: Bool; error: String; };
+obj PredictionGenerationLease { acquired: PredictionGenerations; lease: ModelLease; };
+
+// 2026-10-22: I08 counts loaded workers and running jobs as model readers.
+// This targets snapshot reclamation during model swaps; remove only when the
+// replacement registry proves both lifetimes before freeing an old descriptor.
+defn prediction_generations_new() -> PredictionGenerations {
+    let workers: List<PredictionWorkerModel> = [];
+    term PredictionGenerations { models: model_registry_new(), workers: workers };
+};
+
+defn prediction_generations_install(state: PredictionGenerations, descriptor: ModelDescriptor) -> PredictionGenerationInstall {
+    let installed: ModelInstall = model_install(state.models,descriptor);
+    when !installed.installed {
+        term PredictionGenerationInstall { state: state, installed: false, error: installed.error };
+    };
+    term PredictionGenerationInstall { state: PredictionGenerations { models: installed.registry, workers: state.workers },
+        installed: true, error: "" };
+};
+
+defn prediction_generation_register_worker(state: PredictionGenerations, worker_id: Int) -> Result<PredictionGenerations,String> {
+    when worker_id < 1 || prediction_generation_worker_at(state.workers,worker_id) >= 0 {
+        term Err("Prediction worker identity must be positive and unique.");
+    };
+    let entry: PredictionWorkerModel = PredictionWorkerModel { worker_id: worker_id, generation: "0" };
+    let appended: List<PredictionWorkerModel> = [entry];
+    term Ok(PredictionGenerations { models: state.models, workers: state.workers+appended });
+};
+
+defn prediction_generation_worker_at(workers: List<PredictionWorkerModel>, worker_id: Int) -> Int {
+    foreach idx in 0..workers .^Length { when workers[idx].worker_id == worker_id { term idx; }; };
+    term -1;
+};
+
+defn prediction_generation_current_descriptor(state: PredictionGenerations) -> Result<ModelDescriptor,String> {
+    let idx: Int = model_find(state.models,state.models.current_generation);
+    when idx < 0 { term Err("No prediction model generation is installed."); };
+    term Ok(state.models.slots[idx].descriptor);
+};
+
+defn prediction_generation_worker_ack(state: PredictionGenerations, worker_id: Int, generation: String)
+    -> Result<PredictionGenerations,String>
+{
+    let worker_idx: Int = prediction_generation_worker_at(state.workers,worker_id);
+    when worker_idx < 0 { term Err("Prediction worker is not registered."); };
+    when state.workers[worker_idx].generation == generation { term Ok(state); };
+    let acquired: Result<ModelAcquisition,String> = model_acquire(state.models,generation);
+    when is_err(acquired) { term Err(unwrap_err(acquired)); };
+    let next_models: ModelRegistry = unwrap(acquired).registry;
+    let previous: String = state.workers[worker_idx].generation;
+    let released: Result<ModelRegistry,String> = prediction_generation_release_previous(next_models,state.models,previous,generation);
+    when is_err(released) {
+        model_release(next_models,unwrap(acquired).lease);
+        term Err(unwrap_err(released));
+    };
+    let worker: PredictionWorkerModel = PredictionWorkerModel { worker_id: worker_id, generation: generation };
+    let workers: List<PredictionWorkerModel> = prediction_generation_replace_worker(state.workers,worker_idx,worker);
+    term Ok(PredictionGenerations { models: unwrap(released), workers: workers });
+};
+
+defn prediction_generation_release_previous(next: ModelRegistry, prior: ModelRegistry, previous: String, generation: String)
+    -> Result<ModelRegistry,String>
+{
+    when previous == "0" || previous == generation { term Ok(next); };
+    let idx: Int = model_find(prior,previous);
+    when idx < 0 { term Err("Prediction worker's previous model lease is missing."); };
+    let lease: ModelLease = ModelLease { descriptor: prior.slots[idx].descriptor, held: true };
+    term model_release(next,lease);
+};
+
+defn prediction_generation_replace_worker(workers: List<PredictionWorkerModel>, target: Int,
+    replacement: PredictionWorkerModel) -> List<PredictionWorkerModel>
+{
+    let updated: List<PredictionWorkerModel> = [];
+    foreach idx in 0..workers .^Length {
+        when idx == target { updated <- replacement; };
+        when idx != target { updated <- workers[idx]; };
+    };
+    term updated;
+};
+
+defn prediction_generation_job_acquire(state: PredictionGenerations, generation: String)
+    -> Result<PredictionGenerationLease,String>
+{
+    let acquired: Result<ModelAcquisition,String> = model_acquire(state.models,generation);
+    when is_err(acquired) { term Err(unwrap_err(acquired)); };
+    let updated: PredictionGenerations = PredictionGenerations { models: unwrap(acquired).registry, workers: state.workers };
+    term Ok(PredictionGenerationLease { acquired: updated, lease: unwrap(acquired).lease });
+};
+
+defn prediction_generation_job_release(state: PredictionGenerations, held: PredictionGenerationLease)
+    -> Result<PredictionGenerations,String>
+{
+    let released: Result<ModelRegistry,String> = model_release(state.models,held.lease);
+    when is_err(released) { term Err(unwrap_err(released)); };
+    term Ok(PredictionGenerations { models: unwrap(released), workers: state.workers });
+};
+
+defn prediction_generation_unregister_worker(state: PredictionGenerations, worker_id: Int)
+    -> Result<PredictionGenerations,String>
+{
+    let idx: Int = prediction_generation_worker_at(state.workers,worker_id);
+    when idx < 0 { term Err("Prediction worker is not registered."); };
+    let generation: String = state.workers[idx].generation;
+    let released: Result<ModelRegistry,String> = prediction_generation_release_worker(state.models,generation);
+    when is_err(released) { term Err(unwrap_err(released)); };
+    let workers: List<PredictionWorkerModel> = [];
+    foreach at in 0..state.workers .^Length { when at != idx { workers <- state.workers[at]; }; };
+    term Ok(PredictionGenerations { models: unwrap(released), workers: workers });
+};
+
+defn prediction_generation_release_worker(models: ModelRegistry, generation: String) -> Result<ModelRegistry,String> {
+    when generation == "0" { term Ok(models); };
+    let idx: Int = model_find(models,generation);
+    when idx < 0 { term Err("Prediction worker model lease cannot be found."); };
+    term model_release(models,ModelLease { descriptor: models.slots[idx].descriptor, held: true });
+};

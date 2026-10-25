@@ -1,0 +1,106 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/string.bv";
+
+// 2026-10-21: Task 10.1 keeps wire/file IDs at the boundary. Stored records
+// use zero-based indices; only the canonical printer adds one back. Strict
+// decimal parsing prevents malformed text from silently becoming rating zero.
+// Replace this scanner only with an equally strict, overflow-checked parser.
+obj UDataRecord {
+    user_idx: Int;
+    item_idx: Int;
+    rating: Int;
+    timestamp: Int;
+};
+
+obj UDataBatch {
+    records: List<UDataRecord>;
+    discarded: Int;
+};
+
+defn udata_space(code: Int) -> Bool {
+    term code == 32 || code == 9 || code == 13;
+};
+
+// -1 is an invalid unsigned decimal field, never a valid dataset value.
+defn udata_decimal(text: String, idx: Int, acc: Int) -> Int {
+    when idx >= text .^Length { term acc; };
+    let digit: Int = byte_at(text, idx) - 48;
+    when digit < 0 || digit > 9 { term -1; };
+    when acc > 922337203685477580 ||
+        (acc == 922337203685477580 && digit > 7) { term -1; };
+    term udata_decimal(text, idx + 1, acc * 10 + digit);
+};
+
+defn udata_token_end(line: String, idx: Int) -> Int {
+    when idx >= line .^Length { term idx; };
+    when udata_space(byte_at(line, idx)) { term idx; };
+    term udata_token_end(line, idx + 1);
+};
+
+defn udata_fields(line: String, idx: Int, fields: List<Int>) -> List<Int> {
+    when idx >= line .^Length { term fields; };
+    when fields .^Length >= 5 { term fields; };
+    when udata_space(byte_at(line, idx)) {
+        term udata_fields(line, idx + 1, fields);
+    };
+    let stop: Int = udata_token_end(line, idx);
+    let value: Int = udata_decimal(line[idx:stop], 0, 0);
+    let grown: List<Int> = fields + [value];
+    term udata_fields(line, stop, grown);
+};
+
+defn udata_add_line(line: String, batch: UDataBatch) -> UDataBatch {
+    let empty: List<Int> = [];
+    let fields: List<Int> = udata_fields(line, 0, empty);
+    when fields .^Length != 4 {
+        term UDataBatch { records: batch.records, discarded: batch.discarded + 1 };
+    };
+    when fields[0] < 1 || fields[0] > 943 || fields[1] < 1 || fields[1] > 1682 ||
+        fields[2] < 1 || fields[2] > 5 || fields[3] < 0 {
+        term UDataBatch { records: batch.records, discarded: batch.discarded + 1 };
+    };
+    let record: UDataRecord = UDataRecord {
+        user_idx: fields[0] - 1, item_idx: fields[1] - 1,
+        rating: fields[2], timestamp: fields[3]
+    };
+    let grown: List<UDataRecord> = batch.records + [record];
+    term UDataBatch { records: grown, discarded: batch.discarded };
+};
+
+// Newline terminates a record, so a malformed line cannot consume the next.
+// Empty input has no records; a trailing newline adds no phantom empty record.
+defn udata_scan(text: String, idx: Int, start: Int, batch: UDataBatch) -> UDataBatch {
+    when idx >= text .^Length {
+        when start < idx { term udata_add_line(text[start:idx], batch); };
+        term batch;
+    };
+    when byte_at(text, idx) == 10 {
+        let next: UDataBatch = udata_add_line(text[start:idx], batch);
+        term udata_scan(text, idx + 1, idx + 1, next);
+    };
+    term udata_scan(text, idx + 1, start, batch);
+};
+
+defn udata_parse(text: String) -> UDataBatch {
+    let empty: List<UDataRecord> = [];
+    let batch: UDataBatch = UDataBatch { records: empty, discarded: 0 };
+    term udata_scan(text, 0, 0, batch);
+};
+
+defn udata_print_record(record: UDataRecord)
+    [record.user_idx >= 0 && record.user_idx < 943 &&
+     record.item_idx >= 0 && record.item_idx < 1682 &&
+     record.rating >= 1 && record.rating <= 5 && record.timestamp >= 0][true]
+    -> String
+{
+    term ((record.user_idx + 1) as String) + "\t" +
+        ((record.item_idx + 1) as String) + "\t" +
+        (record.rating as String) + "\t" + (record.timestamp as String) + "\n";
+};
+
+defn udata_print(records: List<UDataRecord>, idx: Int, text: String) -> String {
+    when idx >= records .^Length { term text; };
+    term udata_print(records, idx + 1, text + udata_print_record(records[idx]));
+};

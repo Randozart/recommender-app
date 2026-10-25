@@ -1,0 +1,43 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+// 2026-10-22: I02 v1 boundaries. Counters stay canonical decimal strings at
+// process/browser boundaries; WASM's flexible Int must not truncate revisions.
+// Change this version only with coordinator review and dependent fixture reruns.
+import "std/json.bv";
+
+obj RatingCommand { server_epoch: String; operation_id: String; item_id: Int; rating: Int; };
+obj ProfileRating { item_id: Int; rating: Int; };
+obj ProfileVersion { server_epoch: String; account_id: Int; revision: String; };
+obj PredictionTag { profile: ProfileVersion; model_generation: String; job_id: String; attempt: Int; };
+obj RankedMovie { item_id: Int; score: Float; };
+obj RatingAccepted { profile: ProfileVersion; operation_id: String; delta: ProfileRating; };
+obj RatingSaved { profile: ProfileVersion; operation_id: String; };
+obj RatingSaveFailed { profile: ProfileVersion; operation_id: String; error: String; message: String; retryable: Bool; };
+obj RecommendationResult { tag: PredictionTag; cold_start: Bool; items: List<RankedMovie>; };
+obj RatingDiscarded { original: RatingSaved; profile_revision: String; ratings: List<ProfileRating>; };
+enum RatingEvent {
+    AcceptedRating(RatingAccepted),
+    SavedRating(RatingSaved),
+    FailedRating(RatingSaveFailed),
+    PredictedRatings(RecommendationResult),
+    DiscardedRating(RatingDiscarded),
+};
+
+obj WorkerTag { profile: ProfileVersion; job_id: String; attempt: Int; model_generation: String; };
+obj WorkerMessage { kind: String; tag: WorkerTag; payload: JsonValue; };
+obj ModelDescriptor { generation: String; path: String; identity: String; bytes: Int; };
+obj HydrationRequest { tag: WorkerTag; database_identity: String; };
+obj HydratedProfile { tag: WorkerTag; username: String; ratings: List<ProfileRating>; };
+obj PredictionRequest { tag: WorkerTag; ratings: List<ProfileRating>; };
+obj PersistenceRequest { tag: WorkerTag; command: RatingCommand; timestamp: String; database_identity: String; };
+
+enum PersistencePhase {
+    PersistQueued, PersistRunning, PersistRetryWait, PersistFailed,
+    PersistUncertain, PersistSaved, PersistDiscardQueued, PersistDiscardRunning,
+    PersistDiscardFailed, PersistDiscardUncertain, PersistDiscarded,
+};
+enum PersistenceSignal {
+    DispatchPersist, CommitPersist, RollbackPersist, LosePersist,
+    RetryPersist, RequestDiscard, CommitDiscard, ExhaustPersist, FailPersist,
+};

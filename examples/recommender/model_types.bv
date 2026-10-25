@@ -1,0 +1,9 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import { Means, SimCache, PopSignature } from "./cf_engine.bv";
+import "std/rating_population.bv";
+obj ServerModel {
+    population: RatingPopulation; means: Means; cache: SimCache;
+    accounts: List<Int>; baseline_users: Int; revision: String;
+};

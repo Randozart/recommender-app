@@ -1,0 +1,210 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./reactor.bv";
+import "std/net/http.bv";
+import "std/net/websocket.bv";
+import { syscall, SYS_RECV, SYS_SEND } from "std/posix/syscall.bv";
+
+const SERVER_INPUT_LIMIT: Int = 65536;
+const SERVER_OUTPUT_LIMIT: Int = 1048576;
+
+defn io_trim(text: String) -> String {
+    when text .^Length == 0 { term text; };
+    let first: Int = byte_at(text,0);
+    when first == 32 || first == 9 { term io_trim(text[1:text .^Length]); };
+    let last: Int = byte_at(text,text .^Length-1);
+    when last == 32 || last == 9 { term io_trim(text[0:text .^Length-1]); };
+    term text;
+};
+
+defn io_header(request: HttpRequest, name: String) -> String { term io_trim(http_header(request,name)); };
+
+defn io_interest(reactor: Reactor, slot: Int) -> Bool {
+    let row: Int = reactor_row(reactor,slot);
+    let events: Int = 0;
+    when Load#(row + 120,8) == 0 && Load#(row + 112,8) == 0 { events = 1; };
+    when Load#(row + 48,8) != 0 { events = events | 4; };
+    Store#(reactor.polls + (slot+1)*8 + 4,events,2);
+    term true;
+};
+
+// 2026-10-21: queue ownership transfers here, including allocation failure.
+// Retain the unsent suffix when a second push arrives during backpressure.
+// The explicit cap bounds a stalled peer's memory; replace with configured
+// admission control if the application later needs larger messages.
+defn io_queue(reactor: Reactor, slot: Int, output: GrowBuf) -> Bool {
+    let row: Int = reactor_row(reactor,slot);
+    let previous: Int = Load#(row + 48,8);
+    let sent: Int = Load#(row + 56,8);
+    let remaining: Int = Load#(row + 72,8) - sent;
+    when output.len > SERVER_OUTPUT_LIMIT - remaining {
+        grow_free(output); reactor_remove(reactor,slot); term false;
+    };
+    let combined: Int = Malloc#(remaining + output.len + 1) as Int;
+    when combined == 0 { grow_free(output); reactor_remove(reactor,slot); term false; };
+    when remaining > 0 { Copy#(combined as Ptr,(previous + sent) as Ptr,remaining); };
+    when output.len > 0 { Copy#((combined + remaining) as Ptr,output.ptr as Ptr,output.len); };
+    Free#(previous as Ptr);
+    Store#(row + 48,combined,8); Store#(row + 56,0,8);
+    Store#(row + 72,remaining + output.len,8);
+    grow_free(output);
+    io_interest(reactor,slot);
+    term true;
+};
+
+defn io_http_reply(reactor: Reactor, slot: Int, status: Int, body: String) -> Bool {
+    let row: Int = reactor_row(reactor,slot);
+    Store#(row + 112,1,8);
+    term io_queue(reactor,slot,http_json_response(status,body));
+};
+
+defn io_ws_close(reactor: Reactor, slot: Int, code: Int) -> Bool {
+    let payload: GrowBuf = grow_new(2).put_u16_be(code);
+    let frame: GrowBuf = ws_encode(grow_new(4),true,8,false,0,payload.ptr,payload.len);
+    grow_free(payload);
+    Store#(reactor_row(reactor,slot)+112,1,8);
+    term io_queue(reactor,slot,frame);
+};
+
+defn io_flush(reactor: Reactor, slot: Int) -> Bool {
+    let row: Int = reactor_row(reactor,slot);
+    let output: Int = Load#(row + 48,8);
+    when output == 0 { term true; };
+    let sent: Int = Load#(row + 56,8);
+    let total: Int = Load#(row + 72,8);
+    let count: Int = syscall(SYS_SEND,Load#(row,8),output + sent,total - sent,16384);
+    when count == -11 || count == -4 { term true; };
+    when count <= 0 { reactor_remove(reactor,slot); term false; };
+    Store#(row + 56,sent + count,8);
+    when sent + count == total {
+        Free#(output as Ptr);
+        Store#(row + 48,0,8); Store#(row + 56,0,8); Store#(row + 72,0,8);
+        when Load#(row + 112,8) != 0 || Load#(row + 120,8) != 0 { reactor_remove(reactor,slot); term false; };
+    };
+    io_interest(reactor,slot);
+    term true;
+};
+
+defn io_read(reactor: Reactor, slot: Int) -> Int {
+    let row: Int = reactor_row(reactor,slot);
+    let input: Int = Load#(row + 40,8);
+    when input == 0 {
+        input = Malloc#(SERVER_INPUT_LIMIT) as Int;
+        when input == 0 { reactor_remove(reactor,slot); term -12; };
+        Store#(row + 40,input,8); Store#(row + 80,SERVER_INPUT_LIMIT,8);
+    };
+    let length: Int = Load#(row + 32,8);
+    when length >= SERVER_INPUT_LIMIT { term -90; };
+    let count: Int = syscall(SYS_RECV,Load#(row,8),input + length,SERVER_INPUT_LIMIT - length,0);
+    when count == -11 || count == -4 { term 1; };
+    when count < 0 { reactor_remove(reactor,slot); term count; };
+    when count == 0 { Store#(row + 120,1,8); term 0; };
+    Store#(row + 32,length + count,8);
+    term count;
+};
+
+defn io_buffer(reactor: Reactor, slot: Int) -> ByteBuf {
+    let row: Int = reactor_row(reactor,slot);
+    term ByteBuf { ptr: Load#(row + 40,8), len: Load#(row + 32,8), cap: SERVER_INPUT_LIMIT };
+};
+
+defn io_consume(reactor: Reactor, slot: Int, count: Int) -> Bool {
+    let row: Int = reactor_row(reactor,slot);
+    let length: Int = Load#(row + 32,8);
+    let input: Int = Load#(row + 40,8);
+    // Forward byte movement supports overlapping ranges without memcpy UB.
+    foreach idx in 0..(length-count) { Store#(input+idx,Load#(input+count+idx,1),1); };
+    Store#(row + 32,length-count,8);
+    term true;
+};
+
+defn io_decimal(text: String) -> Int {
+    when text .^Length == 0 || text .^Length > 9 { term -1; };
+    let number: Int = 0;
+    foreach idx in 0..text .^Length {
+        let byte: Int = byte_at(text,idx);
+        when byte < 48 || byte > 57 { term -1; };
+        number = number * 10 + byte - 48;
+    };
+    term number;
+};
+
+// Reject ambiguous HTTP framing before the reusable incremental parser runs.
+// Negative length, duplicate length and transfer encoding cannot be interpreted
+// as an empty body. -1 needs more bytes; -2 is malformed; -3 exceeds the limit.
+defn io_http_size(buf: ByteBuf) -> Int {
+    let text: String = buf_slice_string(buf,0,buf.len);
+    let end: Int = str_find(text,"\r\n\r\n");
+    when end < 0 { term -1; };
+    let line_end: Int = str_find(text,"\r\n");
+    let line: String = text[0:line_end];
+    let space: Int = str_find(line," ");
+    when space < 1 { term -2; };
+    let version: Int = str_find_from(line," ",space+1);
+    when version < space+2 { term -2; };
+    let protocol: String = line[version+1:line .^Length];
+    when protocol != "HTTP/1.1" && protocol != "HTTP/1.0" { term -2; };
+    let headers: String = text[line_end+2:end];
+    let request: HttpRequest = HttpRequest { method: "", path: "", headers: headers, body: "" };
+    when protocol == "HTTP/1.1" && io_header(request,"Host") .^Length == 0 { term -2; };
+    term io_http_headers(text,line_end+2,end,0,false,false);
+};
+
+defn io_header_name(name: String) -> Bool {
+    let symbols: String = "!#$%&'*+-.^_`|~";
+    foreach idx in 0..name .^Length {
+        let byte: Int = byte_at(name,idx);
+        let letter: Bool = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122);
+        let digit: Bool = byte >= 48 && byte <= 57;
+        when !letter && !digit && str_find(symbols,name[idx:idx+1]) < 0 { term false; };
+    };
+    term name .^Length > 0;
+};
+
+defn io_http_headers(text: String, offset: Int, end: Int, length: Int, seen: Bool, host_seen: Bool) -> Int {
+    when offset >= end {
+        when end+4+length > SERVER_INPUT_LIMIT { term -3; };
+        term end+4+length;
+    };
+    let next: Int = str_find_from(text,"\r\n",offset);
+    let line: String = text[offset:next];
+    let colon: Int = str_find(line,":");
+    when colon < 1 { term -2; };
+    let name: String = line[0:colon];
+    when !io_header_name(name) { term -2; };
+    foreach idx in (colon+1)..(line .^Length) {
+        let byte: Int = byte_at(line,idx);
+        when (byte < 32 && byte != 9) || byte == 127 { term -2; };
+    };
+    when str_eq_ci(name,"Transfer-Encoding") { term -2; };
+    when str_eq_ci(name,"Host") {
+        when host_seen { term -2; };
+        term io_http_headers(text,next+2,end,length,seen,true);
+    };
+    when str_eq_ci(name,"Content-Length") {
+        let number: Int = io_decimal(io_trim(http_line_value(line)));
+        when seen || number < 0 { term -2; };
+        term io_http_headers(text,next+2,end,number,true,host_seen);
+    };
+    term io_http_headers(text,next+2,end,length,seen,host_seen);
+};
+
+defn io_utf8(text: String, idx: Int) -> Bool {
+    when idx >= text .^Length { term true; };
+    let byte: Int = byte_at(text,idx);
+    when byte < 128 { term io_utf8(text,idx+1); };
+    let width: Int = 0;
+    when byte >= 194 && byte <= 223 { width = 2; };
+    when byte >= 224 && byte <= 239 { width = 3; };
+    when byte >= 240 && byte <= 244 { width = 4; };
+    when width == 0 || idx+width > text .^Length { term false; };
+    foreach pos in (idx+1)..(idx+width) {
+        let continuation: Int = byte_at(text,pos);
+        when continuation < 128 || continuation > 191 { term false; };
+    };
+    let second: Int = byte_at(text,idx+1);
+    when (byte == 224 && second < 160) || (byte == 237 && second >= 160) ||
+        (byte == 240 && second < 144) || (byte == 244 && second >= 144) { term false; };
+    term io_utf8(text,idx+width);
+};
