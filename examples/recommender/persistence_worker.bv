@@ -23,6 +23,10 @@ obj PersistenceRetryDecision { allowed: Bool; exhausted: Bool; attempt: Int; del
 // Each child opens and configures its own connection. The expected identity
 // excludes model/population revision but includes DB, schema and server epoch.
 defn persistence_worker_open(config: PersistenceWorkerConfig) -> Result<PersistenceWorker,String> {
+    when !(config.addr >= 0) { trap; };
+    when !(config.addr <= 4294967295) { trap; };
+    when !(config.port >= 0) { trap; };
+    when !(config.port <= 65535) { trap; };
     when !protocol_hex(config.server_epoch,32) || config.database .^Length == 0 || config.schema .^Length == 0 {
         term Err("Persistence worker configuration requires a database, schema and current server epoch.");
     };

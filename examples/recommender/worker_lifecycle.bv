@@ -4,6 +4,8 @@
 import "./worker_messages.bv";
 import "std/posix/syscall.bv";
 
+const SYS_KILL: Int = 62;
+const SYS_PRCTL: Int = 157;
 const WORKER_MODEL_SLOTS: Int = 4;
 const WORKER_WAIT_NOHANG: Int = 1;
 const WORKER_SIGTERM: Int = 15;
@@ -102,6 +104,12 @@ defn model_reader_count(registry: ModelRegistry, generation: String) -> Int {
 // zombie or keep an IPC endpoint alive. Restart remains a caller decision and
 // is allowed only within the explicitly bounded attempt budget.
 defn worker_child_poll(child: WorkerChild, now_ms: Int) -> WorkerExit {
+    when !(SYS_CLOSE >= 0) { trap; };
+    when !(SYS_CLOSE < 512) { trap; };
+    when !(SYS_KILL >= 0) { trap; };
+    when !(SYS_KILL < 512) { trap; };
+    when !(SYS_WAIT4 >= 0) { trap; };
+    when !(SYS_WAIT4 < 512) { trap; };
     when child.pid <= 0 || child.channel_fd < 0 || child.attempt < 1 || child.restart_limit < 0 || child.attempt > child.restart_limit+1 {
         term WorkerExit { child: child, status: -1, signal: 0, signaled: false, reaped: false, restart: false, timed_out: false };
     };
@@ -135,6 +143,10 @@ defn worker_child_poll(child: WorkerChild, now_ms: Int) -> WorkerExit {
 };
 
 defn worker_child_reap_error(child: WorkerChild, status_ptr: Int) -> WorkerExit {
+    when !(SYS_CLOSE >= 0) { trap; };
+    when !(SYS_CLOSE < 512) { trap; };
+    when !(SYS_KILL >= 0) { trap; };
+    when !(SYS_KILL < 512) { trap; };
     syscall(SYS_KILL,child.pid,WORKER_SIGKILL);
     let reaped: Int = worker_wait_reap(child.pid,status_ptr);
     let raw_status: Int = Load#(status_ptr,4);
@@ -158,6 +170,10 @@ defn worker_pool_limits(persistence_workers: Int, prediction_workers: Int) -> Re
 // Linux does not inherit PDEATHSIG across fork, and the parent can die between
 // prctl and this check, so both operations are required.
 defn worker_child_parent_guard(parent_pid: Int) -> Bool {
+    when !(SYS_GETPPID >= 0) { trap; };
+    when !(SYS_GETPPID < 512) { trap; };
+    when !(SYS_PRCTL >= 0) { trap; };
+    when !(SYS_PRCTL < 512) { trap; };
     when parent_pid <= 1 { term false; };
     let configured: Int = syscall(SYS_PRCTL,WORKER_PR_SET_PDEATHSIG,WORKER_SIGTERM);
     term configured == 0 && syscall(SYS_GETPPID) == parent_pid;
@@ -167,6 +183,8 @@ defn worker_child_parent_guard(parent_pid: Int) -> Bool {
 // resources. The child's IPC endpoint is omitted by the launcher; never call a
 // protocol-aware close (for example pg_close) on a fork-shared DB descriptor.
 defn worker_child_close_inherited(fds: List<Int>) -> Bool {
+    when !(SYS_CLOSE >= 0) { trap; };
+    when !(SYS_CLOSE < 512) { trap; };
     foreach idx in 0..fds .^Length {
         when fds[idx] >= 0 && syscall(SYS_CLOSE,fds[idx]) < 0 { term false; };
     };
@@ -174,6 +192,8 @@ defn worker_child_close_inherited(fds: List<Int>) -> Bool {
 };
 
 defn worker_wait_reap(pid: Int, status_ptr: Int) -> Int {
+    when !(SYS_WAIT4 >= 0) { trap; };
+    when !(SYS_WAIT4 < 512) { trap; };
     Store#(status_ptr,0,8);
     let result: Int = syscall(SYS_WAIT4,pid,status_ptr,0,0);
     when result == -4 { term worker_wait_reap(pid,status_ptr); };

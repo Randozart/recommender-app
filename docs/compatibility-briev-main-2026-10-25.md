@@ -1,6 +1,9 @@
 # Briev `main` compatibility — 2026-10-25
 
-This branch aligns the recommender with the current compiler/stdlib naming:
+This branch aligns the recommender with the current compiler/stdlib naming and
+makes the native service compile against current `main`.
+
+## Renames
 
 - `Matrix` → `FloatMatrix`
 - `Vector` → `FloatVector`
@@ -9,25 +12,43 @@ This branch aligns the recommender with the current compiler/stdlib naming:
 ## Status
 
 - Browser `app.rbv`: builds and loads with current `brievc` (zero page errors).
-- Server `server.bv`: not yet clean. After the rename it reports 119
-  type/contract errors:
-  - 1 type mismatch
-  - 118 contract failures in reactor row access, vector/ivec indexing,
-    CSR/matrix capacities, PostgreSQL row access, system-call constants,
-    buffer slices, and rating-population accessors.
+- Server `server.bv`: `brievc check` passes and `brievc build` links the native
+  executable.
+- Runtime gates that need PostgreSQL, MovieLens 100K, or Playwright have not
+  been run on this branch.
 
-The remaining failures are app-side proof/bounds gaps, not missing stdlib
-modules. They must be fixed with explicit guards or explicit dynamic
-boundaries; do not weaken stdlib contracts.
+## Compatibility changes
 
-## Next
+The service now states every callee precondition it relies on as an explicit
+`when !(...) { trap; };` guard. The guard families cover:
 
-Add guards by family, then run:
+- reactor row access and socket file descriptors
+- vector/ivec indexing and CSR/matrix capacities
+- PostgreSQL result rows/columns
+- system-call constants and buffer slices
+- rating-population begin/end and mean accessors
+- profile/imputation indexes
+
+Two compiler fixes were required and are carried by the companion Briev
+change:
+
+1. Destructuring `let` no longer falls back to `Int` when tuple inference
+   fails; the inference error is propagated (the fallback hid the real mismatch).
+2. `Type { field: value }.field` is reduced to `value` by the proof engine, so
+   struct-literal arguments (`Socket { fd: fd }`, `ByteBuf { ... }`) discharge
+   bounds already guarded by the caller.
+
+`std/posix/syscall.bv` on current `main` does not export `SYS_KILL`,
+`SYS_PRCTL`, or `SYS_SOCKETPAIR`; the worker modules define those three
+constants locally. Migrate them to the stdlib import once it exports them.
+
+## Reproduction
 
 ```sh
-brievc check server.bv
-brievc build server.bv
+BRIEV_STDLIB=/path/to/briev/lib/std brievc check examples/recommender/server.bv \
+  --stdlib-path /path/to/briev/lib
+BRIEV_STDLIB=/path/to/briev/lib/std brievc build examples/recommender/server.bv \
+  --stdlib-path /path/to/briev/lib --out target/recommender-demo
+BRIEV_STDLIB=/path/to/briev/lib/std brievc build examples/recommender/app.rbv \
+  --stdlib-path /path/to/briev/lib --split --out target/recommender-web
 ```
-
-until the server checks and links, followed by the existing PostgreSQL /
-MovieLens / WebSocket gates.

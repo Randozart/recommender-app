@@ -20,6 +20,8 @@ import "./account_state.bv";
 import { buf_slice_string } from "std/net/http.bv";
 import "std/string_c.bv";
 
+const SYS_SOCKETPAIR: Int = 53;
+const SYS_KILL: Int = 62;
 const WORKER_SOCKET_STREAM: Int = 1;
 const WORKER_SIGCHLD: Int = 17;
 const WORKER_FRAME_MAGIC_VALUE: Int = 1112692273;
@@ -36,6 +38,8 @@ obj WorkerChildStep { state: WorkerModelState; response: WorkerMessage; };
 // socket. The caller transfers the complete list of parent-owned descriptors
 // to close in the child; the new child IPC endpoint must not be in that list.
 defn worker_spawn(role: String, epoch: String, inherited_fds: List<Int>, attempt: Int, restart_limit: Int, deadline_ms: Int) -> Result<WorkerChannel,String> {
+    when !(SYS_SOCKETPAIR >= 0) { trap; };
+    when !(SYS_SOCKETPAIR < 512) { trap; };
     when (role != "prediction" && role != "persistence") || !protocol_hex(epoch,32) ||
         attempt < 1 || restart_limit < 0 || attempt > restart_limit+1 || deadline_ms < 0 {
         term Err("Worker role, epoch, launch attempt, retry limit or deadline is invalid.");
@@ -45,7 +49,17 @@ defn worker_spawn(role: String, epoch: String, inherited_fds: List<Int>, attempt
     when syscall(SYS_SOCKETPAIR,1,WORKER_SOCKET_STREAM,0,pair) < 0 { Free#(pair as Ptr); term Err("Cannot create the worker IPC socketpair."); };
     let parent_fd: Int = Load#(pair,4);
     let child_fd: Int = Load#(pair+4,4);
+    when !(SYS_CLOSE >= 0) { trap; };
+    when !(SYS_CLOSE < 512) { trap; };
+    when !(SYS_GETPID >= 0) { trap; };
+    when !(SYS_GETPID < 512) { trap; };
     let parent_pid: Int = syscall(SYS_GETPID);
+    when !(SYS_KILL >= 0) { trap; };
+    when !(SYS_KILL < 512) { trap; };
+    when !(WORKER_CHILD_EXIT >= 0) { trap; };
+    when !(WORKER_CHILD_EXIT < 512) { trap; };
+    when !(SYS_CLONE >= 0) { trap; };
+    when !(SYS_CLONE < 512) { trap; };
     let pid: Int = syscall(SYS_CLONE,WORKER_SIGCHLD,0);
     when pid == 0 {
         syscall(SYS_CLOSE,parent_fd);
@@ -118,6 +132,8 @@ defn worker_supervisor_restart(pending: WorkerRestart, inherited_fds: List<Int>,
 };
 
 defn worker_child_read_full(fd: Int, address: Int, bytes: Int, offset: Int) -> Int {
+    when !(SYS_READ >= 0) { trap; };
+    when !(SYS_READ < 512) { trap; };
     when offset >= bytes { term offset; };
     let count: Int = syscall(SYS_READ,fd,address+offset,bytes-offset);
     when count == -4 { term worker_child_read_full(fd,address,bytes,offset); };
@@ -126,6 +142,8 @@ defn worker_child_read_full(fd: Int, address: Int, bytes: Int, offset: Int) -> I
 };
 
 defn worker_child_write_full(fd: Int, address: Int, bytes: Int, offset: Int) -> Int {
+    when !(SYS_SEND >= 0) { trap; };
+    when !(SYS_SEND < 512) { trap; };
     when offset >= bytes { term offset; };
     let count: Int = syscall(SYS_SEND,fd,address+offset,bytes-offset,16384);
     when count == -4 { term worker_child_write_full(fd,address,bytes,offset); };
@@ -172,15 +190,30 @@ defn worker_model_empty() -> Result<WorkerModelState,String> {
     let population: RatingPopulation = RatingPopulation { user_off: ivec_new(2), user_item: ivec_new(1),
         user_val: vec_new(1), item_off: ivec_new(2), item_user: ivec_new(1), item_val: vec_new(1),
         nusers: 1, nitems: 1, nnz: 0 };
+when !((0 >= 0)) { trap; };
+when !((0 < population.item_off.len)) { trap; };
+when !((1 < population.item_off.len)) { trap; };
+
+    when !((1 >= 0)) { trap; };
+    when !((1 < population.user_off.len)) { trap; };
+    when !((0 < population.user_off.len)) { trap; };
     ivec_set(population.user_off,0,0); ivec_set(population.user_off,1,0);
     ivec_set(population.item_off,0,0); ivec_set(population.item_off,1,0);
     let means: Means = Means { user_mean: vec_new(1), item_mean: vec_new(1),
         user_has: ivec_new(1), item_has: ivec_new(1), global: 0.0 };
+    when !(0 < means.user_mean.len) { trap; };
+    when !(0 < means.item_mean.len) { trap; };
+    when !(0 < means.user_has.len) { trap; };
+    when !(0 < means.item_has.len) { trap; };
     vec_set(means.user_mean,0,0.0); vec_set(means.item_mean,0,0.0);
     ivec_set(means.user_has,0,0); ivec_set(means.item_has,0,0);
     let cache: SimCache = SimCache { user_sim: mat_new(1,1), item_sim: mat_new(1,1),
         user_mean: means.user_mean, item_mean: means.item_mean, nusers: 1, nitems: 1,
         sig: PopSignature { nnz: 0, mtime: 0 } };
+    when !(0 < cache.user_sim.rows) { trap; };
+    when !(0 < cache.user_sim.cols) { trap; };
+    when !(0 < cache.item_sim.rows) { trap; };
+    when !(0 < cache.item_sim.cols) { trap; };
     mat_set(cache.user_sim,0,0,0.0); mat_set(cache.item_sim,0,0,0.0);
     let accounts: List<Int> = [];
     let model: ServerModel = ServerModel { population: population, means: means, cache: cache,
@@ -194,6 +227,8 @@ defn worker_model_empty() -> Result<WorkerModelState,String> {
 };
 
 defn worker_child_send_started(fd: Int, role: String, epoch: String) -> Bool {
+    when !(SYS_NANOSLEEP >= 0) { trap; };
+    when !(SYS_NANOSLEEP < 512) { trap; };
     let profile: ProfileVersion = ProfileVersion { server_epoch: epoch, account_id: 0, revision: "0" };
     let tag: WorkerTag = WorkerTag { profile: profile, job_id: "1", attempt: 1, model_generation: "0" };
     let fields: List<(String,JsonValue)> = [("role",StrVal(role))];
@@ -219,6 +254,8 @@ defn worker_child_loop(fd: Int, frame: Int, role: String, state: WorkerModelStat
     when header != 8 { term 2; };
     let magic: Int = (Load#(frame,1)<<24)|(Load#(frame+1,1)<<16)|(Load#(frame+2,1)<<8)|Load#(frame+3,1);
     let size: Int = (Load#(frame+4,1)<<24)|(Load#(frame+5,1)<<16)|(Load#(frame+6,1)<<8)|Load#(frame+7,1);
+    when !((8 >= 0)) { trap; };
+    when !((size >= 0)) { trap; };
     when magic != WORKER_FRAME_MAGIC_VALUE || size < 1 || size > PROTOCOL_JSON_LIMIT { term 3; };
     when worker_child_read_full(fd,frame+8,size,0) != size { term 4; };
     let text: String = buf_slice_string(ByteBuf { ptr: frame, len: size+8, cap: WORKER_MAX_FRAME },8,size);
@@ -334,6 +371,10 @@ defn worker_child_send_message(fd: Int, message: WorkerMessage) -> Int {
 // malicious path therefore cannot make read_file grow beyond the 512 MiB
 // descriptor bound before the size/checksum validation runs.
 defn worker_read_snapshot(path: String, expected_bytes: Int) -> Result<String,String> {
+    when !(SYS_CLOSE >= 0) { trap; };
+    when !(SYS_CLOSE < 512) { trap; };
+    when !(SYS_OPEN >= 0) { trap; };
+    when !(SYS_OPEN < 512) { trap; };
     when expected_bytes < 80 || expected_bytes > 536870912 { term Err("Model size is outside the 80-byte..512-MiB bound."); };
     let cpath: Int = to_c_string(path);
     let fd: Int = syscall(SYS_OPEN,cpath,0,0);
@@ -352,6 +393,8 @@ defn worker_read_snapshot(path: String, expected_bytes: Int) -> Result<String,St
 };
 
 defn worker_snapshot_read_loop(fd: Int, address: Int, limit: Int, offset: Int) -> Int {
+    when !(SYS_READ >= 0) { trap; };
+    when !(SYS_READ < 512) { trap; };
     when offset >= limit { term offset; };
     let count: Int = syscall(SYS_READ,fd,address+offset,limit-offset);
     when count == -4 { term worker_snapshot_read_loop(fd,address,limit,offset); };
@@ -361,6 +404,8 @@ defn worker_snapshot_read_loop(fd: Int, address: Int, limit: Int, offset: Int) -
 };
 
 defn worker_wait_reap_no_status(pid: Int) -> Int {
+    when !(SYS_WAIT4 >= 0) { trap; };
+    when !(SYS_WAIT4 < 512) { trap; };
     let result: Int = syscall(SYS_WAIT4,pid,0,0,0);
     when result == -4 { term worker_wait_reap_no_status(pid); };
     term result;

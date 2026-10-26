@@ -20,6 +20,9 @@ defn server_fatal(message: String) -> Bool {
 };
 
 defn server_boot() -> ServerState {
+    when !(LOOPBACK >= 0) { trap; };
+    when !(LOOPBACK <= 4294967295) { trap; };
+    when !(5432 <= 65535) { trap; };
     let port: Int = server_env_number("PORT",8080);
     let capacity: Int = server_env_number("MAX_CONNECTIONS",1024);
     let lambda_milli: Int = server_env_number("LAMBDA_MILLI",500);

@@ -22,6 +22,7 @@ obj PredictionScratch {
 };
 
 defn prediction_scratch_new(model: ServerModel, byte_limit: Int) -> Result<PredictionScratch,String> {
+    when !(model.population.nnz >= 0) { trap; };
     let users: Int = model.population.nusers;
     let items: Int = model.population.nitems;
     when users < 1 || users > 65535 || items < 1 || items > 65535 || byte_limit < 1 || byte_limit > 536870912 {
@@ -61,6 +62,16 @@ defn prediction_scratch_new(model: ServerModel, byte_limit: Int) -> Result<Predi
 defn prediction_base_fill(model: ServerModel, base: FloatMatrix) -> Bool {
     foreach row in 0..model.population.nusers {
         foreach neighbor in 0..(row+1) {
+            when !(neighbor >= 0) { trap; };
+            when !(neighbor < base.rows) { trap; };
+            when !((row >= 0)) { trap; };
+            when !((row < base.cols)) { trap; };
+            when !((row < base.rows)) { trap; };
+            when !((neighbor >= 0)) { trap; };
+            when !((neighbor < base.cols)) { trap; };
+            when !((row < model.population.nusers)) { trap; };
+            when !((neighbor < model.population.nusers)) { trap; };
+
             let score: Float = base_sim_user(model.population,model.means,row,neighbor);
             mat_set(base,row,neighbor,score); mat_set(base,neighbor,row,score);
         };
