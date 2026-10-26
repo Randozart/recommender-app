@@ -217,8 +217,6 @@ defn active_user_prediction(active: ActivePrediction, item: Int)
         when !(user < active.similarities.len) { trap; };
         when user != active.excluded {
             when !(count < users.len) { trap; };
-            when !(count < sims.len) { trap; };
-            when !(count < devs.len) { trap; };
             ivec_set(users,count,user);
             vec_set(sims,count,vec_get(active.similarities,user));
             when !(idx < pop.item_val.len) { trap; };
@@ -227,10 +225,6 @@ defn active_user_prediction(active: ActivePrediction, item: Int)
             count = count + 1;
         };
     };
-    when !(count >= 0) { trap; };
-    when !(count <= users.len) { trap; };
-    when !(count <= sims.len) { trap; };
-    when !(count <= devs.len) { trap; };
     let (sum,eta): (Float,Float) = knn_aggregate(users,sims,devs,count,NEIGHBOR_K);
     ivec_free(users); vec_free(sims); vec_free(devs);
     when eta == 0.0 { term active.mean; };
