@@ -40,6 +40,8 @@ brievc build examples/recommender/app.rbv \
   gates. The runner documentation describes the required PostgreSQL setup.
 - `docs/architecture/applications/` records the account, frontend, persistence,
   reactor, responsiveness, and server contracts.
+- `docs/architecture/applications/recommender-system-map.md` gives component,
+  runtime ownership, rating-flow, and startup/refresh diagrams.
 - `docs/session/2026-10-25-bug-report.md` records the bugs found and fixed in
   the recommender recovery session, with causes and reproduction steps.
 
