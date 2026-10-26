@@ -125,9 +125,9 @@ defn baseline_line(conn: PgConn, line: String, state: BaselineProgress) -> Basel
 };
 
 defn baseline_flush(conn: PgConn, state: BaselineProgress) -> BaselineProgress {
+    when state.result.ok == false || state.pending .^Length == 0 { term state; };
     when !((state.pending.^Length > 0)) { trap; };
     when !((state.pending.^Length <= 64)) { trap; };
-    when state.result.ok == false || state.pending .^Length == 0 { term state; };
 
     let sql: String = baseline_insert_sql(state.pending .^Length);
     let empty_params: List<String> = [];

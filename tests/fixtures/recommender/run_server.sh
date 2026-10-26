@@ -6,6 +6,7 @@ BV=${BRIEVC:-./target/debug/brievc}
 : "${PGUSER:?Set PGUSER to the dedicated test role}"
 : "${PGDATABASE:?Set PGDATABASE to the dedicated test database}"
 export PGUSER PGDATABASE
+export PGSCHEMA=briev_server_loop_gate
 out=$(mktemp -d /tmp/briev-server-gates.XXXXXX)
 trap 'rm -f "$out"/*; rmdir "$out"' EXIT
 "$BV" build tests/fixtures/recommender/movie_catalogue_gate.bv --out "$out"

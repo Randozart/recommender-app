@@ -117,7 +117,6 @@ defn api_recommendations(model: ServerModel, state: AccountState, lambda: Float)
     let text: String = "";
     foreach rank in 0..TOP_N {
         let best: Int = api_best_item(scores,picked);
-        when !((best >= 0)) { trap; };
         when !((best < scores.len)) { trap; };
         when best >= 0 {
             when !(best < picked.len) { trap; };

@@ -34,9 +34,9 @@ defn reactor_clear_words(address: Int, count: Int) [count >= 0][true] -> Bool {
 };
 
 defn reactor_init_slots(reactor: Reactor, slot: Int) -> Bool {
+    when slot >= reactor.capacity { term true; };
     when !(slot >= 0) { trap; };
     when !(slot < reactor.capacity) { trap; };
-    when slot >= reactor.capacity { term true; };
     let row: Int = reactor_row(reactor, slot);
     reactor_clear_words(row, 16);
     Store#(row, -1, 8);
@@ -101,9 +101,9 @@ defn reactor_remove(reactor: Reactor, slot: Int)
 };
 
 defn reactor_close_slots(reactor: Reactor, slot: Int) -> Bool {
+    when slot >= reactor.capacity { term true; };
     when !(slot >= 0) { trap; };
     when !(slot < reactor.capacity) { trap; };
-    when slot >= reactor.capacity { term true; };
     reactor_remove(reactor, slot);
     reactor_close_slots(reactor, slot + 1);
     term true;
