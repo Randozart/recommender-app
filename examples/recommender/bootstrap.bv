@@ -36,7 +36,6 @@ defn baseline_load_result(result: PgResult, loaded: Bool, accepted: Int, discard
 // Requires an idle dedicated connection and the schema from store.bv.
 defn baseline_bootstrap(conn: PgConn, path: String) -> BaselineLoad {
     let marker: PgResult = store_baseline_begin(conn);
-    when !((0 >= 0)) { trap; };
     when !((0 < marker.nrows)) { trap; };
     when !((0 < marker.ncols)) { trap; };
     when marker.ok == false { term baseline_load_result(marker, false, 0, 0); };

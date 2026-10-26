@@ -26,10 +26,6 @@ obj WorkerChannel {
 obj WorkerReceived { channel: WorkerChannel; frame: WorkerFrame; };
 
 defn worker_channel_open(fd: Int, pid: Int, role: String, epoch: String) -> Result<WorkerChannel,String> {
-    when !(SYS_FCNTL >= 0) { trap; };
-    when !(SYS_FCNTL < 512) { trap; };
-    when !(SYS_CLOSE >= 0) { trap; };
-    when !(SYS_CLOSE < 512) { trap; };
     when fd < 0 || pid <= 0 || (role != "prediction" && role != "persistence") || !protocol_hex(epoch,32) { term Err("Worker channel requires an open endpoint, valid role, epoch and child process ID."); };
     let tx: GrowBuf = grow_new(1);
     let rx: GrowBuf = grow_new(65544);
@@ -50,8 +46,6 @@ defn worker_channel_open(fd: Int, pid: Int, role: String, epoch: String) -> Resu
 };
 
 defn worker_channel_close(channel: WorkerChannel) -> WorkerChannel {
-    when !(SYS_CLOSE >= 0) { trap; };
-    when !(SYS_CLOSE < 512) { trap; };
     when channel.fd >= 0 { syscall(SYS_CLOSE,channel.fd); };
     when channel.tx.ptr != 0 { grow_free(channel.tx); };
     when channel.rx.ptr != 0 { grow_free(channel.rx); };
@@ -87,8 +81,6 @@ defn worker_channel_queue(channel: WorkerChannel, payload: String) -> Result<Wor
 // Advance nonblocking output by one syscall. EAGAIN/EINTR preserve the suffix;
 // fatal errors close the endpoint so the supervisor can restart/reconcile it.
 defn worker_channel_write(channel: WorkerChannel) -> WorkerChannel {
-    when !(SYS_SEND >= 0) { trap; };
-    when !(SYS_SEND < 512) { trap; };
     when channel.fd < 0 || channel.terminal != 0 || channel.tx_offset >= channel.tx.len { term channel; };
     let sent: Int = syscall(SYS_SEND,channel.fd,channel.tx.ptr+channel.tx_offset,channel.tx.len-channel.tx_offset,WORKER_MSG_NOSIGNAL);
     when sent == WORKER_EAGAIN || sent == WORKER_EINTR { term channel; };
@@ -105,8 +97,6 @@ defn worker_channel_write(channel: WorkerChannel) -> WorkerChannel {
 // Read at most the remaining protocol budget plus header room. Malformed or
 // oversized frames terminate the channel before a payload-sized allocation.
 defn worker_channel_read(channel: WorkerChannel) -> WorkerChannel {
-    when !(SYS_RECV >= 0) { trap; };
-    when !(SYS_RECV < 512) { trap; };
     when channel.fd < 0 || channel.terminal != 0 || channel.rx.ptr == 0 || channel.rx.cap != 65544 { term worker_channel_close(channel); };
     when channel.rx.len >= 65544 { term channel; };
     let room: Int = 65544-channel.rx.len;

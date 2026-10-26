@@ -73,8 +73,6 @@ defn server_with_workers(state: ServerState, workers: ServerWorkers) -> ServerSt
 };
 
 defn server_worker_yield() -> Void {
-    when !(SYS_NANOSLEEP >= 0) { trap; };
-    when !(SYS_NANOSLEEP < 512) { trap; };
     let delay: Int = Malloc#(16) as Int;
     when delay != 0 {
         Store#(delay,0,8); Store#(delay+8,1000000,8);

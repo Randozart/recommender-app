@@ -14,17 +14,7 @@ defn account_state_failure(error: String, detail: PgResult) -> AccountState {
 defn account_state_ratings(rows: PgResult, identity: AccountResult, idx: Int, ratings: List<AccountRating>) -> AccountState {
     when idx >= rows.nrows { term AccountState { result: identity, ratings: ratings }; };
     when !(((idx >= 0) && (idx < rows.nrows))) { trap; };
-    when !((5 >= 0)) { trap; };
     when !((5 < rows.ncols)) { trap; };
-    when !((idx >= 0)) { trap; };
-    when !((idx < rows.nrows)) { trap; };
-    when !((4 >= 0)) { trap; };
-    when !((4 < rows.ncols)) { trap; };
-    when !((3 >= 0)) { trap; };
-    when !((3 < rows.ncols)) { trap; };
-    when !(idx >= 0) { trap; };
-    when !(idx < rows.nrows) { trap; };
-    when !(2 < rows.ncols) { trap; };
 
     let owner: Int = pg_row_int(rows,idx,2);
     let item: Int = pg_row_int(rows,idx,3);

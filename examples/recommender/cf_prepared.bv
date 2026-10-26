@@ -16,7 +16,6 @@ defn prepared_base(rows: PreparedRows) -> FloatMatrix {
     when !(rows.count >= 1) { trap; };
     let base: FloatMatrix = mat_new(rows.count,rows.count);
     foreach a in 0..rows.count {
-        when !((a >= 0)) { trap; };
         when !((a < rows.off.len)) { trap; };
         foreach b in 0..(a+1) {
             when !((b >= 0)) { trap; };
@@ -31,10 +30,7 @@ defn prepared_base(rows: PreparedRows) -> FloatMatrix {
                 rows.key,rows.value,rows.key,rows.value,vec_get(rows.mean,a),vec_get(rows.mean,b),
                 ivec_get(rows.off,a),ivec_get(rows.off,a+1),ivec_get(rows.off,b),ivec_get(rows.off,b+1),0.0,0.0,0.0);
             let value: Float = pcc_finish(num,da,db);
-            when !(a < base.rows) { trap; };
             when !(b < base.rows) { trap; };
-            when !(a < base.cols) { trap; };
-            when !(b < base.cols) { trap; };
             mat_set(base,a,b,value); mat_set(base,b,a,value);
         };
     };
@@ -46,13 +42,9 @@ defn prepared_cell(space: PreparedSpace, row: Int, col: Int) -> Float {
     when !((col < space.columns.off.len)) { trap; };
     when !((row >= 0)) { trap; };
     when !((row < space.rows.off.len)) { trap; };
-    when !((col + 1) >= 0) { trap; };
 
-    when !(col >= 0) { trap; };
 
-    when !((row + 1) >= 0) { trap; };
 
-    when !(row >= 0) { trap; };
 
     when !(ivec_get(space.rows.off, row) >= 0) { trap; };
 
@@ -89,15 +81,12 @@ defn prepared_cell(space: PreparedSpace, row: Int, col: Int) -> Float {
 defn prepared_space(rows: PreparedRows, columns: PreparedRows) -> PreparedSpace {
     when !((rows.count >= 1)) { trap; };
     when !((rows.width >= 1)) { trap; };
-    when !(rows.count >= 1) { trap; };
 
     let space: PreparedSpace = PreparedSpace { rows: rows, columns: columns,
         base: prepared_base(rows), filled: mat_new(rows.count,rows.width) };
     foreach row in 0..rows.count {
-        when !((row >= 0)) { trap; };
         when !((row < space.filled.rows)) { trap; };
         foreach col in 0..rows.width {
-            when !(col >= 0) { trap; };
             when !(col < space.filled.cols) { trap; };
             mat_set(space.filled,row,col,prepared_cell(space,row,col)); };
     };
@@ -110,16 +99,11 @@ defn prepared_pair(space: PreparedSpace, a: Int, b: Int) -> Float {
     when !(((a + 1) >= 0)) { trap; };
     when !(((a + 1) < space.rows.off.len)) { trap; };
     when !((a >= 0)) { trap; };
-    when !((a < space.rows.off.len)) { trap; };
     when !(b >= 0) { trap; };
 
-    when !(a >= 0) { trap; };
 
-    when !((b + 1) >= 0) { trap; };
 
-    when !((a + 1) >= 0) { trap; };
 
-    when !(b < space.rows.off.len) { trap; };
 
     let ia: Int = ivec_get(space.rows.off,a);
     let ib: Int = ivec_get(space.rows.off,b);
@@ -160,10 +144,6 @@ defn prepared_matrix(rows: PreparedRows, columns: PreparedRows) -> FloatMatrix {
         foreach b in 0..(a+1) {
             when !((b >= 0)) { trap; };
             when !((b < matrix.rows)) { trap; };
-            when !((a >= 0)) { trap; };
-            when !((a < matrix.cols)) { trap; };
-            when !((a < matrix.rows)) { trap; };
-            when !((b < matrix.cols)) { trap; };
             let sim: Float = prepared_pair(space,a,b);
 
             mat_set(matrix,a,b,sim); mat_set(matrix,b,a,sim);

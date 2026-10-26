@@ -90,7 +90,6 @@ defn live_fragment(state: ServerState, slot: Int, frame: WsFrame, message: WsMes
     };
     when frame.opcode == 1 && frame.fin { term live_text(state,slot,message.payload); };
     let length: Int = Load#(row+96,8);
-    when !((0 >= 0)) { trap; };
     when !(((length + message.payload.^Length) >= 0)) { trap; };
     when message.payload .^Length > SERVER_INPUT_LIMIT - length { io_ws_close(state.reactor,slot,1009); term state; };
     let memory: Int = Load#(row+88,8);
