@@ -9,11 +9,11 @@ import "std/matrix.bv";
 // 2026-10-21: memoize the two stages of the existing equations, never widen
 // the final pair's observed union. Row/column orientation is data, not separate
 // algorithms. Retire only when general memoization derives the same reuse.
-obj PreparedRows { off: IntVec; key: IntVec; value: Vector; mean: Vector; count: Int; width: Int; };
-obj PreparedSpace { rows: PreparedRows; columns: PreparedRows; base: Matrix; filled: Matrix; };
+obj PreparedRows { off: IntVec; key: IntVec; value: FloatVector; mean: FloatVector; count: Int; width: Int; };
+obj PreparedSpace { rows: PreparedRows; columns: PreparedRows; base: FloatMatrix; filled: FloatMatrix; };
 
-defn prepared_base(rows: PreparedRows) -> Matrix {
-    let base: Matrix = mat_new(rows.count,rows.count);
+defn prepared_base(rows: PreparedRows) -> FloatMatrix {
+    let base: FloatMatrix = mat_new(rows.count,rows.count);
     foreach a in 0..rows.count {
         foreach b in 0..(a+1) {
             let (num,da,db): (Float,Float,Float) = overlap_acc(
@@ -75,9 +75,9 @@ defn prepared_pair(space: PreparedSpace, a: Int, b: Int) -> Float {
     term pcc_finish(num,da,db);
 };
 
-defn prepared_matrix(rows: PreparedRows, columns: PreparedRows) -> Matrix {
+defn prepared_matrix(rows: PreparedRows, columns: PreparedRows) -> FloatMatrix {
     let space: PreparedSpace = prepared_space(rows,columns);
-    let matrix: Matrix = mat_new(rows.count,rows.count);
+    let matrix: FloatMatrix = mat_new(rows.count,rows.count);
     foreach a in 0..rows.count {
         foreach b in 0..(a+1) {
             let sim: Float = prepared_pair(space,a,b);

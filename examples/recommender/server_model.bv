@@ -35,7 +35,7 @@ defn model_ids(conn: PgConn, ids: List<Int>) -> Result<List<Int>, PgResult> {
     term model_ids(conn, added);
 };
 
-defn model_read_rows(conn: PgConn, users: IntVec, items: IntVec, values: Vector, offset: Int, total: Int) -> PgResult {
+defn model_read_rows(conn: PgConn, users: IntVec, items: IntVec, values: FloatVector, offset: Int, total: Int) -> PgResult {
     when offset >= total { term pg_result_empty(); };
     let rows: PgResult = pg_simple_query(conn, "FETCH 64 FROM population_rows");
     when !rows.ok { term rows; };
@@ -93,7 +93,7 @@ defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: Strin
     when !cursor.ok { term Err(store_abort(conn,cursor)); };
     let users: IntVec = ivec_new(total + 1);
     let items: IntVec = ivec_new(total + 1);
-    let values: Vector = vec_new(total + 1);
+    let values: FloatVector = vec_new(total + 1);
     let read: PgResult = model_read_rows(conn,users,items,values,0,total);
     when !read.ok {
         ivec_free(users); ivec_free(items); vec_free(values);
@@ -114,10 +114,10 @@ defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: Strin
 };
 
 obj ActivePrediction {
-    state: AccountState; model: ServerModel; similarities: Vector; mean: Float; excluded: Int;
+    state: AccountState; model: ServerModel; similarities: FloatVector; mean: Float; excluded: Int;
 };
 
-defn active_copy_row(pop: RatingPopulation, user: Int, users: IntVec, items: IntVec, values: Vector, offset: Int) -> Int {
+defn active_copy_row(pop: RatingPopulation, user: Int, users: IntVec, items: IntVec, values: FloatVector, offset: Int) -> Int {
     let count: Int = offset;
     foreach idx in pop_user_begin(pop,user)..pop_user_end(pop,user) {
         ivec_set(users,count,user);
@@ -137,7 +137,7 @@ defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
     let capacity: Int = pop.nnz + state.ratings .^Length + 1;
     let users: IntVec = ivec_new(capacity);
     let items: IntVec = ivec_new(capacity);
-    let values: Vector = vec_new(capacity);
+    let values: FloatVector = vec_new(capacity);
     let count: Int = 0;
     foreach user_idx in 0..pop.nusers {
         when user_idx != excluded {
@@ -153,7 +153,7 @@ defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
     let overlay: RatingPopulation = pop_build(users,items,values,count,pop.nusers + 1,pop.nitems);
     ivec_free(users); ivec_free(items); vec_free(values);
     let means: Means = means_build(overlay);
-    let similarities: Vector = vec_new(pop.nusers);
+    let similarities: FloatVector = vec_new(pop.nusers);
     foreach idx in 0..pop.nusers { vec_set(similarities,idx,sim_user(overlay,means,pop.nusers,idx)); };
     let mean: Float = means_user(means,pop.nusers);
     means_free(means); pop_free(overlay);
@@ -165,8 +165,8 @@ defn active_user_prediction(active: ActivePrediction, item: Int) -> Float {
     let begin: Int = pop_item_begin(pop,item);
     let end: Int = pop_item_end(pop,item);
     let users: IntVec = ivec_new(end - begin + 1);
-    let sims: Vector = vec_new(end - begin + 1);
-    let devs: Vector = vec_new(end - begin + 1);
+    let sims: FloatVector = vec_new(end - begin + 1);
+    let devs: FloatVector = vec_new(end - begin + 1);
     let count: Int = 0;
     foreach idx in begin..end {
         let user: Int = ivec_get(pop.item_user,idx);
@@ -186,8 +186,8 @@ defn active_user_prediction(active: ActivePrediction, item: Int) -> Float {
 defn active_item_prediction(active: ActivePrediction, item: Int) -> Float {
     let count: Int = active.state.ratings .^Length;
     let items: IntVec = ivec_new(count + 1);
-    let sims: Vector = vec_new(count + 1);
-    let devs: Vector = vec_new(count + 1);
+    let sims: FloatVector = vec_new(count + 1);
+    let devs: FloatVector = vec_new(count + 1);
     foreach idx in 0..count {
         let rating: AccountRating = active.state.ratings[idx];
         ivec_set(items,idx,rating.item_id);

@@ -1,6 +1,6 @@
 // cf_engine - the AutAI-Fusion collaborative-filtering engine (recommender-app
 // APP code, NOT stdlib). Built on the general stdlib primitives (matrix.bv's
-// Vector/IntVec and rating_population.bv's dual-orientation CSR); the paper's
+// FloatVector/IntVec and rating_population.bv's dual-orientation CSR); the paper's
 // equations themselves are application knowledge and live here.
 //
 // 2026-10-20 (recommender-app Task 6, part 1): means + global-mean fallback.
@@ -36,8 +36,8 @@ import { Ok, Err, is_ok, is_err, unwrap, unwrap_err } from "std/result.bv";
 // each (has_mean == true iff that user/item had >= 1 observed rating). The
 // global mean is the fallback a prediction uses when a row/column is empty.
 obj Means {
-    user_mean: Vector;     // len nusers
-    item_mean: Vector;     // len nitems
+    user_mean: FloatVector;     // len nusers
+    item_mean: FloatVector;     // len nitems
     user_has:  IntVec;     // len nusers; 1 if the user had >= 1 rating, else 0
     item_has:  IntVec;     // len nitems; 1 if the item had >= 1 rating, else 0
     global:    Float;      // average of ALL observed ratings (empty-row fallback)
@@ -51,10 +51,10 @@ defn means_build(pop: RatingPopulation)
     -> Means
 {
     let global: Float = means_global(pop);
-    let umean: Vector = vec_new(pop.nusers);
+    let umean: FloatVector = vec_new(pop.nusers);
     let uhas:  IntVec = ivec_new(pop.nusers);
     means_fill_users(pop, umean, uhas, global, 0);
-    let imean: Vector = vec_new(pop.nitems);
+    let imean: FloatVector = vec_new(pop.nitems);
     let ihas:  IntVec = ivec_new(pop.nitems);
     means_fill_items(pop, imean, ihas, global, 0);
     term Means {
@@ -73,7 +73,7 @@ defn means_global(pop: RatingPopulation) [pop.nnz >= 0][true] -> Float {
 };
 
 // means_sum_all - sum the first nnz values of a CSR value vector. Tail recursion.
-defn means_sum_all(val: Vector, nnz: Int, k: Int, acc: Float)
+defn means_sum_all(val: FloatVector, nnz: Int, k: Int, acc: Float)
     [nnz >= 0 && k >= 0][true]
     -> Float
 {
@@ -86,7 +86,7 @@ defn means_sum_all(val: Vector, nnz: Int, k: Int, acc: Float)
 // means_fill_users - for each user u, write its true mean and presence flag.
 // The user's ratings are user_val[begin..end); the count end-begin is the
 // observed-rating count. Empty user (begin == end) => mean := global, has := 0.
-defn means_fill_users(pop: RatingPopulation, umean: Vector, uhas: IntVec, global: Float, u: Int)
+defn means_fill_users(pop: RatingPopulation, umean: FloatVector, uhas: IntVec, global: Float, u: Int)
     [u >= 0][true]
     -> Int
 {
@@ -100,7 +100,7 @@ defn means_fill_users(pop: RatingPopulation, umean: Vector, uhas: IntVec, global
 };
 
 // means_fill_items - the per-item mirror over item_val / item offsets.
-defn means_fill_items(pop: RatingPopulation, imean: Vector, ihas: IntVec, global: Float, i: Int)
+defn means_fill_items(pop: RatingPopulation, imean: FloatVector, ihas: IntVec, global: Float, i: Int)
     [i >= 0][true]
     -> Int
 {
@@ -116,7 +116,7 @@ defn means_fill_items(pop: RatingPopulation, imean: Vector, ihas: IntVec, global
 // means_write_row - shared writer: mean of val[begin..end) into dst[idx], or the
 // global fallback with has=0 when the slice is empty. val is the orientation's
 // value vector (user_val or item_val); the slice is contiguous in CSR order.
-defn means_write_row(val: Vector, dst: Vector, has: IntVec, global: Float, idx: Int, begin: Int, end: Int)
+defn means_write_row(val: FloatVector, dst: FloatVector, has: IntVec, global: Float, idx: Int, begin: Int, end: Int)
     [idx >= 0 && begin >= 0 && end >= begin][true]
     -> Int
 {
@@ -134,7 +134,7 @@ defn means_write_row(val: Vector, dst: Vector, has: IntVec, global: Float, idx: 
 
 // means_slice_sum - sum val[begin..end). Tail recursion carrying the start
 // cursor forward to end.
-defn means_slice_sum(val: Vector, begin: Int, end: Int, acc: Float)
+defn means_slice_sum(val: FloatVector, begin: Int, end: Int, acc: Float)
     [begin >= 0 && end >= begin][true]
     -> Float
 {
@@ -221,7 +221,7 @@ defn base_sim_item(pop: RatingPopulation, m: Means, s: Int, t: Int)
 // value. On a key match both contribute a centered product; otherwise advance
 // the run with the smaller key. Tail recursion over both cursors.
 defn overlap_acc(
-    key_a: IntVec, val_a: Vector, key_b: IntVec, val_b: Vector,
+    key_a: IntVec, val_a: FloatVector, key_b: IntVec, val_b: FloatVector,
     mean_a: Float, mean_b: Float,
     ia: Int, enda: Int, ib: Int, endb: Int,
     num: Float, da: Float, db: Float)
@@ -302,7 +302,7 @@ defn impute_user(pop: RatingPopulation, m: Means, a: Int, i: Int)
 // down the column slice [cur, end).
 defn impute_user_acc(
     pop: RatingPopulation, m: Means, a: Int, ma: Float,
-    col_user: IntVec, col_val: Vector, cur: Int, end: Int,
+    col_user: IntVec, col_val: FloatVector, cur: Int, end: Int,
     accum: Float, wsum: Float)
     [a >= 0 && cur >= 0 && end >= cur][true]
     -> (Float, Float)
@@ -347,7 +347,7 @@ defn impute_item(pop: RatingPopulation, m: Means, s: Int, u: Int)
 // Σ basesim(s,t)·(rut − t̄t) and Σ|basesim(s,t)|, skipping t == s. Tail recursion.
 defn impute_item_acc(
     pop: RatingPopulation, m: Means, s: Int,
-    row_item: IntVec, row_val: Vector, cur: Int, end: Int,
+    row_item: IntVec, row_val: FloatVector, cur: Int, end: Int,
     accum: Float, wsum: Float)
     [s >= 0 && cur >= 0 && end >= cur][true]
     -> (Float, Float)
@@ -376,7 +376,7 @@ defn lookup_user_item(pop: RatingPopulation, u: Int, i: Int)
     term lookup_row(pop.user_item, pop.user_val, i,
         pop_user_begin(pop, u), pop_user_end(pop, u));
 };
-defn lookup_row(row_item: IntVec, row_val: Vector, target: Int, cur: Int, end: Int)
+defn lookup_row(row_item: IntVec, row_val: FloatVector, target: Int, cur: Int, end: Int)
     [cur >= 0 && end >= cur][true]
     -> Float
 {
@@ -550,8 +550,8 @@ defn predict_user(pop: RatingPopulation, m: Means, a: Int, s: Int)
     };
     // scratch parallel buffers: candidate user, their sim'(a,x), their (rxs−ūx).
     let cu:  IntVec = ivec_new(cnt);
-    let csim: Vector = vec_new(cnt);
-    let cdev: Vector = vec_new(cnt);
+    let csim: FloatVector = vec_new(cnt);
+    let cdev: FloatVector = vec_new(cnt);
     let nfill: Int = pu_gather(pop, m, a, s, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
     let (accum, eta): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, NEIGHBOR_K);
     ivec_free(cu); vec_free(csim); vec_free(cdev);
@@ -566,8 +566,8 @@ defn predict_user(pop: RatingPopulation, m: Means, a: Int, s: Int)
 // n (≤ cnt; x==a is skipped). Tail recursion over the column slice.
 defn pu_gather(
     pop: RatingPopulation, m: Means, a: Int, s: Int,
-    col_user: IntVec, col_val: Vector, cur: Int, end: Int, n: Int,
-    cu: IntVec, csim: Vector, cdev: Vector)
+    col_user: IntVec, col_val: FloatVector, cur: Int, end: Int, n: Int,
+    cu: IntVec, csim: FloatVector, cdev: FloatVector)
     [a >= 0 && cur >= 0 && n >= 0][true]
     -> Int
 {
@@ -598,8 +598,8 @@ defn predict_item(pop: RatingPopulation, m: Means, a: Int, s: Int)
         term ms;
     };
     let ct:   IntVec = ivec_new(cnt);
-    let csim: Vector = vec_new(cnt);
-    let cdev: Vector = vec_new(cnt);
+    let csim: FloatVector = vec_new(cnt);
+    let cdev: FloatVector = vec_new(cnt);
     let nfill: Int = pi_gather(pop, m, s, pop.user_item, pop.user_val, begin, begin + cnt, 0, ct, csim, cdev);
     let (accum, eta): (Float, Float) = knn_aggregate(ct, csim, cdev, nfill, NEIGHBOR_K);
     ivec_free(ct); vec_free(csim); vec_free(cdev);
@@ -613,8 +613,8 @@ defn predict_item(pop: RatingPopulation, m: Means, a: Int, s: Int)
 // csim[n]=sim'(s,t), cdev[n]=rat−t̄t. Tail recursion.
 defn pi_gather(
     pop: RatingPopulation, m: Means, s: Int,
-    row_item: IntVec, row_val: Vector, cur: Int, end: Int, n: Int,
-    ct: IntVec, csim: Vector, cdev: Vector)
+    row_item: IntVec, row_val: FloatVector, cur: Int, end: Int, n: Int,
+    ct: IntVec, csim: FloatVector, cdev: FloatVector)
     [s >= 0 && cur >= 0 && n >= 0][true]
     -> Int
 {
@@ -637,7 +637,7 @@ defn pi_gather(
 // Selection: a `used` marker + k passes each taking the max remaining sim — the
 // contribution is added the moment a candidate is selected, so each is counted
 // exactly once (defect-#3 correction is structural, not a fragile index walk).
-defn knn_aggregate(cand: IntVec, csim: Vector, cdev: Vector, n: Int, k: Int)
+defn knn_aggregate(cand: IntVec, csim: FloatVector, cdev: FloatVector, n: Int, k: Int)
     [n >= 0 && k >= 0][true]
     -> (Float, Float)
 {
@@ -652,7 +652,7 @@ defn knn_aggregate(cand: IntVec, csim: Vector, cdev: Vector, n: Int, k: Int)
 // 2026-10-22: active prediction scans every catalogue item using one worker-
 // owned candidate workspace. Reset only the used prefix so ties and selection
 // order exactly match knn_aggregate while avoiding per-item marker allocation.
-defn knn_aggregate_reuse(csim: Vector, cdev: Vector, used: IntVec, n: Int, k: Int)
+defn knn_aggregate_reuse(csim: FloatVector, cdev: FloatVector, used: IntVec, n: Int, k: Int)
     [n >= 0 && k >= 0 && n <= csim.len && n <= cdev.len && n <= used.len][true]
     -> (Float, Float)
 {
@@ -676,7 +676,7 @@ defn knn_zero(used: IntVec, n: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
 // knn_select - `take` passes; each finds the max-sim UNUSED candidate, marks it,
 // and adds its contribution to accum/eta. Done when `take` neighbors selected or
 // no unused candidate remains. Tail recursion over the passes.
-defn knn_select(csim: Vector, cdev: Vector, used: IntVec, n: Int, take: Int, done: Int, accum: Float, eta: Float)
+defn knn_select(csim: FloatVector, cdev: FloatVector, used: IntVec, n: Int, take: Int, done: Int, accum: Float, eta: Float)
     [n >= 0 && take >= 0 && done >= 0][true]
     -> (Float, Float)
 {
@@ -695,7 +695,7 @@ defn knn_select(csim: Vector, cdev: Vector, used: IntVec, n: Int, take: Int, don
 
 // knn_argmax - index of the max csim among unused candidates [0,n); -1 if none
 // unused. `bi` is the best index so far, `bv` its sim. Tail recursion.
-defn knn_argmax(csim: Vector, used: IntVec, n: Int, i: Int, bi: Int, bv: Float)
+defn knn_argmax(csim: FloatVector, used: IntVec, n: Int, i: Int, bi: Int, bv: Float)
     [n >= 0 && i >= 0][true]
     -> Int
 {
@@ -851,7 +851,7 @@ defn rec_argbest(pop: RatingPopulation, m: Means, a: Int, lam: Float, picked: In
 // (user-user nusers², item-item nitems²), the two mean vectors (reused straight
 // from Means — same Malloc# blocks, the cache does not copy them), and a
 // PopSignature (Task 9.4) that records which population the snapshot was built
-// from. The matrices are Matrix (matrix.bv): flat row-major Float blocks indexed
+// from. The matrices are FloatMatrix (matrix.bv): flat row-major Float blocks indexed
 // at an 8-byte stride — exactly the risk-ledger large-Malloc path at 943/1682
 // scale, exercised here at 4×4 for correctness.
 //
@@ -878,10 +878,10 @@ obj PopSignature {
 };
 
 obj SimCache {
-    user_sim:  Matrix;       // nusers × nusers PCC (sim', Eq. 9)
-    item_sim:  Matrix;       // nitems × nitems PCC (sim', Eq. 10)
-    user_mean: Vector;       // nusers true means  (borrowed from Means)
-    item_mean: Vector;       // nitems true means  (borrowed from Means)
+    user_sim:  FloatMatrix;       // nusers × nusers PCC (sim', Eq. 9)
+    item_sim:  FloatMatrix;       // nitems × nitems PCC (sim', Eq. 10)
+    user_mean: FloatVector;       // nusers true means  (borrowed from Means)
+    item_mean: FloatVector;       // nitems true means  (borrowed from Means)
     nusers: Int;
     nitems: Int;
     sig:    PopSignature;    // which population this snapshot was built from
@@ -907,9 +907,9 @@ defn simcache_build(pop: RatingPopulation, m: Means, mtime: Int)
     [pop.nusers >= 1 && pop.nitems >= 1][true]
     -> SimCache
 {
-    let usim: Matrix = mat_new(pop.nusers, pop.nusers);
+    let usim: FloatMatrix = mat_new(pop.nusers, pop.nusers);
     sc_fill_user(pop, m, usim, 0);
-    let isim: Matrix = mat_new(pop.nitems, pop.nitems);
+    let isim: FloatMatrix = mat_new(pop.nitems, pop.nitems);
     sc_fill_item(pop, m, isim, 0);
     term SimCache {
         user_sim: usim, item_sim: isim,
@@ -922,7 +922,7 @@ defn simcache_build(pop: RatingPopulation, m: Means, mtime: Int)
 // sc_fill_user - fill row a of the user-user matrix. For each b in [0, a] compute
 // sim_user once and write BOTH [a][b] and [b][a] (symmetry); the diagonal [a][a]
 // is 1.0 (sim' of a user with itself). Tail recursion over rows a, inner over b.
-defn sc_fill_user(pop: RatingPopulation, m: Means, usim: Matrix, a: Int)
+defn sc_fill_user(pop: RatingPopulation, m: Means, usim: FloatMatrix, a: Int)
     [a >= 0][true]
     -> Int
 {
@@ -932,7 +932,7 @@ defn sc_fill_user(pop: RatingPopulation, m: Means, usim: Matrix, a: Int)
     sc_fill_user_row(pop, m, usim, a, 0);
     term sc_fill_user(pop, m, usim, a + 1);
 };
-defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: Matrix, a: Int, b: Int)
+defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: FloatMatrix, a: Int, b: Int)
     [a >= 0 && b >= 0][true]
     -> Int
 {
@@ -946,7 +946,7 @@ defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: Matrix, a: Int, b: 
 };
 
 // sc_fill_item - the item-space mirror: lower-triangle sim_item once, mirrored.
-defn sc_fill_item(pop: RatingPopulation, m: Means, isim: Matrix, s: Int)
+defn sc_fill_item(pop: RatingPopulation, m: Means, isim: FloatMatrix, s: Int)
     [s >= 0][true]
     -> Int
 {
@@ -956,7 +956,7 @@ defn sc_fill_item(pop: RatingPopulation, m: Means, isim: Matrix, s: Int)
     sc_fill_item_row(pop, m, isim, s, 0);
     term sc_fill_item(pop, m, isim, s + 1);
 };
-defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: Matrix, s: Int, t: Int)
+defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: FloatMatrix, s: Int, t: Int)
     [s >= 0 && t >= 0][true]
     -> Int
 {
@@ -1069,10 +1069,10 @@ defn served_read(sv: Served) -> SimCache {
     let nu: Int = ivec_get(sv.slots, SV_NUSERS);
     let ni: Int = ivec_get(sv.slots, SV_NITEMS);
     term SimCache {
-        user_sim:  Matrix { ptr: ivec_get(sv.slots, SV_USER_SIM),  rows: nu, cols: nu },
-        item_sim:  Matrix { ptr: ivec_get(sv.slots, SV_ITEM_SIM),  rows: ni, cols: ni },
-        user_mean: Vector { ptr: ivec_get(sv.slots, SV_USER_MEAN), len: nu },
-        item_mean: Vector { ptr: ivec_get(sv.slots, SV_ITEM_MEAN), len: ni },
+        user_sim:  FloatMatrix { ptr: ivec_get(sv.slots, SV_USER_SIM),  rows: nu, cols: nu },
+        item_sim:  FloatMatrix { ptr: ivec_get(sv.slots, SV_ITEM_SIM),  rows: ni, cols: ni },
+        user_mean: FloatVector { ptr: ivec_get(sv.slots, SV_USER_MEAN), len: nu },
+        item_mean: FloatVector { ptr: ivec_get(sv.slots, SV_ITEM_MEAN), len: ni },
         nusers: nu, nitems: ni,
         sig: PopSignature {
             nnz: ivec_get(sv.slots, SV_NNZ), mtime: ivec_get(sv.slots, SV_MTIME)
@@ -1114,7 +1114,7 @@ defn served_free(sv: Served) -> Void {
 // mtime] (5×8 bytes) followed by the four raw Malloc# blocks back-to-back —
 // user_sim (nusers²×8), item_sim (nitems²×8), user_mean (nusers×8), item_mean
 // (nitems×8). The matrices hold f64 bit patterns; Copy# moves raw bytes, so
-// there is NO float round-trip (the IntVec-vs-Vector lesson applies to typed
+// there is NO float round-trip (the IntVec-vs-FloatVector lesson applies to typed
 // slots, not to a raw byte copy of the whole block). The image is wrapped in a
 // Briev String ([len:i64][bytes]) and written with std/os/fs.bv's write_file;
 // load is read_file + header parse + Copy# back into fresh matrices.
@@ -1237,10 +1237,10 @@ defn simcache_load(path: String) -> SimCache {
     let isim_bytes: Int = ni * ni * 8;
     let umean_bytes: Int = nu * 8;
     let imean_bytes: Int = ni * 8;
-    let usim: Matrix = mat_new(nu, nu);
-    let isim: Matrix = mat_new(ni, ni);
-    let umean: Vector = vec_new(nu);
-    let imean: Vector = vec_new(ni);
+    let usim: FloatMatrix = mat_new(nu, nu);
+    let isim: FloatMatrix = mat_new(ni, ni);
+    let umean: FloatVector = vec_new(nu);
+    let imean: FloatVector = vec_new(ni);
     Copy#(usim.ptr,  off0,                                      usim_bytes);
     Copy#(isim.ptr,  off0 + usim_bytes,                         isim_bytes);
     Copy#(umean.ptr, off0 + usim_bytes + isim_bytes,            umean_bytes);
@@ -1283,7 +1283,7 @@ node run [tick < 1][tick == 1] {
     let nnz: Int = 15;
     let us:  IntVec = ivec_new(nnz);
     let it:  IntVec = ivec_new(nnz);
-    let val: Vector = vec_new(nnz);
+    let val: FloatVector = vec_new(nnz);
 
     // u0 row (i0..i3)
     ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
@@ -1602,7 +1602,7 @@ defn probe_swap_pop(u1i0: Float) -> RatingPopulation {
     let nnz: Int = 15;
     let us:  IntVec = ivec_new(nnz);
     let it:  IntVec = ivec_new(nnz);
-    let val: Vector = vec_new(nnz);
+    let val: FloatVector = vec_new(nnz);
     ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
     ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,3.0);
     ivec_set(us,2,0); ivec_set(it,2,2); vec_set(val,2,4.0);
@@ -1640,7 +1640,7 @@ defn probe_serving() -> Int {
     let cap: Int = 32;
     let us:  IntVec = ivec_new(cap);
     let it:  IntVec = ivec_new(cap);
-    let val: Vector = vec_new(cap);
+    let val: FloatVector = vec_new(cap);
     // u0 profile (items 0,1) — also gives u0 a row so sim' is defined.
     ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
     ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,4.0);
@@ -1677,7 +1677,7 @@ defn probe_serving() -> Int {
 // probe_serv_fill - users u1..(nu-1) each rate items 0,1 (overlap with u0) and
 // 2,3,4. Item 2's value differs from 3/4; items 3 and 4 share the SAME value per
 // user (the forced tie). `k` is the running write cursor. Tail recursion over u.
-defn probe_serv_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+defn probe_serv_fill(us: IntVec, it: IntVec, val: FloatVector, k: Int, u: Int, nu: Int)
     [k >= 0 && u >= 1][true]
     -> Int
 {
@@ -1721,7 +1721,7 @@ defn probe_knn_truncation() -> Int {
     let nnz: Int = nu * ni;
     let us:  IntVec = ivec_new(nnz);
     let it:  IntVec = ivec_new(nnz);
-    let val: Vector = vec_new(nnz);
+    let val: FloatVector = vec_new(nnz);
     probe_fill(us, it, val, 0, 0, nu);
     let pop: RatingPopulation = pop_build(us, it, val, nnz, nu, ni);
     let m: Means = means_build(pop);
@@ -1731,8 +1731,8 @@ defn probe_knn_truncation() -> Int {
     let begin: Int = pop_item_begin(pop, 0);
     let cnt:   Int = pop_item_end(pop, 0) - begin;
     let cu:   IntVec = ivec_new(cnt);
-    let csim: Vector = vec_new(cnt);
-    let cdev: Vector = vec_new(cnt);
+    let csim: FloatVector = vec_new(cnt);
+    let cdev: FloatVector = vec_new(cnt);
     let nfill: Int = pu_gather(pop, m, 0, 0, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
     let (_a30, eta30): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 30);
     let (_a31, eta31): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 31);
@@ -1751,7 +1751,7 @@ defn probe_knn_truncation() -> Int {
 // probe_fill - user u (0..nu) rates item 0 with value 3, and item 1 with a value
 // that varies by u (1..5 cycling) so each user's centered profile differs,
 // yielding 31 distinct sim' to user 0. Tail recursion over users.
-defn probe_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+defn probe_fill(us: IntVec, it: IntVec, val: FloatVector, k: Int, u: Int, nu: Int)
     [k >= 0 && u >= 0][true]
     -> Int
 {
@@ -1768,7 +1768,7 @@ defn probe_profile(u: Int) [u >= 0][term >= 1.0 && term <= 5.0] -> Float {
     term ((u % 5) + 1) as Float;
 };
 // probe_min_sim - the smallest of the first n sims. Tail recursion.
-defn probe_min_sim(csim: Vector, n: Int, i: Int, acc: Float) [n >= 0 && i >= 0][true] -> Float {
+defn probe_min_sim(csim: FloatVector, n: Int, i: Int, acc: Float) [n >= 0 && i >= 0][true] -> Float {
     when i >= n {
         term acc;
     };
