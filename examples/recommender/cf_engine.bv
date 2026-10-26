@@ -603,9 +603,11 @@ defn sim_next_item(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: In
     -> Int
 {
     when ia >= enda {
+        when !(ib < kb.len) { trap; };
         term ivec_get(kb, ib);
     };
     when ib >= endb {
+        when !(ia < ka.len) { trap; };
         term ivec_get(ka, ia);
     };
     when !(ia < ka.len) { trap; };
