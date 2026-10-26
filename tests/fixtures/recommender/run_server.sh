@@ -17,6 +17,10 @@ for gate in reactor_gate server_json_gate server_api_gate server_io_gate server_
     "$BV" build "tests/fixtures/recommender/$gate.bv" --out "$out"
     if [ "$gate" != server_property_gate ]; then timeout 60 "$out/$gate"; fi
 done
-RECOMMENDER_PROPERTY_BINARY="$out/server_property_gate" \
-    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/briev-target}" \
-    cargo test --test recommender_server_properties -- --ignored
+if [ -f tests/recommender_server_properties.rs ] && [ -f Cargo.toml ]; then
+    RECOMMENDER_PROPERTY_BINARY="$out/server_property_gate" \
+        CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/briev-target}" \
+        cargo test --test recommender_server_properties -- --ignored
+else
+    echo "server_property_gate=skipped (recommender_server_properties test is not in this repository)"
+fi

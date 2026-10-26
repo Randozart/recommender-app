@@ -25,8 +25,9 @@ makes the native service compile against current `main`.
   - `run_profile_admission.sh`, `run.sh`, `run_accounts.sh`,
     `run_cache.sh`, `run_operation_store.sh`, `run_prediction_workers.sh`,
     and `run_worker.sh` PASS.
-  - `run_server.sh` passes catalogue/reactor/json/api/io/protocol/loop; the
-    malformed-WebSocket-frame gate still gets no close payload.
+  - `run_server.sh` PASS through catalogue/reactor/json/api/io/protocol/loop
+    and malformed WebSocket frames. The repository-level
+    `recommender_server_properties` test is absent and is reported as skipped.
   - `browser_pending_peer.mjs` still fails waiting for the `Live` tab, with no
     page errors.
 - The app receipt payload is JSON-serialized and reparsed at the wire boundary
