@@ -198,11 +198,11 @@ defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
     term ActivePrediction { state: state, model: model, similarities: similarities, mean: mean, excluded: excluded };
 };
 
-defn active_user_prediction(active: ActivePrediction, item: Int) -> Float {
+defn active_user_prediction(active: ActivePrediction, item: Int)
+    [item >= 0 && item < active.model.population.nitems]
+    -> Float {
     let pop: RatingPopulation = active.model.population;
 
-    when !((item >= 0)) { trap; };
-    when !((item < pop.nitems)) { trap; };
     let begin: Int = pop_item_begin(pop,item);
     let end: Int = pop_item_end(pop,item);
     when !(((end - begin) + 1) >= 1) { trap; };
@@ -237,8 +237,9 @@ defn active_user_prediction(active: ActivePrediction, item: Int) -> Float {
     term active.mean + sum / eta;
 };
 
-defn active_item_prediction(active: ActivePrediction, item: Int) -> Float {
-    when !(item >= 0) { trap; };
+defn active_item_prediction(active: ActivePrediction, item: Int)
+    [item >= 0 && item < active.model.population.nitems]
+    -> Float {
     when !(item < active.model.cache.nitems) { trap; };
     let count: Int = active.state.ratings .^Length;
     let items: IntVec = ivec_new(count + 1);

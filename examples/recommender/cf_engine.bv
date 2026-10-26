@@ -492,7 +492,7 @@ defn sim_union_user(
     pop: RatingPopulation, m: Means, a: Int, b: Int, ma: Float, mb: Float,
     ia: Int, enda: Int, ib: Int, endb: Int,
     num: Float, da: Float, db: Float)
-    [ia >= 0 && ib >= 0][true]
+    [ia >= 0 && ib >= 0 && a >= 0 && a < pop.nusers && b >= 0 && b < pop.nusers][true]
     -> (Float, Float, Float)
 {
     when ia >= enda && ib >= endb {
@@ -500,12 +500,8 @@ defn sim_union_user(
     };
     let item: Int = sim_next_item(pop.user_item, ia, enda, pop.user_item, ib, endb);
 
-    when !((b >= 0)) { trap; };
-    when !((b < pop.nusers)) { trap; };
     when !((item >= 0)) { trap; };
     when !((item < pop.nitems)) { trap; };
-    when !((a >= 0)) { trap; };
-    when !((a < pop.nusers)) { trap; };
     let va: Float = impute_user(pop, m, a, item) - ma;
     let vb: Float = impute_user(pop, m, b, item) - mb;
     let (na, nb): (Int, Int) = sim_advance(pop.user_item, ia, enda, pop.user_item, ib, endb, item);
@@ -539,7 +535,7 @@ defn sim_union_item(
     pop: RatingPopulation, m: Means, s: Int, t: Int, ms: Float, mt: Float,
     is: Int, ends: Int, it: Int, endt: Int,
     num: Float, da: Float, db: Float)
-    [is >= 0 && it >= 0][true]
+    [is >= 0 && it >= 0 && s >= 0 && s < pop.nitems && t >= 0 && t < pop.nitems][true]
     -> (Float, Float, Float)
 {
     when is >= ends && it >= endt {
@@ -547,12 +543,8 @@ defn sim_union_item(
     };
     let usr: Int = sim_next_item(pop.item_user, is, ends, pop.item_user, it, endt);
 
-    when !((t >= 0)) { trap; };
-    when !((t < pop.nitems)) { trap; };
     when !((usr >= 0)) { trap; };
     when !((usr < pop.nusers)) { trap; };
-    when !((s >= 0)) { trap; };
-    when !((s < pop.nitems)) { trap; };
     // imputed cell (item, user): impute_item(pop, m, item=s|t, user=usr).
     let va: Float = impute_item(pop, m, s, usr) - ms;
     let vb: Float = impute_item(pop, m, t, usr) - mt;

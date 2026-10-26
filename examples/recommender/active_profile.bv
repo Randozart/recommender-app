@@ -216,10 +216,10 @@ defn active_profile_build(profile: ActiveProfileEngine) -> Bool {
     term true;
 };
 
-defn active_profile_user_prediction(profile: ActiveProfileEngine, item: Int) -> Float {
+defn active_profile_user_prediction(profile: ActiveProfileEngine, item: Int)
+    [item >= 0 && item < profile.model.population.nitems]
+    -> Float {
     let pop: RatingPopulation = profile.model.population;
-    when !((item >= 0)) { trap; };
-    when !((item < pop.nitems)) { trap; };
     let scratch: PredictionScratch = profile.scratch;
     let count: Int = 0;
 when !((count < scratch.candidates.len)) { trap; };
@@ -248,8 +248,9 @@ when !((count < scratch.candidates.len)) { trap; };
     term profile.mean+numerator/weight;
 };
 
-defn active_profile_item_prediction(profile: ActiveProfileEngine, item: Int) -> Float {
-    when !(item >= 0) { trap; };
+defn active_profile_item_prediction(profile: ActiveProfileEngine, item: Int)
+    [item >= 0 && item < profile.model.population.nitems]
+    -> Float {
     when !(item < profile.model.cache.nitems) { trap; };
     // Preserve the serial server's frozen item similarities and item means;
     // active profile evaluation updates its user-side view only.
