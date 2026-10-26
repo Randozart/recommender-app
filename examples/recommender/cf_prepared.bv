@@ -18,19 +18,14 @@ defn prepared_base(rows: PreparedRows) -> FloatMatrix {
     foreach a in 0..rows.count {
         when !((a < rows.off.len)) { trap; };
         foreach b in 0..(a+1) {
-            when !((b >= 0)) { trap; };
-            when !((b < rows.off.len)) { trap; };
             when !((ivec_get(rows.off, a) >= 0)) { trap; };
             when !((ivec_get(rows.off, b) >= 0)) { trap; };
             when !(a < rows.mean.len) { trap; };
-            when !(b < rows.mean.len) { trap; };
             when !(a + 1 < rows.off.len) { trap; };
-            when !(b + 1 < rows.off.len) { trap; };
             let (num,da,db): (Float,Float,Float) = overlap_acc(
                 rows.key,rows.value,rows.key,rows.value,vec_get(rows.mean,a),vec_get(rows.mean,b),
                 ivec_get(rows.off,a),ivec_get(rows.off,a+1),ivec_get(rows.off,b),ivec_get(rows.off,b+1),0.0,0.0,0.0);
             let value: Float = pcc_finish(num,da,db);
-            when !(b < base.rows) { trap; };
             mat_set(base,a,b,value); mat_set(base,b,a,value);
         };
     };
@@ -142,8 +137,6 @@ defn prepared_matrix(rows: PreparedRows, columns: PreparedRows) -> FloatMatrix {
     let matrix: FloatMatrix = mat_new(rows.count,rows.count);
     foreach a in 0..rows.count {
         foreach b in 0..(a+1) {
-            when !((b >= 0)) { trap; };
-            when !((b < matrix.rows)) { trap; };
             let sim: Float = prepared_pair(space,a,b);
 
             mat_set(matrix,a,b,sim); mat_set(matrix,b,a,sim);
