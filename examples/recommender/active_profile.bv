@@ -72,12 +72,10 @@ defn active_profile_prepare(engine: ActiveProfileEngine, owner: Int, ratings: Li
 
 defn active_profile_global(engine: ActiveProfileEngine, excluded: Int, added_sum: Float, added_count: Int) -> Float {
     let pop: RatingPopulation = engine.model.population;
-    when !((excluded >= 0)) { trap; };
-    when !((excluded < pop.nusers)) { trap; };
     let sum: Float = engine.scratch.population_sum+added_sum;
     let count: Int = pop.nnz+added_count;
     when excluded >= 0 {
-
+        when !(excluded < pop.nusers) { trap; };
         foreach idx in pop_user_begin(pop,excluded)..pop_user_end(pop,excluded) {
             when !((idx >= 0)) { trap; };
             when !((idx < pop.user_val.len)) { trap; };
@@ -154,7 +152,7 @@ defn active_profile_impute_acc(profile: ActiveProfileEngine, user: Int, cursor: 
     when !((cursor >= 0)) { trap; };
     when !((cursor < pop.item_user.len)) { trap; };
     let neighbor: Int = ivec_get(pop.item_user,cursor);
-    when !(((user >= 0) && (user < profile.scratch.base.rows))) { trap; };
+    when !(user < profile.scratch.base.rows) { trap; };
     when !((neighbor >= 0)) { trap; };
     when !((neighbor < profile.scratch.base.cols)) { trap; };
     when !((neighbor < profile.scratch.active_base.len)) { trap; };
@@ -311,7 +309,6 @@ defn active_profile_rank(scratch: PredictionScratch) -> List<RankedMovie> {
     let items: List<RankedMovie> = [];
     foreach rank in 0..TOP_N {
         let best: Int = active_profile_best(scratch);
-        when !((best >= 0)) { trap; };
         when !((best < scratch.picked.len)) { trap; };
         when !((best < scratch.scores.len)) { trap; };
         when best >= 0 {

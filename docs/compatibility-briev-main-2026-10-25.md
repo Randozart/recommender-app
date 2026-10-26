@@ -14,6 +14,13 @@ makes the native service compile against current `main`.
 - Browser `app.rbv`: builds and loads with current `brievc` (zero page errors).
 - Server `server.bv`: `brievc check` passes and `brievc build` links the native
   executable.
+- Fixtures: the seven `tests/fixtures/recommender/*.bv` files still used the
+  old `Vector` spelling; they now use `FloatVector`.
+- `run_active_scratch.sh`: PASS.
+- `run_active_profile.sh`: PASS at `-O0` and at `-O3` without LTO; the
+  harness-exact `-O3 -flto` binary segfaults (compiler bug, not a guard).
+- `run_worker.sh`: runs, but generation 2 loses the installed state in the
+  current compiler; the same gate passes with the app's original compiler.
 - Runtime gates that need PostgreSQL, MovieLens 100K, or Playwright have not
   been run on this branch.
 

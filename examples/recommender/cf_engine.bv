@@ -77,13 +77,12 @@ defn means_sum_all(val: FloatVector, nnz: Int, k: Int, acc: Float)
     [nnz >= 0 && k >= 0][true]
     -> Float
 {
-    when !((k >= 0)) { trap; };
-    when !((k < val.len)) { trap; };
-    when !(k >= 0) { trap; };
-
     when k >= nnz {
         term acc;
     };
+    when !((k >= 0)) { trap; };
+    when !((k < val.len)) { trap; };
+
     term means_sum_all(val, nnz, k + 1, acc + vec_get(val, k));
 };
 
@@ -155,13 +154,12 @@ defn means_slice_sum(val: FloatVector, begin: Int, end: Int, acc: Float)
     [begin >= 0 && end >= begin][true]
     -> Float
 {
-    when !((begin >= 0)) { trap; };
-    when !((begin < val.len)) { trap; };
-    when !(begin >= 0) { trap; };
-
     when begin >= end {
         term acc;
     };
+    when !((begin >= 0)) { trap; };
+    when !((begin < val.len)) { trap; };
+
     term means_slice_sum(val, begin + 1, end, acc + vec_get(val, begin));
 };
 
@@ -269,20 +267,15 @@ defn overlap_acc(
     [ia >= 0 && ib >= 0][true]
     -> (Float, Float, Float)
 {
+    when ia >= enda || ib >= endb {
+        term (num, da, db);
+    };
     when !((ib >= 0)) { trap; };
     when !((ib < val_b.len)) { trap; };
     when !((ia >= 0)) { trap; };
     when !((ia < val_a.len)) { trap; };
     when !((ia < key_a.len)) { trap; };
-    when !(ib >= 0) { trap; };
-
-    when !(ia >= 0) { trap; };
-
     when !(ib < key_b.len) { trap; };
-
-    when ia >= enda || ib >= endb {
-        term (num, da, db);
-    };
     let ka: Int = ivec_get(key_a, ia);
     let kb: Int = ivec_get(key_b, ib);
     when ka == kb {
@@ -365,14 +358,12 @@ defn impute_user_acc(
     [a >= 0 && cur >= 0 && end >= cur][true]
     -> (Float, Float)
 {
-    when !((cur < col_val.len)) { trap; };
-    when !((cur >= 0)) { trap; };
-    when !((cur < col_user.len)) { trap; };
-    when !(cur >= 0) { trap; };
-
     when cur >= end {
         term (accum, wsum);
     };
+    when !((cur < col_val.len)) { trap; };
+    when !((cur >= 0)) { trap; };
+    when !((cur < col_user.len)) { trap; };
     let x: Int = ivec_get(col_user, cur);
     when !((a >= 0)) { trap; };
     when !((a < pop.nusers)) { trap; };
@@ -427,14 +418,12 @@ defn impute_item_acc(
     [s >= 0 && cur >= 0 && end >= cur][true]
     -> (Float, Float)
 {
-    when !((cur < row_val.len)) { trap; };
-    when !((cur >= 0)) { trap; };
-    when !((cur < row_item.len)) { trap; };
-    when !(cur >= 0) { trap; };
-
     when cur >= end {
         term (accum, wsum);
     };
+    when !((cur < row_val.len)) { trap; };
+    when !((cur >= 0)) { trap; };
+    when !((cur < row_item.len)) { trap; };
     let t: Int = ivec_get(row_item, cur);
     when !((s >= 0)) { trap; };
     when !((s < pop.nitems)) { trap; };
@@ -470,12 +459,11 @@ defn lookup_row(row_item: IntVec, row_val: FloatVector, target: Int, cur: Int, e
     [cur >= 0 && end >= cur][true]
     -> Float
 {
-    when !(cur < row_val.len) { trap; };
-
-    when !(cur < row_item.len) { trap; };
     when cur >= end {
         term -1.0;
     };
+    when !(cur < row_val.len) { trap; };
+    when !(cur < row_item.len) { trap; };
     let it: Int = ivec_get(row_item, cur);
     when it == target {
         term vec_get(row_val, cur);
@@ -614,15 +602,14 @@ defn sim_next_item(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: In
     [ia >= 0 && ib >= 0][true]
     -> Int
 {
-    when !(ia < ka.len) { trap; };
-
-    when !(ib < kb.len) { trap; };
     when ia >= enda {
         term ivec_get(kb, ib);
     };
     when ib >= endb {
         term ivec_get(ka, ia);
     };
+    when !(ia < ka.len) { trap; };
+    when !(ib < kb.len) { trap; };
     let va: Int = ivec_get(ka, ia);
     let vb: Int = ivec_get(kb, ib);
     when va <= vb {
@@ -642,13 +629,11 @@ defn sim_advance(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: Int,
     term (na, nb);
 };
 defn sim_step(k: IntVec, i: Int, end: Int, key: Int) [i >= 0][true] -> Int {
-    when !((i >= 0)) { trap; };
-    when !((i < k.len)) { trap; };
-    when !(i >= 0) { trap; };
-
     when i >= end {
         term i;
     };
+    when !((i >= 0)) { trap; };
+    when !((i < k.len)) { trap; };
     when ivec_get(k, i) == key {
         term i + 1;
     };
@@ -813,11 +798,11 @@ defn knn_min(a: Int, b: Int) -> Int {
     term b;
 };
 defn knn_zero(used: IntVec, n: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
+    when i >= n { term 0; };
     when !((i >= 0)) { trap; };
     when !((i < used.len)) { trap; };
-    when !(i >= 0) { trap; };
 
-    when i >= n { term 0; };
+
     ivec_set(used, i, 0);
     term knn_zero(used, n, i + 1);
 };
@@ -834,7 +819,6 @@ defn knn_select(csim: FloatVector, cdev: FloatVector, used: IntVec, n: Int, take
     };
     let best: Int = knn_argmax(csim, used, n, 0, -1, 0.0);
     when !((best < cdev.len)) { trap; };
-    when !((best >= 0)) { trap; };
     when !((best < csim.len)) { trap; };
     when !((best < used.len)) { trap; };
     when best < 0 {
@@ -853,12 +837,11 @@ defn knn_argmax(csim: FloatVector, used: IntVec, n: Int, i: Int, bi: Int, bv: Fl
     [n >= 0 && i >= 0][true]
     -> Int
 {
-    when !(i < csim.len) { trap; };
-
-    when !(i < used.len) { trap; };
     when i >= n {
         term bi;
     };
+    when !(i < csim.len) { trap; };
+    when !(i < used.len) { trap; };
     when ivec_get(used, i) == 1 {
         term knn_argmax(csim, used, n, i + 1, bi, bv);
     };
@@ -1093,6 +1076,9 @@ defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: FloatMatrix, a: Int
     [a >= 0 && b >= 0][true]
     -> Int
 {
+    when b > a {
+        term 0;
+    };
     when !(((b >= 0) && (b < usim.rows))) { trap; };
     when !((a >= 0)) { trap; };
     when !((a < usim.cols)) { trap; };
@@ -1105,9 +1091,6 @@ defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: FloatMatrix, a: Int
 
     when !(b >= 0) { trap; };
 
-    when b > a {
-        term 0;
-    };
     let s: Float = sim_user(pop, m, a, b);
 
     when !(a < usim.rows) { trap; };
@@ -1134,6 +1117,9 @@ defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: FloatMatrix, s: Int
     [s >= 0 && t >= 0][true]
     -> Int
 {
+    when t > s {
+        term 0;
+    };
     when !(((t >= 0) && (t < isim.rows))) { trap; };
     when !((s >= 0)) { trap; };
     when !((s < isim.cols)) { trap; };
@@ -1146,9 +1132,6 @@ defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: FloatMatrix, s: Int
 
     when !(t >= 0) { trap; };
 
-    when t > s {
-        term 0;
-    };
     let v: Float = sim_item(pop, m, s, t);
 
     when !(s < isim.rows) { trap; };
