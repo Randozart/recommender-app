@@ -17,10 +17,10 @@ makes the native service compile against current `main`.
 - Fixtures: the seven `tests/fixtures/recommender/*.bv` files still used the
   old `Vector` spelling; they now use `FloatVector`.
 - `run_active_scratch.sh`: PASS.
-- `run_active_profile.sh`: PASS at `-O0` and at `-O3` without LTO; the
-  harness-exact `-O3 -flto` binary segfaults (compiler bug, not a guard).
-- `run_worker.sh`: runs, but generation 2 loses the installed state in the
-  current compiler; the same gate passes with the app's original compiler.
+- `run_active_profile.sh`: PASS under the harness-exact `-O3 -flto` build.
+- `run_worker.sh`: PASS through install, generation-2 prediction, shutdown and
+  reap. The recovery suffix needs PostgreSQL because it spawns the
+  persistence worker, so `persistent_ipc=false` is expected locally.
 - Runtime gates that need PostgreSQL, MovieLens 100K, or Playwright have not
   been run on this branch.
 
