@@ -28,8 +28,9 @@ makes the native service compile against current `main`.
   - `run_server.sh` PASS through catalogue/reactor/json/api/io/protocol/loop
     and malformed WebSocket frames. The repository-level
     `recommender_server_properties` test is absent and is reported as skipped.
-  - `browser_pending_peer.mjs` still fails waiting for the `Live` tab, with no
-    page errors.
+  - `browser_pending_peer.mjs`: the `Live` binding now works (compiler
+    `b7bdfb08` preserves hyphens in `b-window` event names); the gate now
+    stalls on the 1682-movie catalogue load.
 - The app receipt payload is JSON-serialized and reparsed at the wire boundary
   to avoid the current constructed-`JsonValue`-in-`Array` copy bug (companion
   BUGS.md); parsed payloads behave correctly.
