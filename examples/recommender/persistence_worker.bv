@@ -155,7 +155,15 @@ defn persistence_worker_receipt_payload(epoch: String, receipts: List<DurableOpe
     let operations: List<JsonValue> = [];
     foreach idx in 0..receipts .^Length { operations <- persistence_worker_receipt_value(receipts[idx]); };
     let fields: List<(String,JsonValue)> = [("current_server_epoch",StrVal(epoch)),("operations",Array(operations))];
-    term Object(fields);
+    // 2026-10-26: a JsonValue Object nested in Array loses its member table when
+    // copied through a function return (compiler repro in BUGS.md). Serialize
+    // and reparse at the wire boundary so the reply carries canonical JSON.
+    let raw: JsonValue = Object(fields);
+    let encoded: Result<String,String> = json_stringify(raw);
+    when is_err(encoded) { term raw; };
+    let parsed: Result<JsonValue,String> = json_parse(unwrap(encoded));
+    when is_err(parsed) { term raw; };
+    term unwrap(parsed);
 };
 
 defn persistence_worker_receipt_value(receipt: DurableOperationReceipt) -> JsonValue {

@@ -21,8 +21,17 @@ makes the native service compile against current `main`.
 - `run_worker.sh`: PASS through install, generation-2 prediction, shutdown and
   reap. The recovery suffix needs PostgreSQL because it spawns the
   persistence worker, so `persistent_ipc=false` is expected locally.
-- Runtime gates that need PostgreSQL, MovieLens 100K, or Playwright have not
-  been run on this branch.
+- Local PostgreSQL 18.6 + MovieLens 100k + Playwright Chromium gates:
+  - `run_profile_admission.sh`, `run.sh`, `run_accounts.sh`,
+    `run_cache.sh`, `run_operation_store.sh`, `run_prediction_workers.sh`,
+    and `run_worker.sh` PASS.
+  - `run_server.sh` passes catalogue/reactor/json/api/io/protocol/loop; the
+    malformed-WebSocket-frame gate still gets no close payload.
+  - `browser_pending_peer.mjs` still fails waiting for the `Live` tab, with no
+    page errors.
+- The app receipt payload is JSON-serialized and reparsed at the wire boundary
+  to avoid the current constructed-`JsonValue`-in-`Array` copy bug (companion
+  BUGS.md); parsed payloads behave correctly.
 
 ## Compatibility changes
 
