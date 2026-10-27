@@ -178,6 +178,7 @@ when !((0 < population.item_off.len)) { trap; };
 when !((1 < population.item_off.len)) { trap; };
 
     when !((1 < population.user_off.len)) { trap; };
+    when !((0 < population.user_off.len)) { trap; };
     ivec_set(population.user_off,0,0); ivec_set(population.user_off,1,0);
     ivec_set(population.item_off,0,0); ivec_set(population.item_off,1,0);
     let means: Means = Means { user_mean: vec_new(1), item_mean: vec_new(1),

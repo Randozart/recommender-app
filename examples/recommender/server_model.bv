@@ -29,6 +29,8 @@ defn model_ids(conn: PgConn, ids: List<Int>) -> Result<List<Int>, PgResult> {
     when rows.nrows == 0 { term Ok(ids); };
     let added: List<Int> = ids;
     foreach idx in 0..rows.nrows {
+        when !((idx >= 0)) { trap; };
+        when !((idx < rows.nrows)) { trap; };
         when !((0 < rows.ncols)) { trap; };
         let entry: List<Int> = [pg_row_int(rows, idx, 0)];
         added = added + entry;
@@ -44,7 +46,11 @@ defn model_read_rows(conn: PgConn, users: IntVec, items: IntVec, values: FloatVe
         term store_error("Population rows changed within their snapshot; retry refresh.");
     };
     foreach idx in 0..rows.nrows {
+        when !(((idx >= 0) && (idx < rows.nrows))) { trap; };
         when !((1 < rows.ncols)) { trap; };
+        when !((idx >= 0)) { trap; };
+        when !((idx < rows.nrows)) { trap; };
+        when !((0 < rows.ncols)) { trap; };
         when !((2 < rows.ncols)) { trap; };
         when !(((offset + idx) >= 0)) { trap; };
         when !(((offset + idx) < users.len)) { trap; };
@@ -90,6 +96,7 @@ defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: Strin
         " OR item_id >= " + nitems as String + ") + (SELECT count(*) FROM ratings WHERE item_id >= " + nitems as String + ")");
     when !((0 < counted.nrows)) { trap; };
     when !((1 < counted.ncols)) { trap; };
+    when !((0 < counted.ncols)) { trap; };
     when !counted.ok { term Err(store_abort(conn,counted)); };
 
     let total: Int = pg_row_int(counted,0,0);
@@ -120,6 +127,7 @@ defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: Strin
     };
     let pop: RatingPopulation = pop_build(users,items,values,total,baseline_users + ids .^Length,nitems);
     ivec_free(users); ivec_free(items); vec_free(values);
+    when !(pop.nnz >= 0) { trap; };
     when !(pop.nusers >= 1) { trap; };
     when !(pop.nitems >= 1) { trap; };
     let means: Means = means_build(pop);
@@ -144,6 +152,9 @@ defn active_copy_row(pop: RatingPopulation, user: Int, users: IntVec, items: Int
         when !((idx >= 0)) { trap; };
         when !((idx < pop.user_item.len)) { trap; };
 
+        when !(count >= 0) { trap; };
+        when !(count < users.len) { trap; };
+        when !(count < items.len) { trap; };
         when !(count < values.len) { trap; };
         when !(idx < pop.user_val.len) { trap; };
         ivec_set(users,count,user);
@@ -169,6 +180,8 @@ defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
     let items: IntVec = ivec_new(capacity);
     let values: FloatVector = vec_new(capacity);
     let count: Int = 0;
+    when !((count >= 0)) { trap; };
+    when !((count < users.len)) { trap; };
     foreach user_idx in 0..pop.nusers {
         when user_idx != excluded {
             count = active_copy_row(pop,user_idx,users,items,values,count);
@@ -177,20 +190,27 @@ defn active_build(model: ServerModel, state: AccountState) -> ActivePrediction {
     foreach idx in 0..state.ratings .^Length {
         when !(count >= 0) { trap; };
         when !(count < users.len) { trap; };
+        when !(count < items.len) { trap; };
+        when !(count < values.len) { trap; };
         ivec_set(users,count,pop.nusers);
         ivec_set(items,count,state.ratings[idx].item_id);
         vec_set(values,count,state.ratings[idx].rating as Float);
         count = count + 1;
     };
     when !(count >= 0) { trap; };
+    when !(pop.nusers + 1 >= 1) { trap; };
+    when !(pop.nitems >= 1) { trap; };
     let overlay: RatingPopulation = pop_build(users,items,values,count,pop.nusers + 1,pop.nitems);
     ivec_free(users); ivec_free(items); vec_free(values);
+    when !(overlay.nnz >= 0) { trap; };
     when !(overlay.nusers >= 1) { trap; };
     when !(overlay.nitems >= 1) { trap; };
     let means: Means = means_build(overlay);
     let similarities: FloatVector = vec_new(pop.nusers);
     foreach idx in 0..pop.nusers {
+        when !(idx < similarities.len) { trap; };
         when !(pop.nusers < overlay.nusers) { trap; };
+        when !(idx < overlay.nusers) { trap; };
         vec_set(similarities,idx,sim_user(overlay,means,pop.nusers,idx)); };
     when !(pop.nusers < means.user_mean.len) { trap; };
     let mean: Float = means_user(means,pop.nusers);
@@ -211,12 +231,16 @@ defn active_user_prediction(active: ActivePrediction, item: Int)
     let devs: FloatVector = vec_new(end - begin + 1);
     let count: Int = 0;
     foreach idx in begin..end {
+        when !((idx >= 0)) { trap; };
         when !((idx < pop.item_user.len)) { trap; };
         let user: Int = ivec_get(pop.item_user,idx);
         when !(user >= 0) { trap; };
         when !(user < active.similarities.len) { trap; };
         when user != active.excluded {
+            when !(count >= 0) { trap; };
             when !(count < users.len) { trap; };
+            when !(count < sims.len) { trap; };
+            when !(count < devs.len) { trap; };
             ivec_set(users,count,user);
             vec_set(sims,count,vec_get(active.similarities,user));
             when !(idx < pop.item_val.len) { trap; };
@@ -225,6 +249,10 @@ defn active_user_prediction(active: ActivePrediction, item: Int)
             count = count + 1;
         };
     };
+    when !(count >= 0) { trap; };
+    when !(count <= users.len) { trap; };
+    when !(count <= sims.len) { trap; };
+    when !(count <= devs.len) { trap; };
     let (sum,eta): (Float,Float) = knn_aggregate(users,sims,devs,count,NEIGHBOR_K);
     ivec_free(users); vec_free(sims); vec_free(devs);
     when eta == 0.0 { term active.mean; };
@@ -240,14 +268,24 @@ defn active_item_prediction(active: ActivePrediction, item: Int)
     let sims: FloatVector = vec_new(count + 1);
     let devs: FloatVector = vec_new(count + 1);
     foreach idx in 0..count {
+        when !((idx >= 0)) { trap; };
+        when !((idx < sims.len)) { trap; };
+        when !((idx < items.len)) { trap; };
         let rating: AccountRating = active.state.ratings[idx];
+when !(item >= 0) { trap; };
+        when !(item < active.model.cache.nitems) { trap; };
 when !((rating.item_id >= 0)) { trap; };
 when !((rating.item_id < active.model.cache.nitems)) { trap; };
 
         ivec_set(items,idx,rating.item_id);
         vec_set(sims,idx,simcache_item_sim(active.model.cache,item,rating.item_id));
+        when !(idx < devs.len) { trap; };
         vec_set(devs,idx,(rating.rating as Float) - simcache_item_mean(active.model.cache,rating.item_id));
     };
+    when !(count >= 0) { trap; };
+    when !(count <= items.len) { trap; };
+    when !(count <= sims.len) { trap; };
+    when !(count <= devs.len) { trap; };
     let (sum,eta): (Float,Float) = knn_aggregate(items,sims,devs,count,NEIGHBOR_K);
     ivec_free(items); vec_free(sims); vec_free(devs);
     let mean: Float = simcache_item_mean(active.model.cache,item);

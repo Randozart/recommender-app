@@ -83,6 +83,7 @@ defn api_best_item(scores: FloatVector, picked: IntVec) -> Int {
     let best: Int = -1;
     let score: Float = -1.0;
     foreach item in 0..scores.len {
+        when !((item >= 0)) { trap; };
         when !((item < picked.len)) { trap; };
 
         when ivec_get(picked,item) == 0 && vec_get(scores,item) > score { best = item; score = vec_get(scores,item); };
@@ -119,6 +120,7 @@ defn api_recommendations(model: ServerModel, state: AccountState, lambda: Float)
         let best: Int = api_best_item(scores,picked);
         when !((best < scores.len)) { trap; };
         when best >= 0 {
+            when !(best < picked.len) { trap; };
             text = api_add_recommendation(text,best,vec_get(scores,best));
             ivec_set(picked,best,1);
         };

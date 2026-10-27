@@ -153,6 +153,7 @@ defn io_decimal(text: String) -> Int {
 // as an empty body. -1 needs more bytes; -2 is malformed; -3 exceeds the limit.
 defn io_http_size(buf: ByteBuf) -> Int {
     when !(buf.len >= 0) { trap; };
+    when !((0 + buf.len) <= buf.len) { trap; };
     let text: String = buf_slice_string(buf,0,buf.len);
     let end: Int = str_find(text,"\r\n\r\n");
     when end < 0 { term -1; };
