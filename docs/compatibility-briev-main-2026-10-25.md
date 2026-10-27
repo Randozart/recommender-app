@@ -52,7 +52,10 @@ change:
 
 1. Destructuring `let` no longer falls back to `Int` when tuple inference
    fails; the inference error is propagated (the fallback hid the real mismatch).
-2. `Type { field: value }.field` is reduced to `value` by the proof engine, so
+2. Proven guards are eliminated by the compiler after typechecking; the source
+   guards stay as intent/documentation. Never delete a source guard as a manual
+   optimization (`AGENTS.md` Rule 25).
+3. `Type { field: value }.field` is reduced to `value` by the proof engine, so
    struct-literal arguments (`Socket { fd: fd }`, `ByteBuf { ... }`) discharge
    bounds already guarded by the caller.
 
