@@ -11,6 +11,11 @@ vendored here. This repository is an application source repository; a checkout
 alone is not sufficient to compile it. Use a compatible Briev compiler build
 and point `BRIEV_STDLIB` at that compiler checkout's `lib/std` directory.
 
+Compatibility pin: `Randozart/briev-lang` commit `6604ae53` (2026-10-28). It
+contains the state-collection lifetime fix required by the browser catalogue
+gate, plus the callable-txn tail-loop isolation fix and wasm tail-loop lowering.
+Older compiler commits build the app but trap on catalogue load.
+
 The app targets MovieLens 100K. Supply the dataset files yourself and set
 `UDATA_PATH` to `u.data` and `UITEM_PATH` to `u.item`. The native service needs
 local PostgreSQL on `127.0.0.1:5432`, a role/database configured for local
