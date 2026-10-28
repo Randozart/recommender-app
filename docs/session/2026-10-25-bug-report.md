@@ -124,7 +124,8 @@ headers, isolates callable-txn emission from a preceding tail-lowered defn, and
 lowers eligible wasm self-tail recursion to an explicit loop. Compiler commit
 `210c5b9b` seeds top-level unpacked instances on assignment, fixing the real
 server's lost registration response. `b1de89fc` clears txn identity at defn
-entry and stops keyed-row churn, fixing the real browser responsiveness gate. `mem2reg` and `tailcallelim` remain in the
+entry and stops keyed-row churn, fixing the real browser responsiveness gate.
+`a0fcfb31` retains local enum return images, fixing the server protocol crash. `mem2reg` and `tailcallelim` remain in the
 wasm pipeline, but they did not fix the immediate lifetime fault. Verified with
 `browser_pending_peer.mjs` end to end; no throughput claim is made.
 

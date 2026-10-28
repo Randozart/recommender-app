@@ -11,7 +11,7 @@ vendored here. This repository is an application source repository; a checkout
 alone is not sufficient to compile it. Use a compatible Briev compiler build
 and point `BRIEV_STDLIB` at that compiler checkout's `lib/std` directory.
 
-Compatibility pin: `Randozart/briev-lang` commit `31e3238e` (2026-10-28). It
+Compatibility pin: `Randozart/briev-lang` commit `77aef3b1` (2026-10-28). It
 contains the state-collection lifetime fix (`6604ae53`) required by the browser
 catalogue gate, plus the top-level unpacked-instance assignment fix required by
 the real server auth path. It also stops spurious defn state flushes and keyed
