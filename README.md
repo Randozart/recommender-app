@@ -11,11 +11,12 @@ vendored here. This repository is an application source repository; a checkout
 alone is not sufficient to compile it. Use a compatible Briev compiler build
 and point `BRIEV_STDLIB` at that compiler checkout's `lib/std` directory.
 
-Compatibility pin: `Randozart/briev-lang` commit `210c5b9b` (2026-10-28). It
+Compatibility pin: `Randozart/briev-lang` commit `31e3238e` (2026-10-28). It
 contains the state-collection lifetime fix (`6604ae53`) required by the browser
 catalogue gate, plus the top-level unpacked-instance assignment fix required by
-the real server auth path. Older compiler commits build the app but trap on
-catalogue load or lose the registration response.
+the real server auth path. It also stops spurious defn state flushes and keyed
+DOM-row churn. Older compiler commits build the app but trap on catalogue load,
+lose the registration response, or fail the browser responsiveness gate.
 
 The app targets MovieLens 100K. Supply the dataset files yourself and set
 `UDATA_PATH` to `u.data` and `UITEM_PATH` to `u.item`. The native service needs
