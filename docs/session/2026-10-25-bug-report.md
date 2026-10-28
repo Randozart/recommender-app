@@ -121,10 +121,11 @@ before the app can complete the interaction.
 
 **Fix:** Compiler commit `6604ae53` heap-owns state-collection construction
 headers, isolates callable-txn emission from a preceding tail-lowered defn, and
-lowers eligible wasm self-tail recursion to an explicit loop. `mem2reg` and
-`tailcallelim` remain in the wasm pipeline, but they did not fix the immediate
-lifetime fault. Verified with `browser_pending_peer.mjs` end to end; no
-throughput claim is made.
+lowers eligible wasm self-tail recursion to an explicit loop. Compiler commit
+`210c5b9b` seeds top-level unpacked instances on assignment, fixing the real
+server's lost registration response. `mem2reg` and `tailcallelim` remain in the
+wasm pipeline, but they did not fix the immediate lifetime fault. Verified with
+`browser_pending_peer.mjs` end to end; no throughput claim is made.
 
 ### Specialized catalogue iteration called an incompatible erased adapter
 
