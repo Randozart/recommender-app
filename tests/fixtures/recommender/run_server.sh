@@ -35,7 +35,7 @@ run_property_case rating 0 false
 run_property_case rating 6 false
 run_property_case threshold 4 true
 run_property_case threshold 5 false
-run_property_case owner 0 true 0 3 1 7 0
-run_property_case owner 0 false 0 3 1 8 0
-run_property_case owner 0 false 0 3 1 7 1
-run_property_case owner 0 false 0 3 0 7 0
+run_property_case owner 0 true 0 1 7 0
+run_property_case owner 0 false 0 1 8 0
+run_property_case owner 0 false 0 1 7 1
+run_property_case owner 0 false 0 0 7 0
