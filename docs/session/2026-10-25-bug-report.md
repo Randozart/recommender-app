@@ -125,9 +125,14 @@ lowers eligible wasm self-tail recursion to an explicit loop. Compiler commit
 `210c5b9b` seeds top-level unpacked instances on assignment, fixing the real
 server's lost registration response. `b1de89fc` clears txn identity at defn
 entry and stops keyed-row churn, fixing the real browser responsiveness gate.
-`a0fcfb31` retains local enum return images, fixing the server protocol crash. `mem2reg` and `tailcallelim` remain in the
-wasm pipeline, but they did not fix the immediate lifetime fault. Verified with
-`browser_pending_peer.mjs` end to end; no throughput claim is made.
+`569cf69b` retains every enum return image, fixing the server protocol and
+runtime ownership crashes. Otto Westerlund’s PR #48 (`2288e4ec`, merged at
+`97bc4fa0`) fixes pooled-object replacement and mixed-width member storage.
+`3f633135` reserves the full row width in view snapshots; `e110fd1e` snapshots
+flush records before effects can grow and detach wasm memory. `mem2reg` and
+`tailcallelim` remain in the wasm pipeline, but they did not fix the immediate
+lifetime fault. Verified with `browser_pending_peer.mjs` (twice) and the I11
+real browser/server gate; no throughput claim is made.
 
 ### Specialized catalogue iteration called an incompatible erased adapter
 
