@@ -23,7 +23,7 @@ done
 run_property_case() {
     local mode="$1" value="$2" expected="$3" fd="${4:-0}" upgraded="${5:-0}" owner="${6:-0}" closing="${7:-0}"
     local got
-    got=$(PROPERTY_MODE="$mode" PROPERTY_VALUE="$value" PROPERTY_FD="${fd:-0}"         PROPERTY_UPGRADED="${upgraded:-0}" PROPERTY_OWNER="${owner:-0}"         PROPERTY_CLOSING="${closing:-0}" timeout 60 "$out/server_property_gate")
+    got=$(PROPERTY_MODE="$mode" PROPERTY_VALUE="$value" PROPERTY_FD="${fd:-0}"         PROPERTY_BOUND_OWNER="${upgraded:-0}" PROPERTY_OWNER="${owner:-0}"         PROPERTY_CLOSING="${closing:-0}" timeout 60 "$out/server_property_gate")
     if [ "$got" != "$expected" ]; then
         echo "server_property_gate=$mode expected=$expected got=$got" >&2
         exit 1
